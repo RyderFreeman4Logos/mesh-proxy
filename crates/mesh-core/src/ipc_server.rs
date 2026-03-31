@@ -7,7 +7,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tracing::{info, warn};
 
 use crate::daemon::{ShutdownRx, ShutdownTx};
-use crate::frame;
+use mesh_proto::frame;
 
 /// Shared state accessible to IPC connection handlers.
 struct SharedState {

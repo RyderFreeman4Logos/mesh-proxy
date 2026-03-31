@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use mesh_proto::{MeshConfig, NodeRole};
+use mesh_proto::{IpcRequest, IpcResponse, MeshConfig, NodeRole};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -92,30 +92,92 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Start { role, config } => {
-            let node_role: NodeRole = role.into();
-            println!(
-                "Starting mesh-proxy daemon (role: {node_role:?})...\nConfig: {}",
-                config.display()
-            );
-        }
-        Command::Stop => {
-            println!("Stopping mesh-proxy daemon...");
-        }
-        Command::Status { output } => {
-            println!("Querying daemon status (format: {output})...");
-        }
+        Command::Start { role, config } => cmd_start(role, config).await?,
+        Command::Stop => cmd_stop().await?,
+        Command::Status { output } => cmd_status(output).await?,
         Command::Expose => {
             println!("Not implemented in Phase 1");
         }
-        Command::Accept { ticket, name } => {
-            println!(
-                "Accepting ticket: {ticket}{}",
-                name.as_deref()
-                    .map(|n| format!(" (name: {n})"))
-                    .unwrap_or_default()
-            );
+        Command::Accept { .. } => {
             println!("Not implemented in Phase 1");
+        }
+    }
+
+    Ok(())
+}
+
+/// Start the mesh-proxy daemon: load config, fork, acquire PID lock, run.
+async fn cmd_start(role: Role, config_path: PathBuf) -> Result<()> {
+    let mut config = MeshConfig::load(&config_path)?;
+    config.role = role.into();
+
+    let pid_path = config.data_dir.join("daemon.pid");
+    let socket_path = config.data_dir.join("daemon.sock");
+
+    mesh_core::process::cleanup_stale_socket(&socket_path, &pid_path);
+    mesh_core::process::daemonize()?;
+
+    // Acquire PID file lock — keep the File handle alive for daemon lifetime.
+    let _pid_lock = mesh_core::process::write_pid_file(&pid_path)?;
+
+    let mut daemon = mesh_core::Daemon::new(config, config_path);
+    daemon.run().await
+}
+
+/// Stop the running daemon by sending SIGTERM via PID file.
+async fn cmd_stop() -> Result<()> {
+    let config = MeshConfig::default();
+    let pid_path = config.data_dir.join("daemon.pid");
+
+    mesh_core::process::stop_daemon(&pid_path)?;
+    println!("Daemon stopped");
+    Ok(())
+}
+
+/// Query daemon status via IPC and print the result.
+async fn cmd_status(output: OutputFormat) -> Result<()> {
+    let config = MeshConfig::default();
+    let socket_path = config.data_dir.join("daemon.sock");
+
+    let mut stream = match tokio::net::UnixStream::connect(&socket_path).await {
+        Ok(s) => s,
+        Err(_) => {
+            println!("Daemon is not running");
+            return Ok(());
+        }
+    };
+
+    mesh_proto::frame::write_json(&mut stream, &IpcRequest::Status)
+        .await
+        .context("failed to send status request")?;
+
+    let response: IpcResponse = mesh_proto::frame::read_json(&mut stream)
+        .await
+        .context("failed to read status response")?;
+
+    match response {
+        IpcResponse::Status(info) => match output {
+            OutputFormat::Text => {
+                println!("Role:            {}", info.role);
+                println!("Node:            {}", info.node_name);
+                println!("Endpoint:        {}", info.endpoint_id);
+                println!("Online:          {}", info.online);
+                println!("Connected nodes: {}", info.connected_nodes.len());
+                println!("Services:        {}", info.services.len());
+            }
+            OutputFormat::Json => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&info)
+                        .context("failed to serialize status to JSON")?
+                );
+            }
+        },
+        IpcResponse::Error { message } => {
+            anyhow::bail!("daemon returned error: {message}");
+        }
+        IpcResponse::Ok { message } => {
+            println!("{message}");
         }
     }
 

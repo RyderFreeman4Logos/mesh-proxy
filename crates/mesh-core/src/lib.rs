@@ -1,5 +1,4 @@
 mod daemon;
-pub(crate) mod frame;
 mod ipc_server;
 mod mesh_node;
 pub mod process;
