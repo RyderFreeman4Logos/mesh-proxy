@@ -83,45 +83,64 @@ impl std::fmt::Display for OutputFormat {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
-
+/// Entry point — synchronous so `start` can fork() before any threads exist.
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Start { role, config } => cmd_start(role, config).await?,
-        Command::Stop => cmd_stop().await?,
-        Command::Status { output } => cmd_status(output).await?,
-        Command::Expose => {
-            println!("Not implemented in Phase 1");
+        Command::Start { role, config } => {
+            // All pre-fork work is synchronous (single-threaded).
+            let mut cfg = MeshConfig::load(&config)?;
+            cfg.role = role.into();
+
+            let pid_path = cfg.data_dir.join("daemon.pid");
+            let socket_path = cfg.data_dir.join("daemon.sock");
+
+            mesh_core::process::cleanup_stale_socket(&socket_path, &pid_path);
+            mesh_core::process::daemonize()?;
+
+            // Acquire PID lock — keep handle alive for daemon lifetime.
+            let _pid_lock = mesh_core::process::write_pid_file(&pid_path)?;
+
+            // NOW create tokio runtime (safe: we are the only thread).
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(async {
+                    tracing_subscriber::fmt()
+                        .with_env_filter(EnvFilter::from_default_env())
+                        .init();
+
+                    let mut daemon = mesh_core::Daemon::new(cfg, config);
+                    daemon.run().await
+                })
         }
-        Command::Accept { .. } => {
-            println!("Not implemented in Phase 1");
+        other => {
+            // Non-start commands: create runtime normally.
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(async {
+                    tracing_subscriber::fmt()
+                        .with_env_filter(EnvFilter::from_default_env())
+                        .init();
+
+                    match other {
+                        Command::Stop => cmd_stop().await,
+                        Command::Status { output } => cmd_status(output).await,
+                        Command::Expose => {
+                            println!("Not implemented in Phase 1");
+                            Ok(())
+                        }
+                        Command::Accept { .. } => {
+                            println!("Not implemented in Phase 1");
+                            Ok(())
+                        }
+                        Command::Start { .. } => unreachable!(),
+                    }
+                })
         }
     }
-
-    Ok(())
-}
-
-/// Start the mesh-proxy daemon: load config, fork, acquire PID lock, run.
-async fn cmd_start(role: Role, config_path: PathBuf) -> Result<()> {
-    let mut config = MeshConfig::load(&config_path)?;
-    config.role = role.into();
-
-    let pid_path = config.data_dir.join("daemon.pid");
-    let socket_path = config.data_dir.join("daemon.sock");
-
-    mesh_core::process::cleanup_stale_socket(&socket_path, &pid_path);
-    mesh_core::process::daemonize()?;
-
-    // Acquire PID file lock — keep the File handle alive for daemon lifetime.
-    let _pid_lock = mesh_core::process::write_pid_file(&pid_path)?;
-
-    let mut daemon = mesh_core::Daemon::new(config, config_path);
-    daemon.run().await
 }
 
 /// Stop the running daemon by sending SIGTERM via PID file.
