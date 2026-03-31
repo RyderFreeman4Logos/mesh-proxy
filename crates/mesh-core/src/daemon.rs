@@ -1,11 +1,10 @@
+use std::fs;
 use std::path::PathBuf;
 
 use anyhow::Result;
 use mesh_proto::MeshConfig;
 use tokio::sync::broadcast;
-use tracing::{error, info};
-
-use crate::ipc_server::IpcServer;
+use tracing::{error, info, warn};
 
 /// Shutdown signal type.
 pub type ShutdownTx = broadcast::Sender<()>;
@@ -49,7 +48,8 @@ impl Daemon {
         self.config.data_dir.join("daemon.pid")
     }
 
-    /// Main daemon loop. Starts IPC server and waits for shutdown.
+    /// Main daemon loop. Starts IPC server, installs signal handlers, and
+    /// waits for shutdown.
     pub async fn run(&self) -> Result<()> {
         info!(
             role = ?self.config.role,
@@ -57,10 +57,16 @@ impl Daemon {
             "daemon starting"
         );
 
-        // Start IPC server
         let socket_path = self.socket_path();
-        let ipc_server =
-            IpcServer::bind(&socket_path, self.shutdown_tx.clone(), self.config.clone()).await?;
+        let pid_path = self.pid_path();
+
+        // Start IPC server
+        let ipc_server = crate::ipc_server::IpcServer::bind(
+            &socket_path,
+            self.shutdown_tx.clone(),
+            self.config.clone(),
+        )
+        .await?;
         let ipc_shutdown_rx = self.shutdown_rx();
         let ipc_handle = tokio::spawn(async move {
             if let Err(e) = ipc_server.run(ipc_shutdown_rx).await {
@@ -70,16 +76,61 @@ impl Daemon {
 
         // TODO(1.7): Initialize iroh endpoint
 
-        // Wait for shutdown signal
+        // Install signal handlers — both trigger the same shutdown broadcast
+        let shutdown_tx = self.shutdown_tx.clone();
+        tokio::spawn(async move {
+            Self::wait_for_signals(shutdown_tx).await;
+        });
+
+        // Wait for shutdown signal (from signal handler or IPC stop command)
         let mut shutdown_rx = self.shutdown_rx();
         shutdown_rx.recv().await.ok();
-        info!("shutdown signal received");
+        info!("shutdown signal received, cleaning up...");
 
         // Wait for IPC server to finish
         ipc_handle.await.ok();
 
-        // TODO(1.6): Cleanup (remove socket, PID file)
+        // Cleanup socket and PID file
+        Self::cleanup(&socket_path, &pid_path);
+
         info!("daemon stopped");
         Ok(())
+    }
+
+    /// Wait for SIGTERM or Ctrl-C, then broadcast shutdown.
+    async fn wait_for_signals(shutdown_tx: ShutdownTx) {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+
+        tokio::select! {
+            _ = sigterm.recv() => {
+                info!("received SIGTERM");
+            }
+            result = tokio::signal::ctrl_c() => {
+                if let Err(e) = result {
+                    error!(error = %e, "ctrl_c handler failed");
+                    return;
+                }
+                info!("received Ctrl-C");
+            }
+        }
+
+        let _ = shutdown_tx.send(());
+    }
+
+    /// Remove socket and PID file on exit.
+    fn cleanup(socket_path: &PathBuf, pid_path: &PathBuf) {
+        if let Err(e) = fs::remove_file(socket_path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(path = %socket_path.display(), error = %e, "failed to remove socket");
+            }
+        }
+        if let Err(e) = fs::remove_file(pid_path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(path = %pid_path.display(), error = %e, "failed to remove PID file");
+            }
+        }
     }
 }
