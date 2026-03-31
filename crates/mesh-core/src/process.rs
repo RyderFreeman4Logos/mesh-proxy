@@ -16,8 +16,8 @@ pub fn daemonize() -> Result<()> {
         let pid = libc::fork();
         match pid {
             -1 => bail!("fork() failed: {}", std::io::Error::last_os_error()),
-            0 => {}                       // child continues
-            _ => std::process::exit(0),   // parent exits immediately
+            0 => {}                     // child continues
+            _ => std::process::exit(0), // parent exits immediately
         }
 
         // Detach from controlling terminal, become session leader

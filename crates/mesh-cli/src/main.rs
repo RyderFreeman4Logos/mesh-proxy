@@ -6,7 +6,11 @@ use mesh_proto::{IpcRequest, IpcResponse, MeshConfig, NodeRole};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "mesh-proxy", about = "Decentralized P2P port forwarding and service discovery", version)]
+#[command(
+    name = "mesh-proxy",
+    about = "Decentralized P2P port forwarding and service discovery",
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

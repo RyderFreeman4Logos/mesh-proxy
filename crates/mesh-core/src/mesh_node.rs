@@ -33,14 +33,17 @@ impl MeshNode {
             let raw = bs58::decode(encoded)
                 .into_vec()
                 .context("invalid bs58 in secret_key")?;
-            let bytes: [u8; 32] = raw
-                .try_into()
-                .map_err(|v: Vec<u8>| anyhow::anyhow!("secret_key must be 32 bytes, got {}", v.len()))?;
+            let bytes: [u8; 32] = raw.try_into().map_err(|v: Vec<u8>| {
+                anyhow::anyhow!("secret_key must be 32 bytes, got {}", v.len())
+            })?;
             let sk = SecretKey::from_bytes(&bytes);
             builder = builder.secret_key(sk);
         }
 
-        let endpoint = builder.bind().await.context("failed to bind iroh endpoint")?;
+        let endpoint = builder
+            .bind()
+            .await
+            .context("failed to bind iroh endpoint")?;
 
         // Persist the auto-generated key on first run.
         if !had_key {

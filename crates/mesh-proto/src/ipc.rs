@@ -10,10 +10,7 @@ pub enum IpcRequest {
     /// Reload configuration from disk.
     Reload,
     /// Accept a new edge node (control node only).
-    AcceptNode {
-        ticket: String,
-        node_name: String,
-    },
+    AcceptNode { ticket: String, node_name: String },
 }
 
 /// Response from daemon to CLI client.
