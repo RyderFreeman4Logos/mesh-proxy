@@ -13,14 +13,19 @@ pub type ShutdownRx = broadcast::Receiver<()>;
 /// The mesh-proxy daemon engine.
 pub struct Daemon {
     config: MeshConfig,
+    config_path: PathBuf,
     shutdown_tx: ShutdownTx,
 }
 
 impl Daemon {
     /// Create a new daemon from the loaded configuration.
-    pub fn new(config: MeshConfig) -> Self {
+    pub fn new(config: MeshConfig, config_path: PathBuf) -> Self {
         let (shutdown_tx, _) = broadcast::channel(1);
-        Self { config, shutdown_tx }
+        Self {
+            config,
+            config_path,
+            shutdown_tx,
+        }
     }
 
     /// Returns a new shutdown receiver.
@@ -50,7 +55,7 @@ impl Daemon {
 
     /// Main daemon loop. Starts IPC server, installs signal handlers, and
     /// waits for shutdown.
-    pub async fn run(&self) -> Result<()> {
+    pub async fn run(&mut self) -> Result<()> {
         info!(
             role = ?self.config.role,
             node_name = %self.config.node_name,
@@ -74,7 +79,10 @@ impl Daemon {
             }
         });
 
-        // TODO(1.7): Initialize iroh endpoint
+        // Initialize iroh endpoint
+        let mesh_node =
+            crate::mesh_node::MeshNode::new(&mut self.config, &self.config_path).await?;
+        info!(endpoint_id = %mesh_node.id(), "mesh node initialized");
 
         // Install signal handlers — both trigger the same shutdown broadcast
         let shutdown_tx = self.shutdown_tx.clone();
@@ -86,6 +94,9 @@ impl Daemon {
         let mut shutdown_rx = self.shutdown_rx();
         shutdown_rx.recv().await.ok();
         info!("shutdown signal received, cleaning up...");
+
+        // Close iroh endpoint before cleanup
+        mesh_node.close().await;
 
         // Wait for IPC server to finish
         ipc_handle.await.ok();
