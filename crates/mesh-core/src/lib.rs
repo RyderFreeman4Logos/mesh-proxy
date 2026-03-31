@@ -1,4 +1,5 @@
 mod daemon;
+pub(crate) mod frame;
 mod ipc_server;
 
 pub use daemon::{Daemon, ShutdownRx, ShutdownTx};

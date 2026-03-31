@@ -3,7 +3,7 @@ mod ipc;
 mod message;
 
 pub use config::{MeshConfig, NodeRole, ServiceEntry};
-pub use ipc::{IpcRequest, IpcResponse};
+pub use ipc::{IpcRequest, IpcResponse, StatusInfo};
 pub use message::ControlMessage;
 
 /// ALPN identifier for control plane communication.
