@@ -133,15 +133,15 @@ impl Daemon {
 
     /// Remove socket and PID file on exit.
     fn cleanup(socket_path: &PathBuf, pid_path: &PathBuf) {
-        if let Err(e) = fs::remove_file(socket_path) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                warn!(path = %socket_path.display(), error = %e, "failed to remove socket");
-            }
+        if let Err(e) = fs::remove_file(socket_path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(path = %socket_path.display(), error = %e, "failed to remove socket");
         }
-        if let Err(e) = fs::remove_file(pid_path) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                warn!(path = %pid_path.display(), error = %e, "failed to remove PID file");
-            }
+        if let Err(e) = fs::remove_file(pid_path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(path = %pid_path.display(), error = %e, "failed to remove PID file");
         }
     }
 }
