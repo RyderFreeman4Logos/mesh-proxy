@@ -6,6 +6,8 @@ use mesh_proto::MeshConfig;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
+use crate::process::StartupReadyWriter;
+
 /// Shutdown signal type.
 pub type ShutdownTx = broadcast::Sender<()>;
 pub type ShutdownRx = broadcast::Receiver<()>;
@@ -15,16 +17,22 @@ pub struct Daemon {
     config: MeshConfig,
     config_path: PathBuf,
     shutdown_tx: ShutdownTx,
+    startup_ready: Option<StartupReadyWriter>,
 }
 
 impl Daemon {
     /// Create a new daemon from the loaded configuration.
-    pub fn new(config: MeshConfig, config_path: PathBuf) -> Self {
+    pub fn new(
+        config: MeshConfig,
+        config_path: PathBuf,
+        startup_ready: StartupReadyWriter,
+    ) -> Self {
         let (shutdown_tx, _) = broadcast::channel(1);
         Self {
             config,
             config_path,
             shutdown_tx,
+            startup_ready: Some(startup_ready),
         }
     }
 
@@ -72,6 +80,10 @@ impl Daemon {
             self.config.clone(),
         )
         .await?;
+        if let Some(mut startup_ready) = self.startup_ready.take() {
+            startup_ready.signal_ready()?;
+        }
+
         let ipc_shutdown_rx = self.shutdown_rx();
         let ipc_handle = tokio::spawn(async move {
             if let Err(e) = ipc_server.run(ipc_shutdown_rx).await {

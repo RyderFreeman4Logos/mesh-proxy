@@ -101,7 +101,7 @@ fn main() -> Result<()> {
             let socket_path = cfg.data_dir.join("daemon.sock");
 
             mesh_core::process::cleanup_stale_socket(&socket_path, &pid_path);
-            mesh_core::process::daemonize()?;
+            let startup_ready = mesh_core::process::daemonize()?;
 
             // Acquire PID lock — keep handle alive for daemon lifetime.
             let _pid_lock = mesh_core::process::write_pid_file(&pid_path)?;
@@ -115,7 +115,7 @@ fn main() -> Result<()> {
                         .with_env_filter(EnvFilter::from_default_env())
                         .init();
 
-                    let mut daemon = mesh_core::Daemon::new(cfg, config);
+                    let mut daemon = mesh_core::Daemon::new(cfg, config, startup_ready);
                     daemon.run().await
                 })
         }

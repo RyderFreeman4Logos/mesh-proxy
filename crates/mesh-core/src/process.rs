@@ -1,25 +1,79 @@
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
-use std::os::unix::io::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+
+const DAEMON_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Write end of the daemon startup pipe.
+pub struct StartupReadyWriter {
+    fd: Option<OwnedFd>,
+}
+
+impl StartupReadyWriter {
+    fn new(fd: OwnedFd) -> Self {
+        Self { fd: Some(fd) }
+    }
+
+    /// Notify the parent process that the daemon reached its first ready state.
+    pub fn signal_ready(&mut self) -> Result<()> {
+        let fd = self
+            .fd
+            .take()
+            .context("daemon startup signal already sent")?;
+        let byte = [0_u8; 1];
+
+        // SAFETY: `fd` is a live pipe write end owned by this process.
+        let written = unsafe { libc::write(fd.as_raw_fd(), byte.as_ptr().cast(), byte.len()) };
+        if written == -1 {
+            bail!(
+                "failed to notify parent about daemon startup: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        if written != 1 {
+            bail!("failed to notify parent about daemon startup: short write");
+        }
+
+        Ok(())
+    }
+}
 
 /// Fork the current process into background daemon mode.
 ///
 /// MUST be called **before** the tokio runtime is created (single-threaded).
 /// Creates a new session (setsid) and sets restrictive umask.
-pub fn daemonize() -> Result<()> {
+pub fn daemonize() -> Result<StartupReadyWriter> {
+    let (read_end, write_end) = create_startup_pipe()?;
+
     // SAFETY: Called before any threads are spawned (pre-tokio).
     // fork() is safe in a single-threaded process.
-    unsafe {
+    let child_write_end = unsafe {
         let pid = libc::fork();
         match pid {
             -1 => bail!("fork() failed: {}", std::io::Error::last_os_error()),
-            0 => {}                     // child continues
-            _ => std::process::exit(0), // parent exits immediately
+            0 => {
+                drop(read_end);
+                write_end
+            }
+            _ => {
+                drop(write_end);
+                match wait_for_startup_signal(&read_end, DAEMON_STARTUP_TIMEOUT) {
+                    Ok(()) => std::process::exit(0),
+                    Err(err) => {
+                        eprintln!("{err}");
+                        std::process::exit(1);
+                    }
+                }
+            }
         }
+    };
 
+    // SAFETY: `setsid` and `umask` are called in the post-fork child process.
+    unsafe {
         // Detach from controlling terminal, become session leader
         if libc::setsid() == -1 {
             bail!("setsid() failed: {}", std::io::Error::last_os_error());
@@ -29,7 +83,77 @@ pub fn daemonize() -> Result<()> {
         libc::umask(0o077);
     }
 
-    Ok(())
+    Ok(StartupReadyWriter::new(child_write_end))
+}
+
+fn create_startup_pipe() -> Result<(OwnedFd, OwnedFd)> {
+    let mut pipe_fds = [0; 2];
+
+    // SAFETY: `pipe_fds` points to valid storage for two file descriptors.
+    let rc = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
+    if rc != 0 {
+        bail!(
+            "failed to create daemon startup pipe: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    // SAFETY: `pipe` initialized both file descriptors on success.
+    let read_end = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+    // SAFETY: `pipe` initialized both file descriptors on success.
+    let write_end = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+
+    Ok((read_end, write_end))
+}
+
+fn wait_for_startup_signal(read_end: &OwnedFd, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!("daemon startup timed out");
+        }
+
+        let timeout_ms = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
+        let mut poll_fd = libc::pollfd {
+            fd: read_end.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+
+        // SAFETY: `poll_fd` points to one valid pollfd entry.
+        let poll_result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+        if poll_result == -1 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            bail!("failed to wait for daemon startup: {err}");
+        }
+        if poll_result == 0 {
+            bail!("daemon startup timed out");
+        }
+
+        let mut byte = [0_u8; 1];
+        // SAFETY: `read_end` is a live pipe read end and `byte` is valid output storage.
+        let read_result =
+            unsafe { libc::read(read_end.as_raw_fd(), byte.as_mut_ptr().cast(), byte.len()) };
+
+        match read_result {
+            1 if byte[0] == 0 => return Ok(()),
+            1 => bail!("daemon reported invalid startup signal"),
+            0 => bail!("daemon exited before startup completed"),
+            -1 => {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                bail!("failed to read daemon startup signal: {err}");
+            }
+            _ => bail!("failed to read daemon startup signal: short read"),
+        }
+    }
 }
 
 /// Write PID to file and acquire an advisory flock.
@@ -235,5 +359,45 @@ mod tests {
         cleanup_stale_socket(&socket_path, &pid_path);
 
         assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn test_wait_for_startup_signal_accepts_success_byte() {
+        let (read_end, write_end) = create_startup_pipe().unwrap();
+
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            let mut ready = StartupReadyWriter::new(write_end);
+            ready.signal_ready().unwrap();
+        });
+
+        wait_for_startup_signal(&read_end, Duration::from_secs(1)).unwrap();
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn test_wait_for_startup_signal_rejects_closed_pipe() {
+        let (read_end, write_end) = create_startup_pipe().unwrap();
+        drop(write_end);
+
+        let err = wait_for_startup_signal(&read_end, Duration::from_secs(1)).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("daemon exited before startup completed"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn test_wait_for_startup_signal_times_out() {
+        let (read_end, _write_end) = create_startup_pipe().unwrap();
+
+        let err = wait_for_startup_signal(&read_end, Duration::from_millis(50)).unwrap_err();
+
+        assert!(
+            err.to_string().contains("daemon startup timed out"),
+            "unexpected error: {err:#}"
+        );
     }
 }
