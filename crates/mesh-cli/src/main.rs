@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -12,6 +12,10 @@ use tracing_subscriber::EnvFilter;
     version
 )]
 struct Cli {
+    /// Path to config file.
+    #[arg(long, global = true, default_value_os_t = MeshConfig::default_config_path())]
+    config: PathBuf,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -23,10 +27,6 @@ enum Command {
         /// Node role: control or edge.
         #[arg(long)]
         role: Role,
-
-        /// Path to config file.
-        #[arg(long, default_value_os_t = MeshConfig::default_config_path())]
-        config: PathBuf,
     },
 
     /// Stop the running daemon.
@@ -89,10 +89,10 @@ impl std::fmt::Display for OutputFormat {
 
 /// Entry point — synchronous so `start` can fork() before any threads exist.
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let Cli { config, command } = Cli::parse();
 
-    match cli.command {
-        Command::Start { role, config } => {
+    match command {
+        Command::Start { role } => {
             // All pre-fork work is synchronous (single-threaded).
             let mut cfg = MeshConfig::load(&config)?;
             cfg.role = role.into();
@@ -124,14 +124,14 @@ fn main() -> Result<()> {
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?
-                .block_on(async {
+                .block_on(async move {
                     tracing_subscriber::fmt()
                         .with_env_filter(EnvFilter::from_default_env())
                         .init();
 
                     match other {
-                        Command::Stop => cmd_stop().await,
-                        Command::Status { output } => cmd_status(output).await,
+                        Command::Stop => cmd_stop(&config).await,
+                        Command::Status { output } => cmd_status(&config, output).await,
                         Command::Expose => {
                             println!("Not implemented in Phase 1");
                             Ok(())
@@ -148,8 +148,8 @@ fn main() -> Result<()> {
 }
 
 /// Stop the running daemon by sending SIGTERM via PID file.
-async fn cmd_stop() -> Result<()> {
-    let config = MeshConfig::default();
+async fn cmd_stop(config_path: &Path) -> Result<()> {
+    let config = MeshConfig::load(config_path)?;
     let pid_path = config.data_dir.join("daemon.pid");
 
     mesh_core::process::stop_daemon(&pid_path)?;
@@ -158,8 +158,8 @@ async fn cmd_stop() -> Result<()> {
 }
 
 /// Query daemon status via IPC and print the result.
-async fn cmd_status(output: OutputFormat) -> Result<()> {
-    let config = MeshConfig::default();
+async fn cmd_status(config_path: &Path, output: OutputFormat) -> Result<()> {
+    let config = MeshConfig::load(config_path)?;
     let socket_path = config.data_dir.join("daemon.sock");
 
     let mut stream = match tokio::net::UnixStream::connect(&socket_path).await {
@@ -205,4 +205,48 @@ async fn cmd_status(output: OutputFormat) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_accepts_global_config_for_start() {
+        let cli = Cli::try_parse_from([
+            "mesh-proxy",
+            "start",
+            "--role",
+            "edge",
+            "--config",
+            "/tmp/mesh.toml",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.config, PathBuf::from("/tmp/mesh.toml"));
+        assert!(matches!(cli.command, Command::Start { role: Role::Edge }));
+    }
+
+    #[test]
+    fn test_cli_accepts_global_config_for_stop() {
+        let cli =
+            Cli::try_parse_from(["mesh-proxy", "stop", "--config", "/tmp/mesh.toml"]).unwrap();
+
+        assert_eq!(cli.config, PathBuf::from("/tmp/mesh.toml"));
+        assert!(matches!(cli.command, Command::Stop));
+    }
+
+    #[test]
+    fn test_cli_accepts_global_config_for_status() {
+        let cli =
+            Cli::try_parse_from(["mesh-proxy", "status", "--config", "/tmp/mesh.toml"]).unwrap();
+
+        assert_eq!(cli.config, PathBuf::from("/tmp/mesh.toml"));
+        assert!(matches!(
+            cli.command,
+            Command::Status {
+                output: OutputFormat::Text
+            }
+        ));
+    }
 }
