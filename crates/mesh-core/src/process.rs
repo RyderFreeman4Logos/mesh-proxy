@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
@@ -43,9 +43,10 @@ pub fn write_pid_file(pid_path: &Path) -> Result<fs::File> {
     }
 
     let file = fs::OpenOptions::new()
+        .read(true)
         .write(true)
         .create(true)
-        .truncate(true)
+        .truncate(false)
         .open(pid_path)
         .with_context(|| format!("failed to open PID file {}", pid_path.display()))?;
 
@@ -59,6 +60,9 @@ pub fn write_pid_file(pid_path: &Path) -> Result<fs::File> {
     }
 
     let mut file = file;
+    file.set_len(0).context("failed to truncate PID file")?;
+    file.seek(SeekFrom::Start(0))
+        .context("failed to rewind PID file")?;
     writeln!(file, "{}", std::process::id()).context("failed to write PID")?;
     file.flush().context("failed to flush PID file")?;
 
