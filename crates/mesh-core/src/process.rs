@@ -230,7 +230,7 @@ pub fn is_daemon_running(pid_path: &Path) -> bool {
 
 /// Send SIGTERM to the running daemon. Cleans up stale PID file if the
 /// process no longer exists.
-pub fn stop_daemon(pid_path: &Path) -> Result<()> {
+pub fn stop_daemon(pid_path: &Path) -> Result<libc::pid_t> {
     let content = fs::read_to_string(pid_path)
         .with_context(|| format!("no PID file at {}", pid_path.display()))?;
     let pid: libc::pid_t = content.trim().parse().context("invalid PID in file")?;
@@ -251,7 +251,7 @@ pub fn stop_daemon(pid_path: &Path) -> Result<()> {
         bail!("failed to send SIGTERM to PID {pid}: {err}");
     }
 
-    Ok(())
+    Ok(pid)
 }
 
 /// Remove a stale Unix socket if no daemon is running.

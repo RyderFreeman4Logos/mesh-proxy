@@ -152,8 +152,18 @@ async fn cmd_stop(config_path: &Path) -> Result<()> {
     let config = MeshConfig::load(config_path)?;
     let pid_path = config.data_dir.join("daemon.pid");
 
-    mesh_core::process::stop_daemon(&pid_path)?;
-    println!("Daemon stopped");
+    let pid = mesh_core::process::stop_daemon(&pid_path)?;
+    println!("Shutdown signal sent to daemon (PID {pid})");
+
+    for _ in 0..30 {
+        if !pid_path.exists() {
+            println!("Daemon exited");
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    println!("Shutdown signal sent; daemon may still be cleaning up");
     Ok(())
 }
 
