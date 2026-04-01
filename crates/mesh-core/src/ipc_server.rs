@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::RwLock;
 
 use anyhow::Result;
 use mesh_proto::{IpcRequest, IpcResponse, MeshConfig, StatusInfo};
@@ -9,10 +10,47 @@ use tracing::{info, warn};
 use crate::daemon::{ShutdownRx, ShutdownTx};
 use mesh_proto::frame;
 
+const INITIALIZING_ENDPOINT_ID: &str = "(initializing)";
+
+#[derive(Debug, Clone, Default)]
+struct MeshRuntimeState {
+    endpoint_id: Option<String>,
+    online: bool,
+}
+
+impl MeshRuntimeState {
+    fn status_fields(&self) -> (String, bool) {
+        match &self.endpoint_id {
+            Some(endpoint_id) => (endpoint_id.clone(), self.online),
+            None => (INITIALIZING_ENDPOINT_ID.to_string(), false),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct IpcStatusHandle {
+    runtime: Arc<RwLock<MeshRuntimeState>>,
+}
+
+impl IpcStatusHandle {
+    /// Publish the daemon's current mesh endpoint state for status requests.
+    pub fn set_mesh_node(&self, endpoint_id: String, online: bool) {
+        let mut runtime = match self.runtime.write() {
+            Ok(runtime) => runtime,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *runtime = MeshRuntimeState {
+            endpoint_id: Some(endpoint_id),
+            online,
+        };
+    }
+}
+
 /// Shared state accessible to IPC connection handlers.
 struct SharedState {
     shutdown_tx: ShutdownTx,
     config: MeshConfig,
+    runtime: Arc<RwLock<MeshRuntimeState>>,
 }
 
 /// Unix domain socket IPC server for CLI-daemon communication.
@@ -42,9 +80,17 @@ impl IpcServer {
         let state = Arc::new(SharedState {
             shutdown_tx,
             config,
+            runtime: Arc::new(RwLock::new(MeshRuntimeState::default())),
         });
 
         Ok(Self { listener, state })
+    }
+
+    /// Returns a handle for updating mesh runtime status exposed via IPC.
+    pub(crate) fn status_handle(&self) -> IpcStatusHandle {
+        IpcStatusHandle {
+            runtime: Arc::clone(&self.state.runtime),
+        }
     }
 
     /// Run the IPC accept loop until shutdown.
@@ -92,14 +138,22 @@ async fn handle_connection(mut stream: UnixStream, state: Arc<SharedState>) {
 /// Map an IPC request to a response.
 fn dispatch(request: &IpcRequest, state: &SharedState) -> IpcResponse {
     match request {
-        IpcRequest::Status => IpcResponse::Status(StatusInfo {
-            role: format!("{:?}", state.config.role),
-            node_name: state.config.node_name.clone(),
-            endpoint_id: String::new(), // TODO(1.7): real endpoint id
-            online: false,              // TODO(1.7): real online status
-            connected_nodes: vec![],
-            services: vec![],
-        }),
+        IpcRequest::Status => {
+            let runtime = match state.runtime.read() {
+                Ok(runtime) => runtime,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let (endpoint_id, online) = runtime.status_fields();
+
+            IpcResponse::Status(StatusInfo {
+                role: format!("{:?}", state.config.role),
+                node_name: state.config.node_name.clone(),
+                endpoint_id,
+                online,
+                connected_nodes: vec![],
+                services: vec![],
+            })
+        }
         IpcRequest::Stop => {
             let _ = state.shutdown_tx.send(());
             IpcResponse::Ok {
@@ -112,5 +166,54 @@ fn dispatch(request: &IpcRequest, state: &SharedState) -> IpcResponse {
         IpcRequest::AcceptNode { .. } => IpcResponse::Error {
             message: "accept not yet implemented".to_string(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mesh_proto::NodeRole;
+    use tokio::sync::broadcast;
+
+    fn shared_state() -> SharedState {
+        let (shutdown_tx, _) = broadcast::channel(1);
+        SharedState {
+            shutdown_tx,
+            config: MeshConfig {
+                role: NodeRole::Control,
+                ..MeshConfig::default()
+            },
+            runtime: Arc::new(RwLock::new(MeshRuntimeState::default())),
+        }
+    }
+
+    #[test]
+    fn test_status_reports_initializing_before_mesh_node_is_ready() {
+        let state = shared_state();
+
+        let response = dispatch(&IpcRequest::Status, &state);
+
+        let IpcResponse::Status(info) = response else {
+            panic!("expected status response");
+        };
+        assert_eq!(info.endpoint_id, INITIALIZING_ENDPOINT_ID);
+        assert!(!info.online);
+    }
+
+    #[test]
+    fn test_status_reports_mesh_node_state_after_update() {
+        let state = shared_state();
+        let handle = IpcStatusHandle {
+            runtime: Arc::clone(&state.runtime),
+        };
+        handle.set_mesh_node("ep-123".to_string(), true);
+
+        let response = dispatch(&IpcRequest::Status, &state);
+
+        let IpcResponse::Status(info) = response else {
+            panic!("expected status response");
+        };
+        assert_eq!(info.endpoint_id, "ep-123");
+        assert!(info.online);
     }
 }

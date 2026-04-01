@@ -80,6 +80,7 @@ impl Daemon {
             self.config.clone(),
         )
         .await?;
+        let ipc_status = ipc_server.status_handle();
         if let Some(mut startup_ready) = self.startup_ready.take() {
             startup_ready.signal_ready()?;
         }
@@ -94,6 +95,7 @@ impl Daemon {
         // Initialize iroh endpoint
         let mesh_node =
             crate::mesh_node::MeshNode::new(&mut self.config, &self.config_path).await?;
+        ipc_status.set_mesh_node(mesh_node.id().to_string(), true);
         info!(endpoint_id = %mesh_node.id(), "mesh node initialized");
 
         // Install signal handlers — both trigger the same shutdown broadcast
