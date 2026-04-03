@@ -1016,6 +1016,27 @@ mod tests {
         assert_eq!(bytes_read, 0);
     }
 
+    async fn assert_tcp_listener_stopped(port: u16) {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                match std::net::TcpListener::bind(("127.0.0.1", port)) {
+                    Ok(listener) => {
+                        drop(listener);
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => {
+                        panic!("failed to verify TCP listener shutdown on {port}: {error}")
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     async fn shutdown_listeners(edge: &mut EdgeNode) {
         let handles = edge
             .listener_pool
@@ -1255,6 +1276,35 @@ mod tests {
         assert!(edge.apply_route_update(updated_routes, 2).await);
         assert_eq!(edge.listener_pool.len(), 1);
         assert_tcp_connection_closed(port).await;
+
+        shutdown_listeners(&mut edge).await;
+    }
+
+    #[tokio::test]
+    async fn test_apply_route_update_removes_reassigned_service_listener() {
+        let old_port = available_tcp_port();
+        let new_port = loop {
+            let candidate = available_tcp_port();
+            if candidate != old_port {
+                break candidate;
+            }
+        };
+        let mut edge = EdgeNode::new();
+
+        let initial_routes = HashMap::from([(old_port, test_route("web", "endpoint-a"))]);
+        assert!(edge.apply_route_update(initial_routes, 1).await);
+        assert!(edge.listener_pool.contains_key(&old_port));
+        assert_eq!(edge.listener_pool.len(), 1);
+        assert_tcp_connection_closed(old_port).await;
+
+        let updated_routes = HashMap::from([(new_port, test_route("web", "endpoint-a"))]);
+        assert!(edge.apply_route_update(updated_routes, 2).await);
+
+        assert!(!edge.listener_pool.contains_key(&old_port));
+        assert!(edge.listener_pool.contains_key(&new_port));
+        assert_eq!(edge.listener_pool.len(), 1);
+        assert_tcp_listener_stopped(old_port).await;
+        assert_tcp_connection_closed(new_port).await;
 
         shutdown_listeners(&mut edge).await;
     }
