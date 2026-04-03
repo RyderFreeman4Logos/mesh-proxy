@@ -253,6 +253,11 @@ impl EdgeNode {
         self.route_version
     }
 
+    /// Returns the number of active dynamic listeners currently tracked.
+    pub fn listener_count(&self) -> usize {
+        self.listener_pool.len()
+    }
+
     /// Apply a route table update if the version is newer than the cached one.
     ///
     /// Returns `true` if the update was applied, `false` if stale.
