@@ -4,6 +4,7 @@ pub mod health;
 mod ipc;
 pub mod listener;
 mod message;
+pub mod proxy;
 mod service;
 mod ticket;
 mod validate;
@@ -13,6 +14,7 @@ pub use health::{HealthCheckConfig, HealthCheckMode, HealthState};
 pub use ipc::{ConnectedNode, IpcRequest, IpcResponse, ServiceStatus, StatusInfo};
 pub use listener::ListenerState;
 pub use message::{ControlMessage, PortAssignment, RouteEntry, ServiceRegistration};
+pub use proxy::ProxyHandshake;
 pub use service::{NodeInfo, ServiceHealthEntry, ServiceId, ServiceRecord};
 pub use ticket::{JoinTicket, TicketError, TicketStatus};
 pub use validate::{
@@ -26,6 +28,12 @@ pub const ALPN_CONTROL: &[u8] = b"/mesh/ctrl/1";
 
 /// ALPN identifier for data plane proxy traffic.
 pub const ALPN_PROXY: &[u8] = b"/mesh/proxy/1";
+
+/// Maximum number of concurrent proxy connections per node.
+pub const MAX_PROXY_CONNECTIONS: usize = 1000;
+
+/// Timeout in seconds for the proxy handshake exchange.
+pub const PROXY_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 
 /// Service port pool range start (inclusive).
 pub const SERVICE_PORT_START: u16 = 40000;
