@@ -1,3 +1,4 @@
+mod config_watcher;
 mod control_node;
 mod daemon;
 mod edge_node;
@@ -7,6 +8,7 @@ mod persistence;
 mod port_allocator;
 pub mod process;
 
+pub use config_watcher::ConfigWatcher;
 pub use control_node::{
     ControlNode, ControlNodeSnapshot, QuotaError, TicketError, broadcast_routes, run_accept_loop,
 };

@@ -1,12 +1,14 @@
+use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
-use mesh_proto::{MeshConfig, NodeRole};
-use tokio::sync::broadcast;
+use mesh_proto::{MeshConfig, NodeRole, ServiceEntry};
+use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
 
+use crate::ConfigWatcher;
 use crate::control_node::ControlNode;
 use crate::edge_node::EdgeNode;
 use crate::ipc_server::NodeState;
@@ -76,12 +78,15 @@ impl Daemon {
 
         let socket_path = self.socket_path();
         let pid_path = self.pid_path();
+        let (config_tx, mut config_rx) = mpsc::channel(8);
 
         // Start IPC server
         let ipc_server = crate::ipc_server::IpcServer::bind(
             &socket_path,
             self.shutdown_tx.clone(),
             self.config.clone(),
+            self.config_path.clone(),
+            config_tx.clone(),
         )
         .await?;
         let ipc_status = ipc_server.status_handle();
@@ -105,7 +110,7 @@ impl Daemon {
         info!(endpoint_id = %mesh_node.id(), "mesh node initialized");
 
         // Branch by role: create node state and start role-specific tasks.
-        let accept_handle = match self.config.role {
+        let (accept_handle, _config_watcher) = match self.config.role {
             NodeRole::Control => {
                 let cn = Arc::new(tokio::sync::RwLock::new(ControlNode::new()));
                 {
@@ -115,9 +120,12 @@ impl Daemon {
                 let shutdown_rx = self.shutdown_rx();
                 let endpoint = mesh_node.endpoint().clone();
                 let cn_clone = Arc::clone(&cn);
-                Some(tokio::spawn(async move {
-                    crate::control_node::run_accept_loop(cn_clone, endpoint, shutdown_rx).await;
-                }))
+                (
+                    Some(tokio::spawn(async move {
+                        crate::control_node::run_accept_loop(cn_clone, endpoint, shutdown_rx).await;
+                    })),
+                    None,
+                )
             }
             NodeRole::Edge => {
                 let en = Arc::new(tokio::sync::RwLock::new(EdgeNode::new()));
@@ -131,7 +139,10 @@ impl Daemon {
                     let mut ns = node_state_handle.write().await;
                     *ns = NodeState::Edge(Arc::clone(&en));
                 }
-                None
+                let config_watcher =
+                    ConfigWatcher::new(self.config_path.clone(), config_tx.clone())?;
+                info!(path = %self.config_path.display(), "config watcher started");
+                (None, Some(config_watcher))
             }
         };
 
@@ -143,7 +154,23 @@ impl Daemon {
 
         // Wait for shutdown signal (from signal handler or IPC stop command)
         let mut shutdown_rx = self.shutdown_rx();
-        shutdown_rx.recv().await.ok();
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.recv() => {
+                    break;
+                }
+                maybe_reload = config_rx.recv() => {
+                    let Some(()) = maybe_reload else {
+                        warn!("config reload channel closed");
+                        break;
+                    };
+
+                    if let Err(error) = self.reload_config() {
+                        error!(error = %error, path = %self.config_path.display(), "failed to reload config");
+                    }
+                }
+            }
+        }
         info!("shutdown signal received, cleaning up...");
 
         // Wait for accept loop to finish (if running).
@@ -200,4 +227,131 @@ impl Daemon {
             warn!(path = %pid_path.display(), error = %e, "failed to remove PID file");
         }
     }
+
+    fn reload_config(&mut self) -> Result<()> {
+        let new_config = MeshConfig::load(&self.config_path)?;
+
+        if self.config.role == NodeRole::Edge {
+            let diff = ServiceDiff::between(&self.config.services, &new_config.services);
+            diff.log(&self.config_path, new_config.services.len());
+        } else {
+            info!(path = %self.config_path.display(), "config reloaded from disk");
+        }
+
+        self.config = new_config;
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct ServiceDiff {
+    added: Vec<ServiceEntry>,
+    removed: Vec<ServiceEntry>,
+    changed: Vec<ServiceChange>,
+}
+
+impl ServiceDiff {
+    fn between(previous: &[ServiceEntry], current: &[ServiceEntry]) -> Self {
+        let previous_by_name = services_by_name(previous);
+        let current_by_name = services_by_name(current);
+        let mut added = Vec::new();
+        let mut removed = Vec::new();
+        let mut changed = Vec::new();
+
+        for (name, current_service) in &current_by_name {
+            match previous_by_name.get(name) {
+                None => added.push(current_service.clone()),
+                Some(previous_service) if previous_service != current_service => {
+                    changed.push(ServiceChange {
+                        previous: previous_service.clone(),
+                        current: current_service.clone(),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+
+        for (name, previous_service) in &previous_by_name {
+            if !current_by_name.contains_key(name) {
+                removed.push(previous_service.clone());
+            }
+        }
+
+        Self {
+            added,
+            removed,
+            changed,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
+    }
+
+    fn log(&self, config_path: &Path, service_count: usize) {
+        if self.is_empty() {
+            info!(
+                path = %config_path.display(),
+                service_count,
+                "config reloaded with no service changes"
+            );
+            return;
+        }
+
+        info!(
+            path = %config_path.display(),
+            service_count,
+            added = self.added.len(),
+            removed = self.removed.len(),
+            changed = self.changed.len(),
+            "config reloaded with service changes"
+        );
+
+        for service in &self.added {
+            info!(
+                name = %service.name,
+                local_addr = %service.local_addr,
+                protocol = ?service.protocol,
+                health_check = ?service.health_check,
+                "service added via config reload"
+            );
+        }
+
+        for service in &self.removed {
+            info!(
+                name = %service.name,
+                local_addr = %service.local_addr,
+                protocol = ?service.protocol,
+                health_check = ?service.health_check,
+                "service removed via config reload"
+            );
+        }
+
+        for change in &self.changed {
+            info!(
+                name = %change.current.name,
+                old_local_addr = %change.previous.local_addr,
+                new_local_addr = %change.current.local_addr,
+                old_protocol = ?change.previous.protocol,
+                new_protocol = ?change.current.protocol,
+                old_health_check = ?change.previous.health_check,
+                new_health_check = ?change.current.health_check,
+                "service updated via config reload"
+            );
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ServiceChange {
+    previous: ServiceEntry,
+    current: ServiceEntry,
+}
+
+fn services_by_name(services: &[ServiceEntry]) -> BTreeMap<String, ServiceEntry> {
+    services
+        .iter()
+        .cloned()
+        .map(|service| (service.name.clone(), service))
+        .collect()
 }

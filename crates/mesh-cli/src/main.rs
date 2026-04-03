@@ -354,7 +354,9 @@ async fn cmd_expose(
             name,
             assigned_port,
         } => {
-            if let Some(port) = assigned_port {
+            if let Some(port) = assigned_port
+                && port != 0
+            {
                 println!("Service '{name}' exposed on port {port}");
             } else {
                 println!("Service '{name}' exposed (port pending assignment)");
