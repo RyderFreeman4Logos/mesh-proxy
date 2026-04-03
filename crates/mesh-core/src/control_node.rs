@@ -60,6 +60,49 @@ pub struct ControlNode {
     last_pong: HashMap<String, u64>,
 }
 
+#[derive(Debug, Default)]
+struct ActiveControlConnections {
+    by_endpoint_id: RwLock<HashMap<String, iroh::endpoint::Connection>>,
+}
+
+impl ActiveControlConnections {
+    async fn insert(&self, endpoint_id: &str, connection: &iroh::endpoint::Connection) {
+        self.by_endpoint_id
+            .write()
+            .await
+            .insert(endpoint_id.to_owned(), connection.clone());
+    }
+
+    async fn remove_if_stale(
+        &self,
+        endpoint_id: &str,
+        stale_connection: &iroh::endpoint::Connection,
+    ) {
+        let stale_connection_id = stale_connection.stable_id();
+        let mut connections = self.by_endpoint_id.write().await;
+        let should_remove = connections
+            .get(endpoint_id)
+            .is_some_and(|connection| connection.stable_id() == stale_connection_id);
+
+        if should_remove {
+            connections.remove(endpoint_id);
+        }
+    }
+
+    async fn snapshot(
+        &self,
+        exclude_endpoint_id: Option<&str>,
+    ) -> Vec<(String, iroh::endpoint::Connection)> {
+        self.by_endpoint_id
+            .read()
+            .await
+            .iter()
+            .filter(|(endpoint_id, _)| Some(endpoint_id.as_str()) != exclude_endpoint_id)
+            .map(|(endpoint_id, connection)| (endpoint_id.clone(), connection.clone()))
+            .collect()
+    }
+}
+
 impl Default for ControlNode {
     fn default() -> Self {
         Self::new()
@@ -459,6 +502,8 @@ pub async fn run_accept_loop(
     endpoint: iroh::Endpoint,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) {
+    let active_connections = Arc::new(ActiveControlConnections::default());
+
     loop {
         tokio::select! {
             incoming = endpoint.accept() => {
@@ -493,8 +538,9 @@ pub async fn run_accept_loop(
                 }
 
                 let node = Arc::clone(&node);
+                let active_connections = Arc::clone(&active_connections);
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(node, connection).await {
+                    if let Err(e) = handle_connection(node, active_connections, connection).await {
                         warn!(error = %e, "control connection handler error");
                     }
                 });
@@ -510,88 +556,103 @@ pub async fn run_accept_loop(
 /// Handle a single control-plane connection: read messages in a loop and dispatch.
 async fn handle_connection(
     node: Arc<RwLock<ControlNode>>,
+    active_connections: Arc<ActiveControlConnections>,
     connection: iroh::endpoint::Connection,
 ) -> anyhow::Result<()> {
     let remote_id = connection.remote_id();
+    let remote_id_string = remote_id.to_string();
     info!(%remote_id, "control connection established");
 
     // Store the endpoint ID string for route broadcasting.
     {
         let mut n = node.write().await;
-        n.set_node_addr(&remote_id.to_string(), remote_id.to_string());
+        n.set_node_addr(&remote_id_string, remote_id_string.clone());
     }
+    active_connections
+        .insert(&remote_id_string, &connection)
+        .await;
 
-    loop {
-        let (mut send, mut recv) = match connection.accept_bi().await {
-            Ok(pair) => pair,
-            Err(e) => {
-                // Connection closed or error — stop handling.
-                info!(error = %e, "control connection closed");
-                break;
-            }
-        };
+    let result: anyhow::Result<()> = async {
+        loop {
+            let (mut send, mut recv) = match connection.accept_bi().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    // Connection closed or error — stop handling.
+                    info!(error = %e, "control connection closed");
+                    break;
+                }
+            };
 
-        let msg: ControlMessage = match mesh_proto::frame::read_json(&mut recv).await {
-            Ok(msg) => msg,
-            Err(e) => {
-                warn!(error = %e, "failed to read control message");
-                break;
-            }
-        };
+            let msg: ControlMessage = match mesh_proto::frame::read_json(&mut recv).await {
+                Ok(msg) => msg,
+                Err(e) => {
+                    warn!(error = %e, "failed to read control message");
+                    break;
+                }
+            };
 
-        match msg {
-            ControlMessage::Register {
-                node_name,
-                auth_ticket,
-                services,
-            } => {
-                if let Err(e) = handle_register(
-                    &node,
-                    &remote_id.to_string(),
-                    &auth_ticket,
-                    &node_name,
+            match msg {
+                ControlMessage::Register {
+                    node_name,
+                    auth_ticket,
                     services,
-                    &mut send,
-                )
-                .await
-                {
-                    warn!(error = %e, "register handler failed");
+                } => {
+                    if let Err(e) = handle_register(
+                        &node,
+                        &active_connections,
+                        &remote_id_string,
+                        &auth_ticket,
+                        &node_name,
+                        services,
+                        &mut send,
+                    )
+                    .await
+                    {
+                        warn!(error = %e, "register handler failed");
+                    }
+                }
+                ControlMessage::HealthReport {
+                    endpoint_id,
+                    services,
+                } => {
+                    let mut n = node.write().await;
+                    n.aggregate_health(&endpoint_id, services, now_epoch());
+                }
+                ControlMessage::Ping => {
+                    if let Err(e) =
+                        mesh_proto::frame::write_json(&mut send, &ControlMessage::Pong).await
+                    {
+                        warn!(error = %e, "failed to send Pong");
+                    }
+                }
+                ControlMessage::Pong => {
+                    let mut n = node.write().await;
+                    n.record_pong(&remote_id_string, now_epoch());
+                }
+                other => {
+                    warn!(?other, "unexpected control message from edge");
                 }
             }
-            ControlMessage::HealthReport {
-                endpoint_id,
-                services,
-            } => {
-                let mut n = node.write().await;
-                n.aggregate_health(&endpoint_id, services, now_epoch());
-            }
-            ControlMessage::Ping => {
-                if let Err(e) =
-                    mesh_proto::frame::write_json(&mut send, &ControlMessage::Pong).await
-                {
-                    warn!(error = %e, "failed to send Pong");
-                }
-            }
-            ControlMessage::Pong => {
-                let mut n = node.write().await;
-                n.record_pong(&remote_id.to_string(), now_epoch());
-            }
-            other => {
-                warn!(?other, "unexpected control message from edge");
-            }
+
+            // Finish the stream so the peer knows this request is done.
+            send.finish()
+                .map_err(|e| anyhow::anyhow!("failed to finish send stream: {e}"))?;
         }
 
-        // Finish the stream so the peer knows this request is done.
-        send.finish()
-            .map_err(|e| anyhow::anyhow!("failed to finish send stream: {e}"))?;
+        Ok(())
     }
+    .await;
 
-    Ok(())
+    active_connections
+        .remove_if_stale(&remote_id_string, &connection)
+        .await;
+    result
 }
 
 /// Process a Register message: validate ticket, allocate ports, respond with Ack/Nack.
 async fn handle_register(
     node: &Arc<RwLock<ControlNode>>,
+    active_connections: &Arc<ActiveControlConnections>,
     endpoint_id: &str,
     auth_ticket_str: &str,
     node_name: &str,
@@ -658,6 +719,10 @@ async fn handle_register(
                     "failed to send initial route table after registration"
                 );
             }
+
+            // TODO: Debounce this fan-out when many edges re-register at once to avoid O(N^2)
+            // route broadcasts during control-plane churn.
+            broadcast_routes(node, active_connections, Some(endpoint_id)).await;
         }
         Err(reason) => {
             warn!(%reason, "register rejected");
@@ -670,38 +735,23 @@ async fn handle_register(
     Ok(())
 }
 
-/// Broadcast the current route table to all online edge nodes.
-///
-/// Connects to each node individually, sends the update, and continues
-/// on per-node failure. Uses a fresh stream per node (no connection pooling).
-pub async fn broadcast_routes(node: &Arc<RwLock<ControlNode>>, endpoint: &iroh::Endpoint) {
-    let (routes, version, targets) = {
+/// Broadcast the current route table to every connected edge except the sender.
+async fn broadcast_routes(
+    node: &Arc<RwLock<ControlNode>>,
+    active_connections: &Arc<ActiveControlConnections>,
+    exclude_endpoint_id: Option<&str>,
+) {
+    let (routes, version) = {
         let n = node.read().await;
-        (n.routes().clone(), n.route_version(), n.online_node_addrs())
+        (n.routes().clone(), n.route_version())
     };
+    let targets = active_connections.snapshot(exclude_endpoint_id).await;
 
     let update = ControlMessage::RouteTableUpdate { routes, version };
 
-    for (eid, addr_str) in &targets {
-        // Parse the stored EndpointId string back, then connect via Into<EndpointAddr>.
-        let endpoint_id: iroh::EndpointId = match addr_str.parse() {
-            Ok(a) => a,
-            Err(e) => {
-                warn!(endpoint_id = %eid, error = %e, "cannot parse stored endpoint id, skipping broadcast");
-                continue;
-            }
-        };
-
-        let conn = match endpoint.connect(endpoint_id, ALPN_CONTROL).await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(endpoint_id = %eid, error = %e, "failed to connect for route broadcast");
-                continue;
-            }
-        };
-
+    for (eid, connection) in targets {
         let result: anyhow::Result<()> = async {
-            let (mut send, _recv) = conn.open_bi().await.context("open_bi failed")?;
+            let (mut send, _recv) = connection.open_bi().await.context("open_bi failed")?;
             mesh_proto::frame::write_json(&mut send, &update)
                 .await
                 .context("write route update failed")?;
