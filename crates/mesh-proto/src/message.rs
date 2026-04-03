@@ -53,7 +53,7 @@ pub struct PortAssignment {
 }
 
 /// An entry in the global route table.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteEntry {
     pub service_name: String,
     pub node_name: String,

@@ -13,7 +13,9 @@ pub use control_node::{
     ControlNode, ControlNodeSnapshot, QuotaError, TicketError, broadcast_routes, run_accept_loop,
 };
 pub use daemon::{Daemon, ShutdownRx, ShutdownTx};
-pub use edge_node::{ConnectionState, EdgeNode, TransitionError};
+#[cfg(unix)]
+pub use edge_node::spawn_unix_listener;
+pub use edge_node::{ConnectionState, EdgeNode, TransitionError, route_diff, spawn_tcp_listener};
 pub use ipc_server::IpcServer;
 pub use mesh_node::MeshNode;
 pub use persistence::{PersistenceError, load_state, save_atomic};
