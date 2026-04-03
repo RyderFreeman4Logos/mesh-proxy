@@ -152,6 +152,8 @@ fn dispatch(request: &IpcRequest, state: &SharedState) -> IpcResponse {
                 online,
                 connected_nodes: vec![],
                 services: vec![],
+                health_bind: state.config.health_bind.clone(),
+                route_table_version: 0,
             })
         }
         IpcRequest::Stop => {
@@ -162,6 +164,12 @@ fn dispatch(request: &IpcRequest, state: &SharedState) -> IpcResponse {
         }
         IpcRequest::Reload => IpcResponse::Ok {
             message: "reload not yet implemented".to_string(),
+        },
+        IpcRequest::Restart => IpcResponse::Error {
+            message: "restart not yet implemented".to_string(),
+        },
+        IpcRequest::ExposeService { .. } => IpcResponse::Error {
+            message: "expose not yet implemented".to_string(),
         },
         IpcRequest::AcceptNode { .. } => IpcResponse::Error {
             message: "accept not yet implemented".to_string(),

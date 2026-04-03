@@ -212,6 +212,12 @@ async fn cmd_status(config_path: &Path, output: OutputFormat) -> Result<()> {
         IpcResponse::Ok { message } => {
             println!("{message}");
         }
+        IpcResponse::ServiceExposed {
+            name,
+            assigned_port,
+        } => {
+            println!("Service '{name}' exposed (port: {assigned_port:?})");
+        }
     }
 
     Ok(())

@@ -1,12 +1,17 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::config::Protocol;
+use crate::health::HealthCheckConfig;
+use crate::service::ServiceHealthEntry;
+
 /// Messages exchanged over the control plane (ALPN: /mesh/ctrl/1).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlMessage {
     /// Edge -> Control: register this node and its services.
     Register {
         node_name: String,
+        auth_ticket: String,
         services: Vec<ServiceRegistration>,
     },
     /// Control -> Edge: registration accepted, here are your port assignments.
@@ -21,16 +26,22 @@ pub enum ControlMessage {
     RouteTableUpdate {
         routes: HashMap<u16, RouteEntry>,
     },
+    /// Edge -> Control: periodic health status report.
+    HealthReport {
+        endpoint_id: String,
+        services: Vec<ServiceHealthEntry>,
+    },
     /// Bidirectional heartbeat.
     Ping,
     Pong,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ServiceRegistration {
     pub name: String,
     pub local_addr: String,
-    pub protocol: String,
+    pub protocol: Protocol,
+    pub health_check: Option<HealthCheckConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,5 +60,5 @@ pub struct RouteEntry {
     pub endpoint_id: String,
     /// The local address on the target node.
     pub target_local_addr: String,
-    pub protocol: String,
+    pub protocol: Protocol,
 }

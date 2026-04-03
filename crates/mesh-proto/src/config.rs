@@ -3,6 +3,17 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
+use crate::health::HealthCheckConfig;
+
+/// Transport protocol for a service.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    #[default]
+    Tcp,
+    Unix,
+}
+
 /// Top-level configuration file structure.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MeshConfig {
@@ -12,6 +23,9 @@ pub struct MeshConfig {
     pub secret_key: Option<String>,
     /// For edge nodes: the control node's endpoint address (serialized).
     pub control_addr: Option<String>,
+    /// Optional bind address for the local health query HTTP endpoint.
+    #[serde(default)]
+    pub health_bind: Option<String>,
     /// Services this node exposes (edge nodes only).
     #[serde(default)]
     pub services: Vec<ServiceEntry>,
@@ -28,26 +42,25 @@ pub enum NodeRole {
 }
 
 /// A service exposed by an edge node.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ServiceEntry {
     /// Human-readable service name (e.g. "llama3_api").
     pub name: String,
     /// Local address the service listens on.
     /// Can be a TCP address ("127.0.0.1:8080") or Unix socket path ("/tmp/foo.sock").
     pub local_addr: String,
-    /// Protocol: "tcp" or "unix".
-    #[serde(default = "default_protocol")]
-    pub protocol: String,
+    /// Transport protocol.
+    #[serde(default)]
+    pub protocol: Protocol,
+    /// Optional health check configuration for this service.
+    #[serde(default)]
+    pub health_check: Option<HealthCheckConfig>,
 }
 
 fn default_data_dir() -> PathBuf {
     dirs_next::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("mesh-proxy")
-}
-
-fn default_protocol() -> String {
-    "tcp".to_string()
 }
 
 impl Default for MeshConfig {
@@ -59,13 +72,33 @@ impl Default for MeshConfig {
             role: NodeRole::Edge,
             secret_key: None,
             control_addr: None,
+            health_bind: None,
             services: Vec::new(),
             data_dir: default_data_dir(),
         }
     }
 }
 
+impl ServiceEntry {
+    /// Returns `true` if all fields match `Self::default()`.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl HealthCheckConfig {
+    /// Returns `true` if all fields match `Self::default()`.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 impl MeshConfig {
+    /// Returns `true` if all fields match `Self::default()`.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
     /// Returns the default config file path: `~/.config/mesh-proxy/config.toml`.
     pub fn default_config_path() -> PathBuf {
         dirs_next::config_dir()
@@ -136,10 +169,12 @@ mod tests {
             role: NodeRole::Control,
             secret_key: Some("5HueCGU8rMjxEXxiPuD5BDku4MkFqeZyd4dZ1jvhTVqvbTLvyTJ".to_string()),
             control_addr: None,
+            health_bind: None,
             services: vec![ServiceEntry {
                 name: "llama3_api".to_string(),
                 local_addr: "127.0.0.1:8080".to_string(),
-                protocol: "tcp".to_string(),
+                protocol: Protocol::Tcp,
+                health_check: None,
             }],
             data_dir: PathBuf::from("/tmp/mesh-test"),
         }
@@ -167,6 +202,36 @@ mod tests {
         assert!(path.exists());
         assert_eq!(config.role, NodeRole::Edge);
         assert!(config.secret_key.is_none());
+    }
+
+    #[test]
+    fn test_mesh_config_is_default() {
+        let config = MeshConfig::default();
+        assert!(config.is_default());
+
+        let mut modified = MeshConfig::default();
+        modified.role = NodeRole::Control;
+        assert!(!modified.is_default());
+    }
+
+    #[test]
+    fn test_service_entry_is_default() {
+        let entry = ServiceEntry::default();
+        assert!(entry.is_default());
+
+        let mut modified = ServiceEntry::default();
+        modified.name = "svc".to_string();
+        assert!(!modified.is_default());
+    }
+
+    #[test]
+    fn test_health_check_config_is_default() {
+        let hc = HealthCheckConfig::default();
+        assert!(hc.is_default());
+
+        let mut modified = HealthCheckConfig::default();
+        modified.interval_seconds = 30;
+        assert!(!modified.is_default());
     }
 
     #[cfg(unix)]
