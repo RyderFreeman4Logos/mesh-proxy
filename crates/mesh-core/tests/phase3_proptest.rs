@@ -1,9 +1,11 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use mesh_core::EdgeNode;
-use mesh_proto::{MAX_LISTENERS, Protocol, RouteEntry};
+use mesh_proto::{MAX_LISTENERS, MeshConfig, Protocol, RouteEntry};
 use proptest::collection::vec;
 use proptest::prelude::*;
+use tokio::sync::RwLock;
 
 const PORT_POOL_SIZE: usize = MAX_LISTENERS + 4;
 const MAX_SEQUENCE_LEN: usize = 16;
@@ -65,10 +67,13 @@ proptest! {
         let result: Result<(), TestCaseError> = runtime.block_on(async {
             let ports = reserve_unused_tcp_ports(PORT_POOL_SIZE);
             let mut edge = EdgeNode::new();
+            let config = Arc::new(RwLock::new(MeshConfig::default()));
 
             for (index, update) in updates.iter().enumerate() {
                 let routes = build_routes(&ports, update);
-                let applied = edge.apply_route_update(routes, (index + 1) as u64).await;
+                let applied = edge
+                    .apply_route_update(routes, (index + 1) as u64, Arc::clone(&config))
+                    .await;
                 prop_assert!(applied, "route update should be applied");
                 prop_assert!(
                     edge.listener_count() <= MAX_LISTENERS,
@@ -79,7 +84,9 @@ proptest! {
             }
 
             let cleanup_version = updates.len() as u64 + 1;
-            let cleaned_up = edge.apply_route_update(HashMap::new(), cleanup_version).await;
+            let cleaned_up = edge
+                .apply_route_update(HashMap::new(), cleanup_version, config)
+                .await;
             prop_assert!(cleaned_up, "cleanup update should be applied");
             prop_assert_eq!(edge.listener_count(), 0);
 

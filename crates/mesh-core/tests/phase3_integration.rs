@@ -53,6 +53,10 @@ fn test_route(service_name: &str, endpoint_id: &str, target_local_addr: String) 
     }
 }
 
+fn test_runtime_config() -> Arc<RwLock<MeshConfig>> {
+    Arc::new(RwLock::new(MeshConfig::default()))
+}
+
 async fn assert_listener_accepts(port: u16) -> Result<()> {
     let mut stream = TcpStream::connect(("127.0.0.1", port))
         .await
@@ -180,6 +184,7 @@ async fn test_route_diff_drives_listeners() -> Result<()> {
     let removed_port = ports[0];
     let kept_port = ports[1];
     let mut edge = EdgeNode::new();
+    let config = test_runtime_config();
 
     let initial_routes = HashMap::from([
         (
@@ -192,7 +197,10 @@ async fn test_route_diff_drives_listeners() -> Result<()> {
         ),
     ]);
 
-    assert!(edge.apply_route_update(initial_routes, 1).await);
+    assert!(
+        edge.apply_route_update(initial_routes, 1, Arc::clone(&config))
+            .await
+    );
     assert_eq!(edge.listener_count(), 2);
     assert_listener_accepts(removed_port).await?;
     assert_listener_accepts(kept_port).await?;
@@ -202,12 +210,15 @@ async fn test_route_diff_drives_listeners() -> Result<()> {
         test_route("beta", "endpoint-beta", "127.0.0.1:3001".to_string()),
     )]);
 
-    assert!(edge.apply_route_update(updated_routes, 2).await);
+    assert!(
+        edge.apply_route_update(updated_routes, 2, Arc::clone(&config))
+            .await
+    );
     assert_eq!(edge.listener_count(), 1);
     assert_listener_accepts(kept_port).await?;
     wait_for_port_to_close(removed_port).await?;
 
-    assert!(edge.apply_route_update(HashMap::new(), 3).await);
+    assert!(edge.apply_route_update(HashMap::new(), 3, config).await);
     assert_eq!(edge.listener_count(), 0);
     wait_for_port_to_close(kept_port).await?;
 

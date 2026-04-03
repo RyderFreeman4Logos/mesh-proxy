@@ -93,6 +93,7 @@ async fn wait_before_retry(shutdown: &mut broadcast::Receiver<()>) -> bool {
 
 async fn apply_register_ack(
     edge_node: &Arc<RwLock<EdgeNode>>,
+    config: &Arc<RwLock<MeshConfig>>,
     endpoint_id: &str,
     node_name: &str,
     snapshot: &RegistrationSnapshot,
@@ -137,7 +138,9 @@ async fn apply_register_ack(
     // RegisterAck does not carry a route-table version, so advance a local
     // synthetic version to apply listener changes until a fresher snapshot arrives.
     let next_version = edge.route_version().saturating_add(1);
-    let applied = edge.apply_route_update(merged_routes, next_version).await;
+    let applied = edge
+        .apply_route_update(merged_routes, next_version, Arc::clone(config))
+        .await;
     if applied {
         edge.save_route_cache(&snapshot.data_dir)
             .await
@@ -207,12 +210,15 @@ async fn apply_route_table_update(
     if force {
         // After fresh registration, always apply the route table from control
         // regardless of cached version (the control is authoritative).
-        edge.force_route_update(routes, version).await;
+        edge.force_route_update(routes, version, Arc::clone(config))
+            .await;
         edge.save_route_cache(&data_dir)
             .await
             .context("failed to persist route cache after forced route update")?;
     } else {
-        let applied = edge.apply_route_update(routes, version).await;
+        let applied = edge
+            .apply_route_update(routes, version, Arc::clone(config))
+            .await;
         if applied {
             edge.save_route_cache(&data_dir)
                 .await
@@ -286,9 +292,16 @@ async fn send_register(
             } else {
                 // Older control nodes may only return RegisterAck, so keep the
                 // synthetic merge path as a compatibility fallback.
-                apply_register_ack(edge_node, endpoint_id, node_name, &snapshot, &assignments)
-                    .await
-                    .context("failed to apply register ack")?;
+                apply_register_ack(
+                    edge_node,
+                    config,
+                    endpoint_id,
+                    node_name,
+                    &snapshot,
+                    &assignments,
+                )
+                .await
+                .context("failed to apply register ack")?;
             }
 
             log_register_ack_assignments(&assignments);
@@ -483,7 +496,7 @@ pub async fn run_registration_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mesh_proto::Protocol;
+    use mesh_proto::{Protocol, ServiceEntry};
 
     const ENDPOINT_ID_A: &str = "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6";
     const ENDPOINT_ID_B: &str = "5f3db5df65f8fd2815250f699f9d87513a86f969e5da9f634e9a55e8eb49f1a0";
@@ -551,8 +564,18 @@ mod tests {
         );
 
         let edge = Arc::new(RwLock::new(edge));
+        let config = Arc::new(RwLock::new(MeshConfig {
+            services: vec![ServiceEntry {
+                name: "local-api".to_string(),
+                local_addr: "127.0.0.1:8080".to_string(),
+                protocol: Protocol::Tcp,
+                health_check: None,
+            }],
+            ..MeshConfig::default()
+        }));
         apply_register_ack(
             &edge,
+            &config,
             &endpoint_id,
             "edge-a",
             &snapshot,
