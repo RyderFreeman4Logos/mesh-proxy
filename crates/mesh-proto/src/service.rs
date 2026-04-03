@@ -34,6 +34,9 @@ pub struct NodeInfo {
     pub is_online: bool,
     /// Unix timestamp (seconds) of the last heartbeat.
     pub last_heartbeat: Option<u64>,
+    /// Serialized `EndpointAddr` for connecting back to this node.
+    #[serde(default)]
+    pub addr: Option<String>,
 }
 
 /// Per-service health entry reported by an edge node.

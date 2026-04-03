@@ -7,7 +7,9 @@ mod persistence;
 mod port_allocator;
 pub mod process;
 
-pub use control_node::{ControlNode, ControlNodeSnapshot, QuotaError, TicketError};
+pub use control_node::{
+    ControlNode, ControlNodeSnapshot, QuotaError, TicketError, broadcast_routes, run_accept_loop,
+};
 pub use daemon::{Daemon, ShutdownRx, ShutdownTx};
 pub use edge_node::{ConnectionState, EdgeNode, TransitionError};
 pub use ipc_server::IpcServer;

@@ -25,6 +25,7 @@ pub enum ControlMessage {
     /// Control -> All edges: updated global route table.
     RouteTableUpdate {
         routes: HashMap<u16, RouteEntry>,
+        version: u64,
     },
     /// Edge -> Control: periodic health status report.
     HealthReport {

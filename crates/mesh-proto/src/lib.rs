@@ -9,7 +9,7 @@ mod validate;
 
 pub use config::{MeshConfig, NodeRole, Protocol, ServiceEntry};
 pub use health::{HealthCheckConfig, HealthCheckMode, HealthState};
-pub use ipc::{IpcRequest, IpcResponse, StatusInfo};
+pub use ipc::{ConnectedNode, IpcRequest, IpcResponse, ServiceStatus, StatusInfo};
 pub use message::{ControlMessage, PortAssignment, RouteEntry, ServiceRegistration};
 pub use service::{NodeInfo, ServiceHealthEntry, ServiceId, ServiceRecord};
 pub use ticket::{JoinTicket, TicketError, TicketStatus};

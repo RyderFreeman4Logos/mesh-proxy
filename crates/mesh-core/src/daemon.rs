@@ -1,11 +1,15 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
-use mesh_proto::MeshConfig;
+use mesh_proto::{MeshConfig, NodeRole};
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
+use crate::control_node::ControlNode;
+use crate::edge_node::EdgeNode;
+use crate::ipc_server::NodeState;
 use crate::process::StartupReadyWriter;
 
 /// Shutdown signal type.
@@ -61,8 +65,8 @@ impl Daemon {
         self.config.data_dir.join("daemon.pid")
     }
 
-    /// Main daemon loop. Starts IPC server, installs signal handlers, and
-    /// waits for shutdown.
+    /// Main daemon loop. Starts IPC server, initialises node by role,
+    /// installs signal handlers, and waits for shutdown.
     pub async fn run(&mut self) -> Result<()> {
         info!(
             role = ?self.config.role,
@@ -81,6 +85,8 @@ impl Daemon {
         )
         .await?;
         let ipc_status = ipc_server.status_handle();
+        let node_state_handle = ipc_server.node_state_handle();
+
         if let Some(mut startup_ready) = self.startup_ready.take() {
             startup_ready.signal_ready()?;
         }
@@ -98,6 +104,37 @@ impl Daemon {
         ipc_status.set_mesh_node(mesh_node.id().to_string(), true);
         info!(endpoint_id = %mesh_node.id(), "mesh node initialized");
 
+        // Branch by role: create node state and start role-specific tasks.
+        let accept_handle = match self.config.role {
+            NodeRole::Control => {
+                let cn = Arc::new(tokio::sync::RwLock::new(ControlNode::new()));
+                {
+                    let mut ns = node_state_handle.write().await;
+                    *ns = NodeState::Control(Arc::clone(&cn));
+                }
+                let shutdown_rx = self.shutdown_rx();
+                let endpoint = mesh_node.endpoint().clone();
+                let cn_clone = Arc::clone(&cn);
+                Some(tokio::spawn(async move {
+                    crate::control_node::run_accept_loop(cn_clone, endpoint, shutdown_rx).await;
+                }))
+            }
+            NodeRole::Edge => {
+                let en = Arc::new(tokio::sync::RwLock::new(EdgeNode::new()));
+                // Load persisted route cache if available.
+                if let Some((routes, version)) = EdgeNode::load_route_cache(&self.config.data_dir) {
+                    let mut edge = en.write().await;
+                    edge.update_routes(routes, version);
+                    info!(version, "loaded persisted route cache");
+                }
+                {
+                    let mut ns = node_state_handle.write().await;
+                    *ns = NodeState::Edge(Arc::clone(&en));
+                }
+                None
+            }
+        };
+
         // Install signal handlers — both trigger the same shutdown broadcast
         let shutdown_tx = self.shutdown_tx.clone();
         tokio::spawn(async move {
@@ -108,6 +145,11 @@ impl Daemon {
         let mut shutdown_rx = self.shutdown_rx();
         shutdown_rx.recv().await.ok();
         info!("shutdown signal received, cleaning up...");
+
+        // Wait for accept loop to finish (if running).
+        if let Some(handle) = accept_handle {
+            handle.await.ok();
+        }
 
         // Close iroh endpoint before cleanup
         mesh_node.close().await;

@@ -1,6 +1,14 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use mesh_proto::{JoinTicket, NodeInfo, RouteEntry, ServiceId, ServiceRecord};
+use anyhow::Context;
+use mesh_proto::{
+    ALPN_CONTROL, ControlMessage, JoinTicket, NodeInfo, PortAssignment, RouteEntry, ServiceId,
+    ServiceRecord,
+};
+use tokio::sync::RwLock;
+use tracing::{info, warn};
 
 use crate::port_allocator::PortAllocator;
 
@@ -240,6 +248,123 @@ impl ControlNode {
             .collect()
     }
 
+    // -- Service registration (2C-02) --
+
+    /// Register services for a node, allocating ports atomically.
+    ///
+    /// On success, returns port assignments and updates the whitelist, service
+    /// registry, and route table. On failure (quota exceeded, pool exhausted),
+    /// all tentative allocations are rolled back.
+    pub fn register_services(
+        &mut self,
+        endpoint_id: &str,
+        node_name: &str,
+        registrations: &[mesh_proto::ServiceRegistration],
+        now_epoch: u64,
+    ) -> Result<Vec<PortAssignment>, String> {
+        // Quota check: ensure enough capacity for all requested services.
+        let current_count = self
+            .services
+            .keys()
+            .filter(|sid| sid.endpoint_id == endpoint_id)
+            .count();
+        let node = self
+            .whitelist
+            .get(endpoint_id)
+            .ok_or_else(|| format!("node not found in whitelist: {endpoint_id}"))?;
+        if current_count + registrations.len() > node.quota_limit as usize {
+            return Err(format!(
+                "quota exceeded: have {current_count}, want {} more, limit {}",
+                registrations.len(),
+                node.quota_limit
+            ));
+        }
+
+        // Allocate ports for each service (tentative).
+        let mut assignments = Vec::with_capacity(registrations.len());
+        let mut allocated_ports = Vec::with_capacity(registrations.len());
+
+        for reg in registrations {
+            let sid = ServiceId {
+                endpoint_id: endpoint_id.to_owned(),
+                service_name: reg.name.clone(),
+            };
+            match self.allocator.allocate(&sid, now_epoch) {
+                Some(port) => {
+                    allocated_ports.push(port);
+                    assignments.push(PortAssignment {
+                        service_name: reg.name.clone(),
+                        assigned_port: port,
+                    });
+                }
+                None => {
+                    // Rollback all tentative allocations.
+                    for port in &allocated_ports {
+                        self.allocator.release(*port);
+                    }
+                    return Err("port pool exhausted".to_owned());
+                }
+            }
+        }
+
+        // Commit: update whitelist online status, services, and routes.
+        if let Some(info) = self.whitelist.get_mut(endpoint_id) {
+            info.is_online = true;
+            info.last_heartbeat = Some(now_epoch);
+        }
+
+        for (reg, assignment) in registrations.iter().zip(assignments.iter()) {
+            let sid = ServiceId {
+                endpoint_id: endpoint_id.to_owned(),
+                service_name: reg.name.clone(),
+            };
+            let record = ServiceRecord {
+                service_id: sid.clone(),
+                node_name: node_name.to_owned(),
+                local_addr: reg.local_addr.clone(),
+                protocol: reg.protocol,
+                published_port: Some(assignment.assigned_port),
+                health_state: mesh_proto::HealthState::Unknown,
+                last_seen: Some(now_epoch),
+            };
+            self.services.insert(sid, record);
+
+            // Confirm the pending port allocation.
+            self.allocator.confirm(assignment.assigned_port);
+
+            // Insert route entry.
+            self.routes.insert(
+                assignment.assigned_port,
+                RouteEntry {
+                    service_name: reg.name.clone(),
+                    node_name: node_name.to_owned(),
+                    endpoint_id: endpoint_id.to_owned(),
+                    target_local_addr: reg.local_addr.clone(),
+                    protocol: reg.protocol,
+                },
+            );
+        }
+
+        self.route_version += 1;
+        Ok(assignments)
+    }
+
+    /// Returns a list of online nodes with their endpoint addresses for broadcasting.
+    pub fn online_node_addrs(&self) -> Vec<(String, String)> {
+        self.whitelist
+            .values()
+            .filter(|n| n.is_online)
+            .filter_map(|n| n.addr.as_ref().map(|a| (n.endpoint_id.clone(), a.clone())))
+            .collect()
+    }
+
+    /// Update the stored address for a node (used when accepting connections).
+    pub fn set_node_addr(&mut self, endpoint_id: &str, addr: String) {
+        if let Some(info) = self.whitelist.get_mut(endpoint_id) {
+            info.addr = Some(addr);
+        }
+    }
+
     // -- Health aggregation (2B-08) --
 
     /// Update health state for services reported by an edge node.
@@ -271,6 +396,266 @@ impl ControlNode {
     }
 }
 
+// -- Network layer (2C-01, 2C-02, 2C-03, 2C-04) --
+
+fn now_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Accept incoming control-plane connections, verify ALPN, and dispatch messages.
+///
+/// Runs until a shutdown signal is received or the endpoint is closed.
+pub async fn run_accept_loop(
+    node: Arc<RwLock<ControlNode>>,
+    endpoint: iroh::Endpoint,
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            incoming = endpoint.accept() => {
+                let Some(incoming) = incoming else {
+                    info!("endpoint closed, stopping accept loop");
+                    break;
+                };
+                // Accept the connection and complete the handshake.
+                // ALPN is only available after handshake on Connection<HandshakeCompleted>.
+                let connection = match incoming.accept() {
+                    Ok(connecting) => match connecting.await {
+                        Ok(conn) => conn,
+                        Err(e) => {
+                            warn!(error = %e, "failed to complete connection handshake");
+                            continue;
+                        }
+                    },
+                    Err(e) => {
+                        warn!(error = %e, "failed to accept incoming connection");
+                        continue;
+                    }
+                };
+
+                // Check ALPN after handshake.
+                if connection.alpn() != ALPN_CONTROL {
+                    warn!(
+                        alpn = ?String::from_utf8_lossy(connection.alpn()),
+                        "rejecting connection with unexpected ALPN"
+                    );
+                    connection.close(0u32.into(), b"wrong ALPN");
+                    continue;
+                }
+
+                let node = Arc::clone(&node);
+                tokio::spawn(async move {
+                    if let Err(e) = handle_connection(node, connection).await {
+                        warn!(error = %e, "control connection handler error");
+                    }
+                });
+            }
+            _ = shutdown.recv() => {
+                info!("accept loop received shutdown signal");
+                break;
+            }
+        }
+    }
+}
+
+/// Handle a single control-plane connection: read messages in a loop and dispatch.
+async fn handle_connection(
+    node: Arc<RwLock<ControlNode>>,
+    connection: iroh::endpoint::Connection,
+) -> anyhow::Result<()> {
+    let remote_id = connection.remote_id();
+    info!(%remote_id, "control connection established");
+
+    // Store the endpoint ID string for route broadcasting.
+    {
+        let mut n = node.write().await;
+        n.set_node_addr(&remote_id.to_string(), remote_id.to_string());
+    }
+
+    loop {
+        let (mut send, mut recv) = match connection.accept_bi().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                // Connection closed or error — stop handling.
+                info!(error = %e, "control connection closed");
+                break;
+            }
+        };
+
+        let msg: ControlMessage = match mesh_proto::frame::read_json(&mut recv).await {
+            Ok(msg) => msg,
+            Err(e) => {
+                warn!(error = %e, "failed to read control message");
+                break;
+            }
+        };
+
+        match msg {
+            ControlMessage::Register {
+                node_name,
+                auth_ticket,
+                services,
+            } => {
+                if let Err(e) = handle_register(
+                    &node,
+                    &remote_id.to_string(),
+                    &auth_ticket,
+                    &node_name,
+                    services,
+                    &mut send,
+                )
+                .await
+                {
+                    warn!(error = %e, "register handler failed");
+                }
+            }
+            ControlMessage::HealthReport {
+                endpoint_id,
+                services,
+            } => {
+                let mut n = node.write().await;
+                n.aggregate_health(&endpoint_id, services);
+            }
+            ControlMessage::Ping => {
+                if let Err(e) =
+                    mesh_proto::frame::write_json(&mut send, &ControlMessage::Pong).await
+                {
+                    warn!(error = %e, "failed to send Pong");
+                }
+            }
+            ControlMessage::Pong => {
+                let mut n = node.write().await;
+                n.record_pong(&remote_id.to_string(), now_epoch());
+            }
+            other => {
+                warn!(?other, "unexpected control message from edge");
+            }
+        }
+
+        // Finish the stream so the peer knows this request is done.
+        send.finish()
+            .map_err(|e| anyhow::anyhow!("failed to finish send stream: {e}"))?;
+    }
+
+    Ok(())
+}
+
+/// Process a Register message: validate ticket, allocate ports, respond with Ack/Nack.
+async fn handle_register(
+    node: &Arc<RwLock<ControlNode>>,
+    endpoint_id: &str,
+    auth_ticket_str: &str,
+    node_name: &str,
+    services: Vec<mesh_proto::ServiceRegistration>,
+    send: &mut iroh::endpoint::SendStream,
+) -> anyhow::Result<()> {
+    let now = now_epoch();
+
+    // Decode ticket.
+    let ticket = match JoinTicket::from_bs58(auth_ticket_str) {
+        Ok(t) => t,
+        Err(e) => {
+            let reason = format!("invalid ticket: {e}");
+            warn!(%reason, "register rejected");
+            mesh_proto::frame::write_json(send, &ControlMessage::RegisterNack { reason })
+                .await
+                .context("failed to send RegisterNack")?;
+            return Ok(());
+        }
+    };
+
+    // Validate ticket (expiry, replay, endpoint match).
+    {
+        let mut n = node.write().await;
+        if let Err(e) = n.validate_ticket(&ticket, endpoint_id, now) {
+            let reason = format!("ticket validation failed: {e}");
+            warn!(%reason, "register rejected");
+            mesh_proto::frame::write_json(send, &ControlMessage::RegisterNack { reason })
+                .await
+                .context("failed to send RegisterNack")?;
+            return Ok(());
+        }
+    }
+
+    // Register services (quota check + port allocation, atomic).
+    let result = {
+        let mut n = node.write().await;
+        n.register_services(endpoint_id, node_name, &services, now)
+    };
+
+    match result {
+        Ok(assignments) => {
+            info!(
+                endpoint_id,
+                node_name,
+                count = assignments.len(),
+                "node registered successfully"
+            );
+            mesh_proto::frame::write_json(send, &ControlMessage::RegisterAck { assignments })
+                .await
+                .context("failed to send RegisterAck")?;
+        }
+        Err(reason) => {
+            warn!(%reason, "register rejected");
+            mesh_proto::frame::write_json(send, &ControlMessage::RegisterNack { reason })
+                .await
+                .context("failed to send RegisterNack")?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Broadcast the current route table to all online edge nodes.
+///
+/// Connects to each node individually, sends the update, and continues
+/// on per-node failure. Uses a fresh stream per node (no connection pooling).
+pub async fn broadcast_routes(node: &Arc<RwLock<ControlNode>>, endpoint: &iroh::Endpoint) {
+    let (routes, version, targets) = {
+        let n = node.read().await;
+        (n.routes().clone(), n.route_version(), n.online_node_addrs())
+    };
+
+    let update = ControlMessage::RouteTableUpdate { routes, version };
+
+    for (eid, addr_str) in &targets {
+        // Parse the stored EndpointId string back, then connect via Into<EndpointAddr>.
+        let endpoint_id: iroh::EndpointId = match addr_str.parse() {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(endpoint_id = %eid, error = %e, "cannot parse stored endpoint id, skipping broadcast");
+                continue;
+            }
+        };
+
+        let conn = match endpoint.connect(endpoint_id, ALPN_CONTROL).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(endpoint_id = %eid, error = %e, "failed to connect for route broadcast");
+                continue;
+            }
+        };
+
+        let result: anyhow::Result<()> = async {
+            let (mut send, _recv) = conn.open_bi().await.context("open_bi failed")?;
+            mesh_proto::frame::write_json(&mut send, &update)
+                .await
+                .context("write route update failed")?;
+            send.finish()
+                .map_err(|e| anyhow::anyhow!("finish failed: {e}"))?;
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = result {
+            warn!(endpoint_id = %eid, error = %e, "route broadcast to node failed");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use mesh_proto::DEFAULT_SERVICE_QUOTA;
@@ -285,6 +670,7 @@ mod tests {
             quota_used: 0,
             is_online: true,
             last_heartbeat: None,
+            addr: None,
         }
     }
 

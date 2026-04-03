@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::path::Path;
 
 use mesh_proto::RouteEntry;
+
+use crate::persistence::{self, PersistenceError};
 
 /// Error returned when a state transition is not allowed.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -124,6 +127,50 @@ impl EdgeNode {
     pub fn route_version(&self) -> u64 {
         self.route_version
     }
+
+    /// Apply a route table update if the version is newer than the cached one.
+    ///
+    /// Returns `true` if the update was applied, `false` if stale.
+    pub fn apply_route_update(&mut self, routes: HashMap<u16, RouteEntry>, version: u64) -> bool {
+        if version <= self.route_version {
+            return false;
+        }
+        self.cached_routes = routes;
+        self.route_version = version;
+        true
+    }
+
+    /// Persist the cached route table and version to disk atomically.
+    pub async fn save_route_cache(&self, data_dir: &Path) -> Result<(), PersistenceError> {
+        let cache = RouteCache {
+            routes: self.cached_routes.clone(),
+            version: self.route_version,
+        };
+        let path = data_dir.join("route_cache.json");
+        persistence::save_atomic(&path, &cache).await
+    }
+
+    /// Load a previously persisted route cache from disk.
+    ///
+    /// Returns `None` if the file does not exist.
+    pub fn load_route_cache(data_dir: &Path) -> Option<(HashMap<u16, RouteEntry>, u64)> {
+        let path = data_dir.join("route_cache.json");
+        match persistence::load_state::<RouteCache>(&path) {
+            Ok(Some(cache)) => Some((cache.routes, cache.version)),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to load route cache, starting fresh");
+                None
+            }
+        }
+    }
+}
+
+/// Serializable wrapper for the route cache on disk.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RouteCache {
+    routes: HashMap<u16, RouteEntry>,
+    version: u64,
 }
 
 #[cfg(test)]
