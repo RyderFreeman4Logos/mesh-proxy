@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use mesh_proto::{JoinTicket, MeshConfig, NodeRole, ServiceEntry};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task;
 use tracing::{error, info, warn};
 
@@ -97,6 +97,7 @@ pub struct Daemon {
     config_path: PathBuf,
     shutdown_tx: ShutdownTx,
     startup_ready: Option<StartupReadyWriter>,
+    service_change_tx: Option<watch::Sender<()>>,
 }
 
 impl Daemon {
@@ -112,6 +113,7 @@ impl Daemon {
             config_path,
             shutdown_tx,
             startup_ready: Some(startup_ready),
+            service_change_tx: None,
         }
     }
 
@@ -194,75 +196,107 @@ impl Daemon {
         }
 
         // Branch by role: create node state and start role-specific tasks.
-        let (accept_handle, _config_watcher, shared_config, health_state, active_connections) =
-            match self.config.role {
-                NodeRole::Control => {
-                    let cn = Arc::new(tokio::sync::RwLock::new(ControlNode::new()));
-                    {
-                        let mut ns = node_state_handle.write().await;
-                        *ns = NodeState::Control(Arc::clone(&cn));
-                    }
-                    let shutdown_rx = self.shutdown_rx();
-                    let endpoint = mesh_node.endpoint().clone();
-                    let cn_clone = Arc::clone(&cn);
-                    (
-                        Some(tokio::spawn(async move {
-                            crate::control_node::run_accept_loop(cn_clone, endpoint, shutdown_rx)
-                                .await;
-                        })),
-                        None,
-                        None,
-                        Some(HealthServerState::from(Arc::clone(&cn))),
-                        None,
-                    )
+        let (
+            accept_handle,
+            registration_handle,
+            _config_watcher,
+            shared_config,
+            service_change_tx,
+            health_state,
+            active_connections,
+        ) = match self.config.role {
+            NodeRole::Control => {
+                let cn = Arc::new(tokio::sync::RwLock::new(ControlNode::new()));
+                {
+                    let mut ns = node_state_handle.write().await;
+                    *ns = NodeState::Control(Arc::clone(&cn));
                 }
-                NodeRole::Edge => {
-                    let runtime_config = Arc::new(tokio::sync::RwLock::new(self.config.clone()));
-                    let shared_runtime_config = Arc::clone(&runtime_config);
-                    let en = Arc::new(tokio::sync::RwLock::new(EdgeNode::with_endpoint(
-                        mesh_node.endpoint().clone(),
-                    )));
-                    let health_state = HealthServerState::from(Arc::clone(&en));
-                    let edge_active_connections = Arc::new(AtomicUsize::new(0));
-                    let shutdown_active_connections = Arc::clone(&edge_active_connections);
-                    // Load persisted route cache if available.
-                    if let Some((routes, version)) =
-                        EdgeNode::load_route_cache(&self.config.data_dir)
-                    {
-                        let mut edge = en.write().await;
-                        edge.update_routes(routes, version);
-                        info!(version, "loaded persisted route cache");
-                    }
-                    {
-                        let mut ns = node_state_handle.write().await;
-                        *ns = NodeState::Edge(Arc::clone(&en));
-                    }
-                    let config_watcher =
-                        ConfigWatcher::new(self.config_path.clone(), config_tx.clone())?;
-                    info!(path = %self.config_path.display(), "config watcher started");
+                let shutdown_rx = self.shutdown_rx();
+                let endpoint = mesh_node.endpoint().clone();
+                let cn_clone = Arc::clone(&cn);
+                (
+                    Some(tokio::spawn(async move {
+                        crate::control_node::run_accept_loop(cn_clone, endpoint, shutdown_rx).await;
+                    })),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(HealthServerState::from(Arc::clone(&cn))),
+                    None,
+                )
+            }
+            NodeRole::Edge => {
+                let runtime_config = Arc::new(tokio::sync::RwLock::new(self.config.clone()));
+                let shared_runtime_config = Arc::clone(&runtime_config);
+                let en = Arc::new(tokio::sync::RwLock::new(EdgeNode::with_endpoint(
+                    mesh_node.endpoint().clone(),
+                )));
+                let health_state = HealthServerState::from(Arc::clone(&en));
+                let edge_active_connections = Arc::new(AtomicUsize::new(0));
+                let shutdown_active_connections = Arc::clone(&edge_active_connections);
+                // Load persisted route cache if available.
+                if let Some((routes, version)) = EdgeNode::load_route_cache(&self.config.data_dir) {
+                    let mut edge = en.write().await;
+                    edge.update_routes(routes, version);
+                    info!(version, "loaded persisted route cache");
+                }
+                {
+                    let mut ns = node_state_handle.write().await;
+                    *ns = NodeState::Edge(Arc::clone(&en));
+                }
+                let config_watcher =
+                    ConfigWatcher::new(self.config_path.clone(), config_tx.clone())?;
+                info!(path = %self.config_path.display(), "config watcher started");
+                let (svc_tx, svc_rx) = watch::channel(());
+                let reg_handle = if let Some(ref control_addr) = self.config.control_addr {
                     let endpoint = mesh_node.endpoint().clone();
-                    let data_dir = self.config.data_dir.clone();
+                    let control_addr = control_addr.clone();
+                    let node_name = self.config.node_name.clone();
+                    let config = Arc::clone(&runtime_config);
+                    let en = Arc::clone(&en);
                     let shutdown_rx = self.shutdown_rx();
-                    let accept_handle = tokio::spawn(async move {
-                        crate::edge_node::run_edge_accept_loop(
-                            en,
+                    Some(tokio::spawn(async move {
+                        crate::edge_registration::run_registration_loop(
                             endpoint,
-                            runtime_config,
-                            data_dir,
-                            edge_active_connections,
+                            control_addr,
+                            node_name,
+                            config,
+                            en,
+                            svc_rx,
                             shutdown_rx,
                         )
                         .await;
-                    });
-                    (
-                        Some(accept_handle),
-                        Some(config_watcher),
-                        Some(shared_runtime_config),
-                        Some(health_state),
-                        Some(shutdown_active_connections),
+                    }))
+                } else {
+                    None
+                };
+                let endpoint = mesh_node.endpoint().clone();
+                let data_dir = self.config.data_dir.clone();
+                let shutdown_rx = self.shutdown_rx();
+                let accept_handle = tokio::spawn(async move {
+                    crate::edge_node::run_edge_accept_loop(
+                        en,
+                        endpoint,
+                        runtime_config,
+                        data_dir,
+                        edge_active_connections,
+                        shutdown_rx,
                     )
-                }
-            };
+                    .await;
+                });
+                (
+                    Some(accept_handle),
+                    reg_handle,
+                    Some(config_watcher),
+                    Some(shared_runtime_config),
+                    Some(svc_tx),
+                    Some(health_state),
+                    Some(shutdown_active_connections),
+                )
+            }
+        };
+        self.service_change_tx = service_change_tx;
 
         let health_handle = if let Some(health_bind) = self.config.health_bind.as_deref() {
             let bind_addr: SocketAddr = health_bind
@@ -321,6 +355,12 @@ impl Daemon {
             && let Err(error) = handle.await
         {
             warn!(error = %error, "accept loop task join failed");
+        }
+
+        if let Some(handle) = registration_handle
+            && let Err(error) = handle.await
+        {
+            warn!(error = %error, "registration loop task join failed");
         }
 
         if let Some(active_connections) = active_connections.as_deref() {
@@ -440,6 +480,19 @@ impl Daemon {
         if self.config.role == NodeRole::Edge {
             let diff = ServiceDiff::between(&self.config.services, &new_config.services);
             diff.log(&self.config_path, new_config.services.len());
+            let services_changed = !diff.is_empty();
+
+            if let Some(shared_config) = shared_config {
+                *shared_config.write().await = new_config.clone();
+            }
+
+            self.config = new_config;
+
+            if services_changed && let Some(service_change_tx) = self.service_change_tx.as_ref() {
+                let _ = service_change_tx.send(());
+            }
+
+            return Ok(());
         } else {
             info!(path = %self.config_path.display(), "config reloaded from disk");
         }

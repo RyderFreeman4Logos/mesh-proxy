@@ -3,6 +3,7 @@ pub mod connection_pool;
 mod control_node;
 mod daemon;
 mod edge_node;
+pub mod edge_registration;
 pub mod health_prober;
 pub mod health_server;
 mod ipc_server;
