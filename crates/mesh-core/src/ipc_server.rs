@@ -208,9 +208,15 @@ fn dispatch(request: &IpcRequest, state: &SharedState) -> IpcResponse {
         IpcRequest::ExposeService { .. } => IpcResponse::Error {
             message: "expose not yet implemented".to_string(),
         },
-        IpcRequest::AcceptNode { .. } => IpcResponse::Error {
-            message: "accept not yet implemented".to_string(),
-        },
+        IpcRequest::AcceptNode { node_name, .. } => {
+            let label = node_name
+                .as_ref()
+                .map(|n| format!(" (name: {n})"))
+                .unwrap_or_default();
+            IpcResponse::Error {
+                message: format!("accept not yet implemented{label}"),
+            }
+        }
     }
 }
 

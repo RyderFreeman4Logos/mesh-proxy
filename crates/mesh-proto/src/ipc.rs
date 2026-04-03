@@ -22,8 +22,11 @@ pub enum IpcRequest {
         health_check: Option<HealthCheckConfig>,
     },
     /// Accept a new edge node (control node only).
-    /// The `node_name` is extracted from the ticket payload.
-    AcceptNode { ticket: String },
+    AcceptNode {
+        ticket: String,
+        /// Optional friendly name assigned by the admin.
+        node_name: Option<String>,
+    },
 }
 
 /// Response from daemon to CLI client.

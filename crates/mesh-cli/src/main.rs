@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use mesh_proto::{
     HealthCheckConfig, HealthCheckMode, IpcRequest, IpcResponse, MeshConfig, NodeRole, Protocol,
+    validate_local_addr, validate_service_name,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -307,6 +308,13 @@ async fn cmd_expose(
     health_check_mode: Option<HealthCheckModeArg>,
     health_check_target: Option<String>,
 ) -> Result<()> {
+    if let Err(reason) = validate_service_name(&name) {
+        anyhow::bail!("invalid service name '{name}': {reason}");
+    }
+    if let Err(reason) = validate_local_addr(&addr) {
+        anyhow::bail!("invalid local address '{addr}': {reason}");
+    }
+
     let config = MeshConfig::load(config_path)?;
     let socket_path = config.data_dir.join("daemon.sock");
 
@@ -358,11 +366,14 @@ async fn cmd_expose(
 }
 
 /// Accept an edge node's join ticket via IPC (control node only).
-async fn cmd_accept(config_path: &Path, ticket: String, _name: Option<String>) -> Result<()> {
+async fn cmd_accept(config_path: &Path, ticket: String, name: Option<String>) -> Result<()> {
     let config = MeshConfig::load(config_path)?;
     let socket_path = config.data_dir.join("daemon.sock");
 
-    let request = IpcRequest::AcceptNode { ticket };
+    let request = IpcRequest::AcceptNode {
+        ticket,
+        node_name: name,
+    };
 
     let mut stream = tokio::net::UnixStream::connect(&socket_path)
         .await
