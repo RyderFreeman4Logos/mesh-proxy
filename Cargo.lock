@@ -1935,6 +1935,7 @@ dependencies = [
  "anyhow",
  "clap",
  "iroh",
+ "libc",
  "mesh-core",
  "mesh-proto",
  "serde",

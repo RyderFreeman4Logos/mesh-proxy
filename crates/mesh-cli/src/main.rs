@@ -1,4 +1,7 @@
+use std::fmt::Write as _;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -31,6 +34,9 @@ enum Command {
         #[arg(long)]
         role: Role,
     },
+
+    /// Restart the daemon using the current config.
+    Restart,
 
     /// Stop the running daemon.
     Stop,
@@ -74,6 +80,20 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
+
+    /// Manage per-node service quotas (control node only).
+    Quota {
+        #[command(subcommand)]
+        command: QuotaCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum QuotaCommand {
+    /// Show quota usage for all accepted nodes.
+    Show,
+    /// Update the quota limit for a specific node.
+    Set { endpoint_id: String, limit: usize },
 }
 
 /// Node role selection, maps to `NodeRole` from mesh-proto.
@@ -158,33 +178,8 @@ fn main() -> Result<()> {
     let Cli { config, command } = Cli::parse();
 
     match command {
-        Command::Start { role } => {
-            // All pre-fork work is synchronous (single-threaded).
-            let mut cfg = MeshConfig::load(&config)?;
-            cfg.role = role.into();
-
-            let pid_path = cfg.data_dir.join("daemon.pid");
-            let socket_path = cfg.data_dir.join("daemon.sock");
-
-            mesh_core::process::cleanup_stale_socket(&socket_path, &pid_path);
-            let startup_ready = mesh_core::process::daemonize()?;
-
-            // Acquire PID lock — keep handle alive for daemon lifetime.
-            let _pid_lock = mesh_core::process::write_pid_file(&pid_path)?;
-
-            // NOW create tokio runtime (safe: we are the only thread).
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?
-                .block_on(async {
-                    tracing_subscriber::fmt()
-                        .with_env_filter(EnvFilter::from_default_env())
-                        .init();
-
-                    let mut daemon = mesh_core::Daemon::new(cfg, config, startup_ready);
-                    daemon.run().await
-                })
-        }
+        Command::Start { role } => cmd_start(&config, Some(role)),
+        Command::Restart => cmd_restart(&config),
         other => {
             // Non-start commands: create runtime normally.
             tokio::runtime::Builder::new_multi_thread()
@@ -216,11 +211,131 @@ fn main() -> Result<()> {
                             .await
                         }
                         Command::Accept { ticket, name } => cmd_accept(&config, ticket, name).await,
-                        Command::Start { .. } => unreachable!(),
+                        Command::Quota { command } => cmd_quota(&config, command).await,
+                        Command::Start { .. } | Command::Restart => unreachable!(),
                     }
                 })
         }
     }
+}
+
+fn cmd_start(config_path: &Path, role_override: Option<Role>) -> Result<()> {
+    // All pre-fork work is synchronous (single-threaded).
+    let mut config = MeshConfig::load(config_path)?;
+    if let Some(role) = role_override {
+        config.role = role.into();
+    }
+
+    let pid_path = config.data_dir.join("daemon.pid");
+    let socket_path = config.data_dir.join("daemon.sock");
+
+    mesh_core::process::cleanup_stale_socket(&socket_path, &pid_path);
+    let startup_ready = mesh_core::process::daemonize()?;
+
+    // Acquire PID lock — keep handle alive for daemon lifetime.
+    let _pid_lock = mesh_core::process::write_pid_file(&pid_path)?;
+
+    // Create the runtime after fork so the daemon starts single-threaded.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            tracing_subscriber::fmt()
+                .with_env_filter(EnvFilter::from_default_env())
+                .init();
+
+            let mut daemon =
+                mesh_core::Daemon::new(config, config_path.to_path_buf(), startup_ready);
+            daemon.run().await
+        })
+}
+
+fn cmd_restart(config_path: &Path) -> Result<()> {
+    let config = MeshConfig::load(config_path)?;
+    let pid_path = config.data_dir.join("daemon.pid");
+
+    match mesh_core::process::stop_daemon(&pid_path) {
+        Ok(pid) => {
+            println!("Shutdown signal sent to daemon (PID {pid})");
+
+            if wait_for_pid_file_removal(&pid_path, Duration::from_secs(10)) {
+                println!("Daemon exited");
+            } else if pid_path.exists() {
+                let stuck_pid = read_pid_file(&pid_path)?;
+                send_signal(stuck_pid, libc::SIGKILL)?;
+                println!(
+                    "Daemon did not exit within 10s; sent SIGKILL to daemon (PID {stuck_pid})"
+                );
+                let _ = wait_for_process_exit(stuck_pid, Duration::from_secs(2));
+            }
+        }
+        Err(error) => {
+            if mesh_core::process::is_daemon_running(&pid_path) {
+                return Err(error);
+            }
+            println!("Daemon not running; starting a new instance");
+        }
+    }
+
+    cmd_start(config_path, None)
+}
+
+fn read_pid_file(pid_path: &Path) -> Result<libc::pid_t> {
+    std::fs::read_to_string(pid_path)
+        .with_context(|| format!("failed to read PID file {}", pid_path.display()))?
+        .trim()
+        .parse()
+        .context("invalid PID in file")
+}
+
+fn wait_for_pid_file_removal(pid_path: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !pid_path.exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    !pid_path.exists()
+}
+
+fn wait_for_process_exit(pid: libc::pid_t, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !process_exists(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    !process_exists(pid)
+}
+
+fn process_exists(pid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 only checks whether the target process exists.
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+
+    matches!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EPERM)
+    )
+}
+
+fn send_signal(pid: libc::pid_t, signal: i32) -> Result<()> {
+    // SAFETY: sending a signal to a PID read from the daemon PID file.
+    let rc = unsafe { libc::kill(pid, signal) };
+    if rc == 0 {
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+
+    anyhow::bail!("failed to send signal {signal} to PID {pid}: {error}");
 }
 
 /// Stop the running daemon by sending SIGTERM via PID file.
@@ -243,17 +358,48 @@ async fn cmd_stop(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn daemon_socket_path(config_path: &Path) -> Result<PathBuf> {
+    let config = MeshConfig::load(config_path)?;
+    Ok(config.data_dir.join("daemon.sock"))
+}
+
+async fn send_ipc_request(
+    socket_path: &Path,
+    request: &IpcRequest,
+    operation: &str,
+) -> Result<IpcResponse> {
+    let mut stream = tokio::net::UnixStream::connect(socket_path)
+        .await
+        .with_context(|| format!("failed to connect to daemon for {operation}"))?;
+
+    mesh_proto::frame::write_json(&mut stream, request)
+        .await
+        .with_context(|| format!("failed to send {operation} request"))?;
+
+    mesh_proto::frame::read_json(&mut stream)
+        .await
+        .with_context(|| format!("failed to read {operation} response"))
+}
+
 /// Query daemon status via IPC and print the result.
 async fn cmd_status(config_path: &Path, output: OutputFormat) -> Result<()> {
-    let config = MeshConfig::load(config_path)?;
-    let socket_path = config.data_dir.join("daemon.sock");
+    let socket_path = daemon_socket_path(config_path)?;
 
     let mut stream = match tokio::net::UnixStream::connect(&socket_path).await {
         Ok(s) => s,
-        Err(_) => {
-            println!("Daemon is not running");
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            println!(
+                "{} daemon not running",
+                format_indicator("OFFLINE", stdout_supports_color())
+            );
             return Ok(());
         }
+        Err(error) => return Err(error).context("failed to connect to daemon for status"),
     };
 
     mesh_proto::frame::write_json(&mut stream, &IpcRequest::Status)
@@ -267,12 +413,7 @@ async fn cmd_status(config_path: &Path, output: OutputFormat) -> Result<()> {
     match response {
         IpcResponse::Status(info) => match output {
             OutputFormat::Text => {
-                println!("Role:            {}", info.role);
-                println!("Node:            {}", info.node_name);
-                println!("Endpoint:        {}", info.endpoint_id);
-                println!("Online:          {}", info.online);
-                println!("Connected nodes: {}", info.connected_nodes.len());
-                println!("Services:        {}", info.services.len());
+                println!("{}", render_status_text(&info, stdout_supports_color()));
             }
             OutputFormat::Json => {
                 println!(
@@ -324,9 +465,6 @@ async fn cmd_expose(
         anyhow::bail!("invalid local address '{addr}': {reason}");
     }
 
-    let config = MeshConfig::load(config_path)?;
-    let socket_path = config.data_dir.join("daemon.sock");
-
     let health_check = health_check_mode.map(|mode| HealthCheckConfig {
         mode: mode.into(),
         target: health_check_target,
@@ -340,17 +478,8 @@ async fn cmd_expose(
         health_check,
     };
 
-    let mut stream = tokio::net::UnixStream::connect(&socket_path)
-        .await
-        .context("failed to connect to daemon (is it running?)")?;
-
-    mesh_proto::frame::write_json(&mut stream, &request)
-        .await
-        .context("failed to send expose request")?;
-
-    let response: IpcResponse = mesh_proto::frame::read_json(&mut stream)
-        .await
-        .context("failed to read expose response")?;
+    let socket_path = daemon_socket_path(config_path)?;
+    let response = send_ipc_request(&socket_path, &request, "expose").await?;
 
     match response {
         IpcResponse::ServiceExposed {
@@ -378,25 +507,13 @@ async fn cmd_expose(
 
 /// Accept an edge node's join ticket via IPC (control node only).
 async fn cmd_accept(config_path: &Path, ticket: String, name: Option<String>) -> Result<()> {
-    let config = MeshConfig::load(config_path)?;
-    let socket_path = config.data_dir.join("daemon.sock");
-
     let request = IpcRequest::AcceptNode {
         ticket,
         node_name: name,
     };
 
-    let mut stream = tokio::net::UnixStream::connect(&socket_path)
-        .await
-        .context("failed to connect to daemon (is it running?)")?;
-
-    mesh_proto::frame::write_json(&mut stream, &request)
-        .await
-        .context("failed to send accept request")?;
-
-    let response: IpcResponse = mesh_proto::frame::read_json(&mut stream)
-        .await
-        .context("failed to read accept response")?;
+    let socket_path = daemon_socket_path(config_path)?;
+    let response = send_ipc_request(&socket_path, &request, "accept").await?;
 
     match response {
         IpcResponse::Ok { message } => {
@@ -411,6 +528,217 @@ async fn cmd_accept(config_path: &Path, ticket: String, name: Option<String>) ->
     }
 
     Ok(())
+}
+
+async fn cmd_quota(config_path: &Path, command: QuotaCommand) -> Result<()> {
+    match command {
+        QuotaCommand::Show => cmd_quota_show(config_path).await,
+        QuotaCommand::Set { endpoint_id, limit } => {
+            cmd_quota_set(config_path, endpoint_id, limit).await
+        }
+    }
+}
+
+async fn cmd_quota_show(config_path: &Path) -> Result<()> {
+    let socket_path = daemon_socket_path(config_path)?;
+    let response = send_ipc_request(&socket_path, &IpcRequest::QuotaShow, "quota show").await?;
+
+    match response {
+        IpcResponse::QuotaInfo { quotas } => {
+            println!("{}", render_quota_table(&quotas));
+        }
+        IpcResponse::Error { message } => {
+            anyhow::bail!("quota show failed: {message}");
+        }
+        other => {
+            anyhow::bail!("unexpected response: {other:?}");
+        }
+    }
+
+    Ok(())
+}
+
+async fn cmd_quota_set(config_path: &Path, endpoint_id: String, limit: usize) -> Result<()> {
+    let socket_path = daemon_socket_path(config_path)?;
+    let response = send_ipc_request(
+        &socket_path,
+        &IpcRequest::QuotaSet {
+            endpoint_id: endpoint_id.clone(),
+            limit,
+        },
+        "quota set",
+    )
+    .await?;
+
+    match response {
+        IpcResponse::QuotaUpdated => {
+            println!("Quota for {endpoint_id} updated to {limit}");
+        }
+        IpcResponse::Error { message } => {
+            anyhow::bail!("quota set failed: {message}");
+        }
+        other => {
+            anyhow::bail!("unexpected response: {other:?}");
+        }
+    }
+
+    Ok(())
+}
+
+fn render_status_text(info: &mesh_proto::StatusInfo, color_enabled: bool) -> String {
+    let mut output = String::new();
+    let daemon_state = if info.online { "ONLINE" } else { "OFFLINE" };
+    let role = info.role.to_ascii_lowercase();
+
+    let _ = writeln!(
+        &mut output,
+        "{} {} ({role})",
+        format_indicator(daemon_state, color_enabled),
+        info.node_name
+    );
+    let _ = writeln!(&mut output, "Endpoint: {}", info.endpoint_id);
+    let _ = writeln!(
+        &mut output,
+        "Peers: {}  Services: {}  Routes: {}",
+        info.connected_nodes.len(),
+        info.services.len(),
+        info.route_table_version
+    );
+
+    if let Some(health_bind) = &info.health_bind {
+        let _ = writeln!(&mut output, "Health: {health_bind}");
+    }
+
+    let services = sorted_services(&info.services);
+    if services.is_empty() {
+        let _ = write!(&mut output, "No services");
+        return output;
+    }
+
+    for service in services {
+        let _ = writeln!(
+            &mut output,
+            "{}",
+            render_service_line(service, color_enabled)
+        );
+    }
+
+    output.trim_end().to_string()
+}
+
+fn render_service_line(service: &mesh_proto::ServiceStatus, color_enabled: bool) -> String {
+    format!(
+        "{} {} ({}) -> {}",
+        format_indicator(service_status_label(&service.status), color_enabled),
+        service.name,
+        service.node_name,
+        format_service_target(service.assigned_port)
+    )
+}
+
+fn sorted_services(services: &[mesh_proto::ServiceStatus]) -> Vec<&mesh_proto::ServiceStatus> {
+    let mut services = services.iter().collect::<Vec<_>>();
+    services.sort_by(|left, right| {
+        left.assigned_port
+            .unwrap_or(u16::MAX)
+            .cmp(&right.assigned_port.unwrap_or(u16::MAX))
+            .then_with(|| left.node_name.cmp(&right.node_name))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    services
+}
+
+fn service_status_label(status: &str) -> &'static str {
+    if status.eq_ignore_ascii_case("healthy") || status.eq_ignore_ascii_case("online") {
+        "ONLINE"
+    } else if status.eq_ignore_ascii_case("cached") {
+        "CACHED"
+    } else if status.eq_ignore_ascii_case("degraded") {
+        "DEGRADED"
+    } else if status.eq_ignore_ascii_case("unhealthy") || status.eq_ignore_ascii_case("offline") {
+        "OFFLINE"
+    } else {
+        "UNKNOWN"
+    }
+}
+
+fn format_service_target(port: Option<u16>) -> String {
+    match port {
+        Some(port) => format!(":{port}"),
+        None => "pending".to_string(),
+    }
+}
+
+fn format_indicator(label: &str, color_enabled: bool) -> String {
+    if !color_enabled {
+        return format!("[{label}]");
+    }
+
+    let color_code = match label {
+        "ONLINE" => "32",
+        "CACHED" => "36",
+        "DEGRADED" | "UNKNOWN" => "33",
+        "OFFLINE" => "31",
+        _ => "0",
+    };
+
+    format!("\u{1b}[{color_code}m[{label}]\u{1b}[0m")
+}
+
+fn stdout_supports_color() -> bool {
+    std::io::stdout().is_terminal()
+}
+
+fn render_quota_table(quotas: &[(String, usize, usize)]) -> String {
+    if quotas.is_empty() {
+        return "No accepted nodes".to_string();
+    }
+
+    let endpoint_width = quotas
+        .iter()
+        .map(|(endpoint_id, _, _)| endpoint_id.len())
+        .max()
+        .unwrap_or(0)
+        .max("ENDPOINT ID".len());
+    let used_width = quotas
+        .iter()
+        .map(|(_, used, _)| used.to_string().len())
+        .max()
+        .unwrap_or(0)
+        .max("USED".len());
+    let limit_width = quotas
+        .iter()
+        .map(|(_, _, limit)| limit.to_string().len())
+        .max()
+        .unwrap_or(0)
+        .max("LIMIT".len());
+
+    let mut output = String::new();
+    let _ = writeln!(
+        &mut output,
+        "{:<endpoint_width$} {:>used_width$} {:>limit_width$}",
+        "ENDPOINT ID",
+        "USED",
+        "LIMIT",
+        endpoint_width = endpoint_width,
+        used_width = used_width,
+        limit_width = limit_width,
+    );
+
+    for (endpoint_id, used, limit) in quotas {
+        let _ = writeln!(
+            &mut output,
+            "{:<endpoint_width$} {:>used_width$} {:>limit_width$}",
+            endpoint_id,
+            used,
+            limit,
+            endpoint_width = endpoint_width,
+            used_width = used_width,
+            limit_width = limit_width,
+        );
+    }
+
+    output.trim_end().to_string()
 }
 
 #[cfg(test)]
@@ -454,6 +782,93 @@ mod tests {
                 output: OutputFormat::Text
             }
         ));
+    }
+
+    #[test]
+    fn test_cli_accepts_global_config_for_restart() {
+        let cli =
+            Cli::try_parse_from(["mesh-proxy", "restart", "--config", "/tmp/mesh.toml"]).unwrap();
+
+        assert_eq!(cli.config, PathBuf::from("/tmp/mesh.toml"));
+        assert!(matches!(cli.command, Command::Restart));
+    }
+
+    #[test]
+    fn test_cli_accepts_quota_show_subcommand() {
+        let cli = Cli::try_parse_from(["mesh-proxy", "quota", "show"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::Quota {
+                command: QuotaCommand::Show
+            }
+        ));
+    }
+
+    #[test]
+    fn test_cli_accepts_quota_set_subcommand() {
+        let cli = Cli::try_parse_from(["mesh-proxy", "quota", "set", "ep-123", "7"]).unwrap();
+
+        match cli.command {
+            Command::Quota {
+                command: QuotaCommand::Set { endpoint_id, limit },
+            } => {
+                assert_eq!(endpoint_id, "ep-123");
+                assert_eq!(limit, 7);
+            }
+            other => panic!("expected Quota::Set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_render_status_text_formats_compact_service_lines() {
+        let info = mesh_proto::StatusInfo {
+            role: "Control".to_string(),
+            node_name: "controller".to_string(),
+            endpoint_id: "ep-ctrl".to_string(),
+            online: true,
+            connected_nodes: vec![mesh_proto::ConnectedNode {
+                name: "edge-1".to_string(),
+                endpoint_id: "ep-edge".to_string(),
+                online: true,
+            }],
+            services: vec![
+                mesh_proto::ServiceStatus {
+                    name: "api".to_string(),
+                    node_name: "node-beta".to_string(),
+                    assigned_port: Some(40001),
+                    status: "cached".to_string(),
+                },
+                mesh_proto::ServiceStatus {
+                    name: "web".to_string(),
+                    node_name: "node-alpha".to_string(),
+                    assigned_port: Some(40000),
+                    status: "healthy".to_string(),
+                },
+            ],
+            health_bind: Some("127.0.0.1:49000".to_string()),
+            route_table_version: 3,
+        };
+
+        let rendered = render_status_text(&info, false);
+
+        assert!(rendered.contains("[ONLINE] controller (control)"));
+        assert!(rendered.contains("Peers: 1  Services: 2  Routes: 3"));
+        assert!(rendered.contains("[ONLINE] web (node-alpha) -> :40000"));
+        assert!(rendered.contains("[CACHED] api (node-beta) -> :40001"));
+    }
+
+    #[test]
+    fn test_render_quota_table_includes_headers_and_values() {
+        let rendered = render_quota_table(&[
+            ("ep-1".to_string(), 1, 5),
+            ("ep-very-long".to_string(), 2, 10),
+        ]);
+
+        assert!(rendered.contains("ENDPOINT ID"));
+        assert!(rendered.contains("ep-1"));
+        assert!(rendered.contains("ep-very-long"));
+        assert!(rendered.contains("10"));
     }
 
     #[test]
