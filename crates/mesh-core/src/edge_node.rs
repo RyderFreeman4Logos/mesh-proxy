@@ -15,13 +15,15 @@ use mesh_proto::{
 use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::UnixListener;
-use tokio::sync::{RwLock as AsyncRwLock, broadcast};
+use tokio::sync::{RwLock as AsyncRwLock, Semaphore, broadcast};
 use tokio::task::JoinHandle;
 
 #[cfg(unix)]
 use crate::connection_pool::bridge_unix_streams;
 use crate::connection_pool::{ConnectionPool, bridge_streams};
 use crate::persistence::{self, PersistenceError};
+
+const MAX_INBOUND_PROXY_STREAMS_PER_CONNECTION: usize = 64;
 
 #[derive(Debug)]
 /// RAII guard that keeps an inbound proxy connection slot reserved.
@@ -477,6 +479,7 @@ pub async fn handle_proxy_inbound(
     };
 
     tracing::info!(%remote_id, "inbound proxy connection established");
+    let stream_permits = Arc::new(Semaphore::new(MAX_INBOUND_PROXY_STREAMS_PER_CONNECTION));
 
     loop {
         let (send, recv) = match connection.accept_bi().await {
@@ -489,7 +492,12 @@ pub async fn handle_proxy_inbound(
 
         let stream_connection = connection.clone();
         let stream_config = Arc::clone(&config);
+        let stream_permit = Arc::clone(&stream_permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("inbound proxy stream semaphore closed"))?;
         tokio::spawn(async move {
+            let _stream_permit = stream_permit;
             if let Err(error) =
                 handle_proxy_stream(stream_connection.clone(), stream_config, send, recv).await
             {
@@ -1340,6 +1348,99 @@ mod tests {
             active_connections.load(Ordering::Relaxed),
             MAX_PROXY_CONNECTIONS
         );
+
+        client_endpoint.close().await;
+        server_endpoint.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_proxy_inbound_limits_streams_per_connection() -> Result<()> {
+        let (server_endpoint, client_endpoint, server_connection, client_connection) =
+            proxy_connection_pair().await?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .context("failed to bind local TCP test listener")?;
+        let local_addr = listener
+            .local_addr()
+            .context("failed to read local TCP test listener address")?;
+        let config = Arc::new(AsyncRwLock::new(MeshConfig {
+            services: vec![ServiceEntry {
+                name: "limited-service".to_string(),
+                local_addr: local_addr.to_string(),
+                protocol: Protocol::Tcp,
+                health_check: None,
+            }],
+            ..MeshConfig::default()
+        }));
+        let active_connections = Arc::new(AtomicUsize::new(0));
+
+        let handler = tokio::spawn(handle_proxy_inbound(
+            server_connection,
+            Arc::clone(&config),
+            Arc::clone(&active_connections),
+        ));
+
+        let mut client_streams = Vec::with_capacity(MAX_INBOUND_PROXY_STREAMS_PER_CONNECTION);
+        let mut local_streams = Vec::with_capacity(MAX_INBOUND_PROXY_STREAMS_PER_CONNECTION);
+        for _ in 0..MAX_INBOUND_PROXY_STREAMS_PER_CONNECTION {
+            let (mut send, recv) = client_connection.open_bi().await?;
+            mesh_proto::frame::write_json(
+                &mut send,
+                &ProxyHandshake {
+                    service_name: "limited-service".to_string(),
+                    port: 42_000,
+                    protocol: Protocol::Tcp,
+                },
+            )
+            .await?;
+
+            let (local_stream, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .context("timed out waiting for limited inbound stream to connect locally")??;
+            client_streams.push((send, recv));
+            local_streams.push(local_stream);
+        }
+
+        let (mut blocked_send, blocked_recv) = client_connection.open_bi().await?;
+        mesh_proto::frame::write_json(
+            &mut blocked_send,
+            &ProxyHandshake {
+                service_name: "limited-service".to_string(),
+                port: 42_001,
+                protocol: Protocol::Tcp,
+            },
+        )
+        .await?;
+
+        assert!(
+            timeout(Duration::from_millis(250), listener.accept())
+                .await
+                .is_err(),
+            "the 65th inbound stream should wait for a permit"
+        );
+
+        drop(client_streams.pop());
+        drop(local_streams.pop());
+
+        let (released_stream, _) = timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .context("timed out waiting for a released inbound stream permit")??;
+        client_streams.push((blocked_send, blocked_recv));
+        local_streams.push(released_stream);
+
+        drop(client_streams);
+        drop(local_streams);
+        client_connection.close(0u32.into(), b"test done");
+        timeout(Duration::from_secs(5), client_connection.closed())
+            .await
+            .context("timed out waiting for client proxy connection to close")?;
+        timeout(Duration::from_secs(5), handler)
+            .await
+            .context("timed out waiting for proxy handler shutdown")?
+            .context("proxy handler task panicked")??;
+
+        assert_eq!(active_connections.load(Ordering::Relaxed), 0);
 
         client_endpoint.close().await;
         server_endpoint.close().await;

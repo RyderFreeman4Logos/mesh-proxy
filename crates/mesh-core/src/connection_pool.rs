@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -7,7 +8,7 @@ use iroh::{Endpoint, EndpointAddr, EndpointId};
 use mesh_proto::ALPN_PROXY;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 #[cfg(unix)]
 use tokio::net::UnixStream;
@@ -16,6 +17,7 @@ use tokio::net::UnixStream;
 #[derive(Debug)]
 pub struct ConnectionPool {
     pool: RwLock<HashMap<String, Connection>>,
+    dial_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
     endpoint: Endpoint,
 }
 
@@ -24,12 +26,20 @@ impl ConnectionPool {
     pub fn new(endpoint: Endpoint) -> Self {
         Self {
             pool: RwLock::new(HashMap::new()),
+            dial_locks: RwLock::new(HashMap::new()),
             endpoint,
         }
     }
 
     /// Get a cached connection or establish a new one on demand.
     pub async fn get_or_connect(&self, endpoint_id_hex: &str) -> Result<Connection> {
+        if let Some(connection) = self.cached_connection(endpoint_id_hex).await {
+            return Ok(connection);
+        }
+
+        let dial_lock = self.dial_lock(endpoint_id_hex).await;
+        let _dial_guard = dial_lock.lock().await;
+
         if let Some(connection) = self.cached_connection(endpoint_id_hex).await {
             return Ok(connection);
         }
@@ -49,11 +59,36 @@ impl ConnectionPool {
                 error = %error,
                 "evicting closed cached QUIC connection"
             );
-            self.pool.write().await.remove(endpoint_id_hex);
+            self.evict_if_stale(endpoint_id_hex, &cached).await;
             return None;
         }
 
         Some(cached)
+    }
+
+    async fn dial_lock(&self, endpoint_id_hex: &str) -> Arc<Mutex<()>> {
+        if let Some(lock) = self.dial_locks.read().await.get(endpoint_id_hex).cloned() {
+            return lock;
+        }
+
+        let mut dial_locks = self.dial_locks.write().await;
+        Arc::clone(
+            dial_locks
+                .entry(endpoint_id_hex.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
+    }
+
+    async fn evict_if_stale(&self, endpoint_id_hex: &str, stale_connection: &Connection) {
+        let stale_connection_id = stale_connection.stable_id();
+        let mut pool = self.pool.write().await;
+        let should_remove = pool
+            .get(endpoint_id_hex)
+            .is_some_and(|connection| connection.stable_id() == stale_connection_id);
+
+        if should_remove {
+            pool.remove(endpoint_id_hex);
+        }
     }
 
     async fn connect_and_cache(&self, endpoint_id_hex: &str) -> Result<Connection> {
@@ -121,6 +156,7 @@ mod tests {
     use anyhow::{Context, Result};
     use mesh_proto::ALPN_PROXY;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::Barrier;
     use tokio::time::{Duration, timeout};
 
     use super::*;
@@ -176,6 +212,167 @@ mod tests {
 
         let reconnected = pool.get_or_connect(&endpoint_id).await?;
         assert_ne!(first.stable_id(), reconnected.stable_id());
+
+        client_endpoint.close().await;
+        let accepted = timeout(Duration::from_secs(5), accept_task)
+            .await
+            .context("timed out waiting for accept task")?
+            .context("accept task panicked")??;
+        for connection in accepted {
+            connection.close(0u32.into(), b"test done");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_connection_pool_serializes_concurrent_dials_per_endpoint() -> Result<()> {
+        use iroh::address_lookup::memory::MemoryLookup;
+        use iroh::endpoint::presets;
+
+        let caller_count = 8;
+        let address_lookup = MemoryLookup::new();
+        let server_endpoint = iroh::Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN_PROXY.to_vec()])
+            .bind()
+            .await
+            .context("failed to bind server endpoint")?;
+        let client_endpoint = iroh::Endpoint::builder(presets::N0)
+            .address_lookup(address_lookup.clone())
+            .alpns(vec![ALPN_PROXY.to_vec()])
+            .bind()
+            .await
+            .context("failed to bind client endpoint")?;
+        let endpoint_id = server_endpoint.id().to_string();
+        address_lookup.add_endpoint_info(server_endpoint.addr());
+
+        let accept_endpoint = server_endpoint.clone();
+        let accept_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let mut accepted = Vec::new();
+            loop {
+                let incoming =
+                    match timeout(Duration::from_millis(200), accept_endpoint.accept()).await {
+                        Ok(Some(incoming)) => incoming,
+                        Ok(None) | Err(_) => break,
+                    };
+
+                let connection = incoming
+                    .accept()
+                    .context("failed to accept incoming connection")?
+                    .await
+                    .context("incoming connection handshake failed")?;
+                accepted.push(connection);
+
+                if accepted.len() == caller_count {
+                    break;
+                }
+            }
+
+            Result::<Vec<Connection>>::Ok(accepted)
+        });
+
+        let pool = Arc::new(ConnectionPool::new(client_endpoint.clone()));
+        let barrier = Arc::new(Barrier::new(caller_count));
+        let mut tasks = Vec::with_capacity(caller_count);
+        for _ in 0..caller_count {
+            let barrier = Arc::clone(&barrier);
+            let endpoint_id = endpoint_id.clone();
+            let pool = Arc::clone(&pool);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let connection = pool.get_or_connect(&endpoint_id).await?;
+                Result::<_, anyhow::Error>::Ok(connection.stable_id())
+            }));
+        }
+
+        let mut stable_ids = Vec::with_capacity(caller_count);
+        for task in tasks {
+            stable_ids.push(
+                timeout(Duration::from_secs(5), task)
+                    .await
+                    .context("timed out waiting for concurrent dial task")?
+                    .context("concurrent dial task panicked")??,
+            );
+        }
+
+        assert!(
+            stable_ids.windows(2).all(|pair| pair[0] == pair[1]),
+            "all callers should receive the same cached connection"
+        );
+
+        let accepted = timeout(Duration::from_secs(5), accept_task)
+            .await
+            .context("timed out waiting for accept task")?
+            .context("accept task panicked")??;
+        assert_eq!(accepted.len(), 1, "expected exactly one outbound dial");
+
+        client_endpoint.close().await;
+        for connection in accepted {
+            connection.close(0u32.into(), b"test done");
+        }
+        server_endpoint.close().await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_connection_pool_preserves_reconnected_entry_during_stale_eviction() -> Result<()>
+    {
+        use iroh::address_lookup::memory::MemoryLookup;
+        use iroh::endpoint::presets;
+
+        let address_lookup = MemoryLookup::new();
+        let server_endpoint = iroh::Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN_PROXY.to_vec()])
+            .bind()
+            .await
+            .context("failed to bind server endpoint")?;
+        let client_endpoint = iroh::Endpoint::builder(presets::N0)
+            .address_lookup(address_lookup.clone())
+            .alpns(vec![ALPN_PROXY.to_vec()])
+            .bind()
+            .await
+            .context("failed to bind client endpoint")?;
+        let endpoint_id = server_endpoint.id().to_string();
+        address_lookup.add_endpoint_info(server_endpoint.addr());
+
+        let accept_task = tokio::spawn(async move {
+            let mut accepted = Vec::new();
+            for _ in 0..2 {
+                let incoming = server_endpoint
+                    .accept()
+                    .await
+                    .context("accept returned none")?;
+                let connection = incoming
+                    .accept()
+                    .context("failed to accept incoming connection")?
+                    .await
+                    .context("incoming connection handshake failed")?;
+                accepted.push(connection);
+            }
+            Result::<Vec<Connection>>::Ok(accepted)
+        });
+
+        let pool = ConnectionPool::new(client_endpoint.clone());
+
+        let first = pool.get_or_connect(&endpoint_id).await?;
+        first.close(0u32.into(), b"test close");
+        let _ = timeout(Duration::from_secs(5), first.closed())
+            .await
+            .context("timed out waiting for original cached connection to close")?;
+
+        let replacement = pool.get_or_connect(&endpoint_id).await?;
+        assert_ne!(first.stable_id(), replacement.stable_id());
+
+        pool.evict_if_stale(&endpoint_id, &first).await;
+
+        let cached = pool
+            .cached_connection(&endpoint_id)
+            .await
+            .context("expected replacement connection to remain cached")?;
+        assert_eq!(cached.stable_id(), replacement.stable_id());
 
         client_endpoint.close().await;
         let accepted = timeout(Duration::from_secs(5), accept_task)
