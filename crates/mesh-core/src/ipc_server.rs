@@ -118,8 +118,45 @@ impl IpcServer {
     }
 }
 
-/// Handle a single IPC connection: read request, dispatch, write response.
+/// Verify the connecting process has the same UID as this daemon.
+///
+/// Returns `Ok(())` if the peer UID matches, or writes an error response
+/// and returns `Err` if authentication fails.
+async fn authenticate_peer(stream: &UnixStream) -> std::result::Result<(), ()> {
+    let peer_cred = match stream.peer_cred() {
+        Ok(cred) => cred,
+        Err(e) => {
+            warn!(error = %e, "failed to get peer credentials");
+            return Err(());
+        }
+    };
+
+    let peer_uid = peer_cred.uid();
+    // SAFETY: libc::getuid() is always safe to call and has no failure mode.
+    let my_uid = unsafe { libc::getuid() };
+
+    if peer_uid != my_uid {
+        warn!(
+            peer_uid = peer_uid,
+            daemon_uid = my_uid,
+            "IPC connection rejected: UID mismatch"
+        );
+        return Err(());
+    }
+
+    Ok(())
+}
+
+/// Handle a single IPC connection: authenticate, read request, dispatch, write response.
 async fn handle_connection(mut stream: UnixStream, state: Arc<SharedState>) {
+    if authenticate_peer(&stream).await.is_err() {
+        let response = IpcResponse::Error {
+            message: "unauthorized: UID mismatch".to_string(),
+        };
+        let _ = frame::write_json(&mut stream, &response).await;
+        return;
+    }
+
     let request: IpcRequest = match frame::read_json(&mut stream).await {
         Ok(req) => req,
         Err(e) => {
