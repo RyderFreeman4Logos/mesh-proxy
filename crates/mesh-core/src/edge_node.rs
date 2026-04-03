@@ -819,6 +819,12 @@ impl EdgeNode {
     /// Apply a route table update if the version is newer than the cached one.
     ///
     /// Returns `true` if the update was applied, `false` if stale.
+    /// Apply a route update unconditionally, bypassing version check.
+    /// Used after fresh registration when the control's route table is authoritative.
+    pub async fn force_route_update(&mut self, routes: HashMap<u16, RouteEntry>, version: u64) {
+        self.apply_route_update_inner(routes, version).await;
+    }
+
     pub async fn apply_route_update(
         &mut self,
         routes: HashMap<u16, RouteEntry>,
@@ -827,7 +833,11 @@ impl EdgeNode {
         if version <= self.route_version {
             return false;
         }
+        self.apply_route_update_inner(routes, version).await;
+        true
+    }
 
+    async fn apply_route_update_inner(&mut self, routes: HashMap<u16, RouteEntry>, version: u64) {
         let (to_spawn, to_remove) = route_diff(&self.cached_routes, &routes);
         replace_shared_routes(&self.shared_routes, &routes);
         self.cached_routes = routes;
@@ -875,8 +885,6 @@ impl EdgeNode {
                 }
             }
         }
-
-        true
     }
 
     /// Persist the cached route table and version to disk atomically.

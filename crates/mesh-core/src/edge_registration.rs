@@ -196,6 +196,7 @@ async fn apply_route_table_update(
     config: &Arc<RwLock<MeshConfig>>,
     routes: HashMap<u16, RouteEntry>,
     version: u64,
+    force: bool,
 ) -> Result<()> {
     let data_dir = {
         let config = config.read().await;
@@ -203,11 +204,20 @@ async fn apply_route_table_update(
     };
 
     let mut edge = edge_node.write().await;
-    let applied = edge.apply_route_update(routes, version).await;
-    if applied {
+    if force {
+        // After fresh registration, always apply the route table from control
+        // regardless of cached version (the control is authoritative).
+        edge.force_route_update(routes, version).await;
         edge.save_route_cache(&data_dir)
             .await
-            .context("failed to persist route cache after route update")?;
+            .context("failed to persist route cache after forced route update")?;
+    } else {
+        let applied = edge.apply_route_update(routes, version).await;
+        if applied {
+            edge.save_route_cache(&data_dir)
+                .await
+                .context("failed to persist route cache after route update")?;
+        }
     }
 
     Ok(())
@@ -270,7 +280,7 @@ async fn send_register(
             };
 
             if let Some((routes, version)) = initial_route_update {
-                apply_route_table_update(edge_node, config, routes, version)
+                apply_route_table_update(edge_node, config, routes, version, true)
                     .await
                     .context("failed to apply initial route table after register ack")?;
             } else {
@@ -300,7 +310,7 @@ async fn handle_control_message(
 ) -> Result<()> {
     match message {
         ControlMessage::RouteTableUpdate { routes, version } => {
-            apply_route_table_update(edge_node, config, routes, version).await?;
+            apply_route_table_update(edge_node, config, routes, version, false).await?;
         }
         ControlMessage::Ping => {
             write_json(send, &ControlMessage::Pong)
