@@ -597,6 +597,9 @@ fn render_status_text(info: &mesh_proto::StatusInfo, color_enabled: bool) -> Str
         info.node_name
     );
     let _ = writeln!(&mut output, "Endpoint: {}", info.endpoint_id);
+    if let Some(addr) = &info.endpoint_addr {
+        let _ = writeln!(&mut output, "Connect Addr: {addr}");
+    }
     let _ = writeln!(
         &mut output,
         "Peers: {}  Services: {}  Routes: {}",
@@ -826,6 +829,7 @@ mod tests {
             role: "Control".to_string(),
             node_name: "controller".to_string(),
             endpoint_id: "ep-ctrl".to_string(),
+            endpoint_addr: Some(r#"{"node_id":"ep-ctrl"}"#.to_string()),
             online: true,
             connected_nodes: vec![mesh_proto::ConnectedNode {
                 name: "edge-1".to_string(),
@@ -853,6 +857,7 @@ mod tests {
         let rendered = render_status_text(&info, false);
 
         assert!(rendered.contains("[ONLINE] controller (control)"));
+        assert!(rendered.contains(r#"Connect Addr: {"node_id":"ep-ctrl"}"#));
         assert!(rendered.contains("Peers: 1  Services: 2  Routes: 3"));
         assert!(rendered.contains("[ONLINE] web (node-alpha) -> :40000"));
         assert!(rendered.contains("[CACHED] api (node-beta) -> :40001"));

@@ -25,14 +25,15 @@ const INITIALIZING_ENDPOINT_ID: &str = "(initializing)";
 #[derive(Debug, Clone, Default)]
 struct MeshRuntimeState {
     endpoint_id: Option<String>,
+    endpoint_addr: Option<String>,
     online: bool,
 }
 
 impl MeshRuntimeState {
-    fn status_fields(&self) -> (String, bool) {
+    fn status_fields(&self) -> (String, Option<String>, bool) {
         match &self.endpoint_id {
-            Some(endpoint_id) => (endpoint_id.clone(), self.online),
-            None => (INITIALIZING_ENDPOINT_ID.to_string(), false),
+            Some(endpoint_id) => (endpoint_id.clone(), self.endpoint_addr.clone(), self.online),
+            None => (INITIALIZING_ENDPOINT_ID.to_string(), None, false),
         }
     }
 }
@@ -44,13 +45,14 @@ pub(crate) struct IpcStatusHandle {
 
 impl IpcStatusHandle {
     /// Publish the daemon's current mesh endpoint state for status requests.
-    pub fn set_mesh_node(&self, endpoint_id: String, online: bool) {
+    pub fn set_mesh_node(&self, endpoint_id: String, endpoint_addr: Option<String>, online: bool) {
         let mut runtime = match self.runtime.write() {
             Ok(runtime) => runtime,
             Err(poisoned) => poisoned.into_inner(),
         };
         *runtime = MeshRuntimeState {
             endpoint_id: Some(endpoint_id),
+            endpoint_addr,
             online,
         };
     }
@@ -254,7 +256,7 @@ async fn dispatch(request: &IpcRequest, state: &SharedState) -> IpcResponse {
 async fn build_status(state: &SharedState) -> IpcResponse {
     // Extract runtime fields under std::sync::RwLock, then drop the guard
     // before any .await (RwLockReadGuard is not Send).
-    let (endpoint_id, online) = {
+    let (endpoint_id, endpoint_addr, online) = {
         let runtime = match state.runtime.read() {
             Ok(runtime) => runtime,
             Err(poisoned) => poisoned.into_inner(),
@@ -308,6 +310,7 @@ async fn build_status(state: &SharedState) -> IpcResponse {
         role: format!("{:?}", state.config.role),
         node_name: state.config.node_name.clone(),
         endpoint_id,
+        endpoint_addr,
         online,
         connected_nodes,
         services,
@@ -738,6 +741,7 @@ mod tests {
             panic!("expected status response");
         };
         assert_eq!(info.endpoint_id, INITIALIZING_ENDPOINT_ID);
+        assert_eq!(info.endpoint_addr, None);
         assert!(!info.online);
     }
 
@@ -747,7 +751,11 @@ mod tests {
         let handle = IpcStatusHandle {
             runtime: Arc::clone(&state.runtime),
         };
-        handle.set_mesh_node("ep-123".to_string(), true);
+        handle.set_mesh_node(
+            "ep-123".to_string(),
+            Some(r#"{"node_id":"ep-123"}"#.to_string()),
+            true,
+        );
 
         let response = dispatch(&IpcRequest::Status, &state).await;
 
@@ -755,6 +763,10 @@ mod tests {
             panic!("expected status response");
         };
         assert_eq!(info.endpoint_id, "ep-123");
+        assert_eq!(
+            info.endpoint_addr.as_deref(),
+            Some(r#"{"node_id":"ep-123"}"#)
+        );
         assert!(info.online);
     }
 

@@ -66,6 +66,8 @@ pub struct StatusInfo {
     pub role: String,
     pub node_name: String,
     pub endpoint_id: String,
+    /// Serialized `EndpointAddr` used to connect back to this node.
+    pub endpoint_addr: Option<String>,
     pub online: bool,
     pub connected_nodes: Vec<ConnectedNode>,
     pub services: Vec<ServiceStatus>,
