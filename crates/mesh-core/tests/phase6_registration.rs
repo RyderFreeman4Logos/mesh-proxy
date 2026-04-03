@@ -7,6 +7,7 @@ use mesh_core::edge_registration::run_registration_loop;
 use mesh_core::{ControlNode, EdgeNode, run_accept_loop};
 use mesh_proto::{
     ALPN_CONTROL, DEFAULT_SERVICE_QUOTA, MeshConfig, NodeInfo, NodeRole, Protocol, ServiceEntry,
+    ServiceRegistration,
 };
 use tempfile::Builder;
 use tokio::sync::{RwLock, broadcast, watch};
@@ -43,19 +44,36 @@ fn make_whitelist_node(endpoint_id: String, node_name: &str) -> NodeInfo {
     }
 }
 
-fn make_edge_config(control_addr: String, data_dir: std::path::PathBuf) -> MeshConfig {
+fn make_service_entry(name: &str, local_addr: &str) -> ServiceEntry {
+    ServiceEntry {
+        name: name.to_string(),
+        local_addr: local_addr.to_string(),
+        protocol: Protocol::Tcp,
+        health_check: None,
+    }
+}
+
+fn make_service_registration(name: &str, local_addr: &str) -> ServiceRegistration {
+    ServiceRegistration {
+        name: name.to_string(),
+        local_addr: local_addr.to_string(),
+        protocol: Protocol::Tcp,
+        health_check: None,
+    }
+}
+
+fn make_edge_config(
+    control_addr: String,
+    data_dir: std::path::PathBuf,
+    services: Vec<ServiceEntry>,
+) -> MeshConfig {
     MeshConfig {
         node_name: "edge-alpha".to_string(),
         role: NodeRole::Edge,
         secret_key: None,
         control_addr: Some(control_addr),
         health_bind: None,
-        services: vec![ServiceEntry {
-            name: "echo".to_string(),
-            local_addr: "127.0.0.1:18080".to_string(),
-            protocol: Protocol::Tcp,
-            health_check: None,
-        }],
+        services,
         data_dir,
     }
 }
@@ -76,6 +94,13 @@ struct RegistrationHarness {
 
 impl RegistrationHarness {
     async fn start() -> Result<Self> {
+        Self::start_with(vec![make_service_entry("echo", "127.0.0.1:18080")], false).await
+    }
+
+    async fn start_with(
+        edge_services: Vec<ServiceEntry>,
+        preload_existing_route: bool,
+    ) -> Result<Self> {
         let control_endpoint = build_endpoint().await?;
         let edge_endpoint = build_endpoint().await?;
         let edge_endpoint_id = edge_endpoint.id().to_string();
@@ -83,6 +108,19 @@ impl RegistrationHarness {
         let control_node = Arc::new(RwLock::new(ControlNode::new()));
         {
             let mut control = control_node.write().await;
+            if preload_existing_route {
+                let seed_endpoint_id = "seed-node-001".to_string();
+                control.add_node(make_whitelist_node(seed_endpoint_id.clone(), "edge-seed"));
+                control
+                    .register_services(
+                        &seed_endpoint_id,
+                        "edge-seed",
+                        &[make_service_registration("seed-api", "127.0.0.1:28080")],
+                        1_700_000_000,
+                    )
+                    .map_err(anyhow::Error::msg)
+                    .context("failed to seed control route table")?;
+            }
             control.add_node(make_whitelist_node(edge_endpoint_id.clone(), "edge-alpha"));
         }
 
@@ -99,6 +137,7 @@ impl RegistrationHarness {
         let config = Arc::new(RwLock::new(make_edge_config(
             control_addr.clone(),
             tempdir.path().join("data"),
+            edge_services,
         )));
 
         let edge_node = Arc::new(RwLock::new(EdgeNode::with_endpoint(edge_endpoint.clone())));
@@ -209,7 +248,7 @@ async fn test_edge_registration_loop_connects_and_registers() -> Result<()> {
             let edge = harness.edge_node.read().await;
             assert!(
                 !edge.cached_routes().is_empty(),
-                "edge should cache routes from RegisterAck"
+                "edge should cache routes after registration"
             );
             assert_eq!(edge.cached_routes().len(), 1);
 
@@ -223,4 +262,46 @@ async fn test_edge_registration_loop_connects_and_registers() -> Result<()> {
     })
     .await
     .context("edge registration integration test timed out")?
+}
+
+#[tokio::test]
+async fn test_edge_registration_receives_existing_routes_without_local_services() -> Result<()> {
+    timeout(TEST_TIMEOUT, async {
+        let harness = RegistrationHarness::start_with(Vec::new(), true).await?;
+
+        let test_result: Result<()> = async {
+            harness.wait_for_registration().await;
+            harness.wait_for_edge_routes(1, 1).await;
+
+            let control = harness.control_node.read().await;
+            assert_eq!(
+                control.services().len(),
+                1,
+                "control should retain the preloaded service"
+            );
+
+            let edge = harness.edge_node.read().await;
+            assert_eq!(
+                edge.cached_routes().len(),
+                1,
+                "edge should receive the existing route table snapshot"
+            );
+            let route = edge
+                .cached_routes()
+                .values()
+                .next()
+                .context("edge route cache should contain the preloaded route")?;
+            assert_eq!(route.service_name, "seed-api");
+            assert_eq!(route.node_name, "edge-seed");
+
+            Ok(())
+        }
+        .await;
+
+        let shutdown_result = harness.shutdown().await;
+        shutdown_result?;
+        test_result
+    })
+    .await
+    .context("edge registration existing-route integration test timed out")?
 }
