@@ -129,7 +129,9 @@ impl Daemon {
                 )
             }
             NodeRole::Edge => {
-                let en = Arc::new(tokio::sync::RwLock::new(EdgeNode::new()));
+                let en = Arc::new(tokio::sync::RwLock::new(EdgeNode::with_endpoint(
+                    mesh_node.endpoint().clone(),
+                )));
                 // Load persisted route cache if available.
                 if let Some((routes, version)) = EdgeNode::load_route_cache(&self.config.data_dir) {
                     let mut edge = en.write().await;

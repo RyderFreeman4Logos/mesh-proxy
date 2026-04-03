@@ -1,4 +1,5 @@
 mod config_watcher;
+pub mod connection_pool;
 mod control_node;
 mod daemon;
 mod edge_node;
@@ -11,6 +12,7 @@ mod port_allocator;
 pub mod process;
 
 pub use config_watcher::ConfigWatcher;
+pub use connection_pool::{ConnectionPool, bridge_streams};
 pub use control_node::{
     ControlNode, ControlNodeSnapshot, QuotaError, TicketError, broadcast_routes, run_accept_loop,
 };

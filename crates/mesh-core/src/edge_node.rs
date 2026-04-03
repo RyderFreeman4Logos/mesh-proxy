@@ -1,14 +1,20 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
+use std::sync::{Arc, OnceLock, RwLock};
 
-use mesh_proto::{MAX_LISTENERS, RouteEntry};
+use anyhow::Context;
+use iroh::endpoint::presets;
+use mesh_proto::{MAX_LISTENERS, ProxyHandshake, RouteEntry};
 use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
+#[cfg(unix)]
+use crate::connection_pool::bridge_unix_streams;
+use crate::connection_pool::{ConnectionPool, bridge_streams};
 use crate::persistence::{self, PersistenceError};
 
 /// Error returned when a state transition is not allowed.
@@ -56,12 +62,159 @@ pub fn route_diff(
     (to_spawn, to_remove)
 }
 
-/// Spawn a placeholder TCP listener for a dynamically assigned route port.
-///
-/// The listener accepts inbound connections, logs the peer address, and closes
-/// the connection immediately until Phase 4 forwarding is implemented.
+fn fallback_connection_pool() -> Arc<ConnectionPool> {
+    static FALLBACK_POOL: OnceLock<Arc<ConnectionPool>> = OnceLock::new();
+
+    Arc::clone(FALLBACK_POOL.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+
+        std::thread::Builder::new()
+            .name("mesh-core-fallback-endpoint".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to build fallback runtime");
+                let endpoint = runtime.block_on(async {
+                    iroh::Endpoint::builder(presets::N0)
+                        .alpns(vec![mesh_proto::ALPN_PROXY.to_vec()])
+                        .bind()
+                        .await
+                        .expect("failed to bind fallback endpoint")
+                });
+                let pool = Arc::new(ConnectionPool::new(endpoint));
+                tx.send(Arc::clone(&pool))
+                    .expect("failed to send fallback connection pool");
+
+                loop {
+                    std::thread::park();
+                }
+            })
+            .expect("failed to spawn fallback endpoint thread");
+
+        rx.recv()
+            .expect("failed to receive fallback connection pool")
+    }))
+}
+
+fn clone_shared_route(
+    routes: &Arc<RwLock<HashMap<u16, RouteEntry>>>,
+    port: u16,
+) -> Option<RouteEntry> {
+    match routes.read() {
+        Ok(routes) => routes.get(&port).cloned(),
+        Err(poisoned) => {
+            tracing::warn!(port, "shared route table lock poisoned");
+            poisoned.into_inner().get(&port).cloned()
+        }
+    }
+}
+
+fn replace_shared_routes(
+    shared_routes: &RwLock<HashMap<u16, RouteEntry>>,
+    routes: &HashMap<u16, RouteEntry>,
+) {
+    match shared_routes.write() {
+        Ok(mut shared) => {
+            *shared = routes.clone();
+        }
+        Err(poisoned) => {
+            tracing::warn!("shared route table lock poisoned during route update");
+            *poisoned.into_inner() = routes.clone();
+        }
+    }
+}
+
+async fn forward_tcp_stream(
+    port: u16,
+    stream: tokio::net::TcpStream,
+    pool: Arc<ConnectionPool>,
+    routes: Arc<RwLock<HashMap<u16, RouteEntry>>>,
+) -> anyhow::Result<()> {
+    let route = match clone_shared_route(&routes, port) {
+        Some(route) => route,
+        None => {
+            tracing::warn!(
+                port,
+                "no cached route found for accepted TCP listener connection"
+            );
+            return Ok(());
+        }
+    };
+
+    let connection = pool
+        .get_or_connect(&route.endpoint_id)
+        .await
+        .with_context(|| format!("failed to get outbound QUIC connection for port {port}"))?;
+    let (mut send, recv) = connection
+        .open_bi()
+        .await
+        .with_context(|| format!("failed to open outbound QUIC stream for port {port}"))?;
+    let handshake = ProxyHandshake {
+        service_name: route.service_name.clone(),
+        port,
+        protocol: route.protocol,
+    };
+
+    mesh_proto::frame::write_json(&mut send, &handshake)
+        .await
+        .with_context(|| format!("failed to write proxy handshake for port {port}"))?;
+    bridge_streams(stream, send, recv)
+        .await
+        .with_context(|| format!("failed to bridge TCP stream for port {port}"))?;
+
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn forward_unix_stream(
+    path: &Path,
+    port: u16,
+    stream: tokio::net::UnixStream,
+    pool: Arc<ConnectionPool>,
+    routes: Arc<RwLock<HashMap<u16, RouteEntry>>>,
+) -> anyhow::Result<()> {
+    let route = match clone_shared_route(&routes, port) {
+        Some(route) => route,
+        None => {
+            tracing::warn!(
+                path = %path.display(),
+                port,
+                "no cached route found for accepted Unix listener connection"
+            );
+            return Ok(());
+        }
+    };
+
+    let connection = pool
+        .get_or_connect(&route.endpoint_id)
+        .await
+        .with_context(|| format!("failed to get outbound QUIC connection for port {port}"))?;
+    let (mut send, recv) = connection
+        .open_bi()
+        .await
+        .with_context(|| format!("failed to open outbound QUIC stream for port {port}"))?;
+    let handshake = ProxyHandshake {
+        service_name: route.service_name.clone(),
+        port,
+        protocol: route.protocol,
+    };
+
+    mesh_proto::frame::write_json(&mut send, &handshake)
+        .await
+        .with_context(|| format!("failed to write proxy handshake for port {port}"))?;
+    bridge_unix_streams(stream, send, recv)
+        .await
+        .with_context(|| format!("failed to bridge Unix stream for port {port}"))?;
+
+    Ok(())
+}
+
+/// Spawn a forwarding TCP listener for a dynamically assigned route port.
 pub async fn spawn_tcp_listener(
     port: u16,
+    pool: Arc<ConnectionPool>,
+    routes: Arc<RwLock<HashMap<u16, RouteEntry>>>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> std::io::Result<JoinHandle<()>> {
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
@@ -73,7 +226,13 @@ pub async fn spawn_tcp_listener(
                     match accept_result {
                         Ok((stream, peer_addr)) => {
                             tracing::info!(port, %peer_addr, "accepted dynamic TCP listener connection");
-                            drop(stream);
+                            let pool = Arc::clone(&pool);
+                            let routes = Arc::clone(&routes);
+                            tokio::spawn(async move {
+                                if let Err(error) = forward_tcp_stream(port, stream, pool, routes).await {
+                                    tracing::warn!(port, %peer_addr, error = %error, "dynamic TCP listener forwarding failed");
+                                }
+                            });
                         }
                         Err(error) => {
                             tracing::warn!(port, error = %error, "dynamic TCP listener accept failed");
@@ -96,10 +255,13 @@ async fn abort_listener(handle: JoinHandle<()>) {
     let _ = handle.await;
 }
 
-/// Spawn a placeholder Unix socket listener for local Phase 3 testing.
+/// Spawn a forwarding Unix socket listener for local routing tests.
 #[cfg(unix)]
 pub async fn spawn_unix_listener(
     path: impl AsRef<Path>,
+    port: u16,
+    pool: Arc<ConnectionPool>,
+    routes: Arc<RwLock<HashMap<u16, RouteEntry>>>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> std::io::Result<JoinHandle<()>> {
     let path = path.as_ref().to_path_buf();
@@ -120,7 +282,14 @@ pub async fn spawn_unix_listener(
                     match accept_result {
                         Ok((stream, _addr)) => {
                             tracing::info!(path = %path.display(), "accepted dynamic Unix listener connection");
-                            drop(stream);
+                            let pool = Arc::clone(&pool);
+                            let routes = Arc::clone(&routes);
+                            let accept_path = path.clone();
+                            tokio::spawn(async move {
+                                if let Err(error) = forward_unix_stream(&accept_path, port, stream, pool, routes).await {
+                                    tracing::warn!(path = %accept_path.display(), port, error = %error, "dynamic Unix listener forwarding failed");
+                                }
+                            });
                         }
                         Err(error) => {
                             tracing::warn!(path = %path.display(), error = %error, "dynamic Unix listener accept failed");
@@ -160,8 +329,10 @@ impl fmt::Display for ConnectionState {
 pub struct EdgeNode {
     state: ConnectionState,
     cached_routes: HashMap<u16, RouteEntry>,
+    shared_routes: Arc<RwLock<HashMap<u16, RouteEntry>>>,
     route_version: u64,
     listener_pool: HashMap<u16, JoinHandle<()>>,
+    connection_pool: Arc<ConnectionPool>,
     shutdown_tx: broadcast::Sender<()>,
     /// Epoch timestamp of the last ping received from the control node.
     last_ping_from_control: Option<u64>,
@@ -176,12 +347,23 @@ impl Default for EdgeNode {
 impl EdgeNode {
     /// Create a new edge node in the Disconnected state.
     pub fn new() -> Self {
+        Self::with_pool(fallback_connection_pool())
+    }
+
+    /// Create a new edge node backed by the provided iroh endpoint.
+    pub fn with_endpoint(endpoint: iroh::Endpoint) -> Self {
+        Self::with_pool(Arc::new(ConnectionPool::new(endpoint)))
+    }
+
+    fn with_pool(connection_pool: Arc<ConnectionPool>) -> Self {
         let (shutdown_tx, _) = broadcast::channel(16);
         Self {
             state: ConnectionState::Disconnected,
             cached_routes: HashMap::new(),
+            shared_routes: Arc::new(RwLock::new(HashMap::new())),
             route_version: 0,
             listener_pool: HashMap::new(),
+            connection_pool,
             shutdown_tx,
             last_ping_from_control: None,
         }
@@ -244,6 +426,7 @@ impl EdgeNode {
 
     /// Replace the cached route table with a new snapshot.
     pub fn update_routes(&mut self, routes: HashMap<u16, RouteEntry>, version: u64) {
+        replace_shared_routes(&self.shared_routes, &routes);
         self.cached_routes = routes;
         self.route_version = version;
     }
@@ -271,6 +454,7 @@ impl EdgeNode {
         }
 
         let (to_spawn, to_remove) = route_diff(&self.cached_routes, &routes);
+        replace_shared_routes(&self.shared_routes, &routes);
         self.cached_routes = routes;
         self.route_version = version;
 
@@ -281,8 +465,8 @@ impl EdgeNode {
         }
 
         for (port, route) in to_spawn {
-            if let Some(handle) = self.listener_pool.remove(&port) {
-                abort_listener(handle).await;
+            if self.listener_pool.contains_key(&port) {
+                continue;
             }
 
             if self.listener_pool.len() >= MAX_LISTENERS {
@@ -295,7 +479,14 @@ impl EdgeNode {
                 continue;
             }
 
-            match spawn_tcp_listener(port, self.shutdown_tx.subscribe()).await {
+            match spawn_tcp_listener(
+                port,
+                Arc::clone(&self.connection_pool),
+                Arc::clone(&self.shared_routes),
+                self.shutdown_tx.subscribe(),
+            )
+            .await
+            {
                 Ok(handle) => {
                     self.listener_pool.insert(port, handle);
                 }
@@ -376,6 +567,10 @@ mod tests {
             .local_addr()
             .unwrap()
             .port()
+    }
+
+    fn shared_routes(routes: HashMap<u16, RouteEntry>) -> Arc<RwLock<HashMap<u16, RouteEntry>>> {
+        Arc::new(RwLock::new(routes))
     }
 
     async fn assert_tcp_connection_closed(port: u16) {
@@ -569,8 +764,11 @@ mod tests {
     async fn test_spawn_tcp_listener_accepts_and_closes_connection() {
         let port = available_tcp_port();
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let routes = shared_routes(HashMap::from([(port, test_route("alpha", "endpoint-a"))]));
 
-        let handle = spawn_tcp_listener(port, shutdown_rx).await.unwrap();
+        let handle = spawn_tcp_listener(port, fallback_connection_pool(), routes, shutdown_rx)
+            .await
+            .unwrap();
 
         assert_tcp_connection_closed(port).await;
 
@@ -583,11 +781,19 @@ mod tests {
     async fn test_spawn_unix_listener_accepts_and_closes_connection() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("dynamic-listener.sock");
+        let port = available_tcp_port();
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let routes = shared_routes(HashMap::from([(port, test_route("alpha", "endpoint-a"))]));
 
-        let handle = spawn_unix_listener(&socket_path, shutdown_rx)
-            .await
-            .unwrap();
+        let handle = spawn_unix_listener(
+            &socket_path,
+            port,
+            fallback_connection_pool(),
+            routes,
+            shutdown_rx,
+        )
+        .await
+        .unwrap();
 
         let mut stream = UnixStream::connect(&socket_path).await.unwrap();
         let mut buf = [0_u8; 1];
