@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use anyhow::Result;
 use mesh_proto::{MeshConfig, NodeRole, ServiceEntry};
@@ -111,6 +112,7 @@ impl Daemon {
         info!(endpoint_id = %mesh_node.id(), "mesh node initialized");
 
         // Branch by role: create node state and start role-specific tasks.
+        let mut shared_config = None;
         let (accept_handle, _config_watcher) = match self.config.role {
             NodeRole::Control => {
                 let cn = Arc::new(tokio::sync::RwLock::new(ControlNode::new()));
@@ -129,7 +131,12 @@ impl Daemon {
                 )
             }
             NodeRole::Edge => {
-                let en = Arc::new(tokio::sync::RwLock::new(EdgeNode::new()));
+                let runtime_config = Arc::new(tokio::sync::RwLock::new(self.config.clone()));
+                shared_config = Some(Arc::clone(&runtime_config));
+                let en = Arc::new(tokio::sync::RwLock::new(EdgeNode::with_endpoint(
+                    mesh_node.endpoint().clone(),
+                )));
+                let active_connections = Arc::new(AtomicUsize::new(0));
                 // Load persisted route cache if available.
                 if let Some((routes, version)) = EdgeNode::load_route_cache(&self.config.data_dir) {
                     let mut edge = en.write().await;
@@ -143,7 +150,21 @@ impl Daemon {
                 let config_watcher =
                     ConfigWatcher::new(self.config_path.clone(), config_tx.clone())?;
                 info!(path = %self.config_path.display(), "config watcher started");
-                (None, Some(config_watcher))
+                let endpoint = mesh_node.endpoint().clone();
+                let data_dir = self.config.data_dir.clone();
+                let shutdown_rx = self.shutdown_rx();
+                let accept_handle = tokio::spawn(async move {
+                    crate::edge_node::run_edge_accept_loop(
+                        en,
+                        endpoint,
+                        runtime_config,
+                        data_dir,
+                        active_connections,
+                        shutdown_rx,
+                    )
+                    .await;
+                });
+                (Some(accept_handle), Some(config_watcher))
             }
         };
 
@@ -166,7 +187,7 @@ impl Daemon {
                         break;
                     };
 
-                    if let Err(error) = self.reload_config().await {
+                    if let Err(error) = self.reload_config(shared_config.as_ref()).await {
                         error!(error = %error, path = %self.config_path.display(), "failed to reload config");
                     }
                 }
@@ -229,7 +250,10 @@ impl Daemon {
         }
     }
 
-    async fn reload_config(&mut self) -> Result<()> {
+    async fn reload_config(
+        &mut self,
+        shared_config: Option<&Arc<tokio::sync::RwLock<MeshConfig>>>,
+    ) -> Result<()> {
         let config_path = self.config_path.clone();
         let new_config = task::spawn_blocking(move || MeshConfig::load(&config_path))
             .await
@@ -240,6 +264,10 @@ impl Daemon {
             diff.log(&self.config_path, new_config.services.len());
         } else {
             info!(path = %self.config_path.display(), "config reloaded from disk");
+        }
+
+        if let Some(shared_config) = shared_config {
+            *shared_config.write().await = new_config.clone();
         }
 
         self.config = new_config;
