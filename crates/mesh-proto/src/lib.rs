@@ -41,3 +41,13 @@ pub const DEFAULT_HEALTH_PORT: u16 = 49000;
 
 /// Default maximum services per edge node.
 pub const DEFAULT_SERVICE_QUOTA: usize = 5;
+
+/// Heartbeat ping interval in seconds.
+pub const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+
+/// Duration in seconds after which a node is considered timed-out if no pong
+/// has been received.
+pub const HEARTBEAT_TIMEOUT_SECS: u64 = 90;
+
+/// Number of consecutive missed heartbeats before marking a node offline.
+pub const MAX_MISSED_HEARTBEATS: u32 = 3;

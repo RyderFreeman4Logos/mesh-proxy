@@ -255,3 +255,49 @@ mod tests {
         assert_eq!(alloc.allocated_count(), total_ports);
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::collections::HashSet;
+
+    proptest! {
+        /// All allocated ports are unique (no duplicates in any allocation sequence).
+        #[test]
+        fn prop_allocated_ports_are_unique(count in 1usize..200) {
+            let mut alloc = PortAllocator::new();
+            let mut seen = HashSet::new();
+            for i in 0..count {
+                let sid = ServiceId {
+                    endpoint_id: "test".to_owned(),
+                    service_name: format!("svc-{i}"),
+                };
+                if let Some(port) = alloc.allocate(&sid, 1) {
+                    prop_assert!(
+                        seen.insert(port),
+                        "duplicate port {port} allocated at iteration {i}"
+                    );
+                }
+            }
+        }
+
+        /// Every allocated port falls within the configured range.
+        #[test]
+        fn prop_allocated_ports_in_range(count in 1usize..200) {
+            let mut alloc = PortAllocator::new();
+            for i in 0..count {
+                let sid = ServiceId {
+                    endpoint_id: "test".to_owned(),
+                    service_name: format!("svc-{i}"),
+                };
+                if let Some(port) = alloc.allocate(&sid, 1) {
+                    prop_assert!(
+                        (SERVICE_PORT_START..=SERVICE_PORT_END).contains(&port),
+                        "port {port} out of range [{SERVICE_PORT_START}, {SERVICE_PORT_END}]"
+                    );
+                }
+            }
+        }
+    }
+}

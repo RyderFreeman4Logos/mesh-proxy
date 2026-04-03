@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use mesh_proto::{NodeInfo, RouteEntry, ServiceId, ServiceRecord};
+use mesh_proto::{JoinTicket, NodeInfo, RouteEntry, ServiceId, ServiceRecord};
 
 use crate::port_allocator::PortAllocator;
 
@@ -11,6 +11,17 @@ pub enum QuotaError {
     Exceeded { current: usize, limit: u16 },
     #[error("node not found in whitelist: {endpoint_id}")]
     NodeNotFound { endpoint_id: String },
+}
+
+/// Error returned when ticket validation fails.
+#[derive(Debug, thiserror::Error)]
+pub enum TicketError {
+    #[error("ticket has expired")]
+    Expired,
+    #[error("ticket nonce already consumed (replay)")]
+    AlreadyUsed,
+    #[error("ticket endpoint_id does not match sender")]
+    EndpointMismatch,
 }
 
 /// Read-only snapshot of the control node's core state for serialization
@@ -36,6 +47,8 @@ pub struct ControlNode {
     routes: HashMap<u16, RouteEntry>,
     route_version: u64,
     used_tickets: HashSet<[u8; 16]>,
+    /// Epoch timestamp of the most recent pong received from each endpoint.
+    last_pong: HashMap<String, u64>,
 }
 
 impl Default for ControlNode {
@@ -54,6 +67,7 @@ impl ControlNode {
             routes: HashMap::new(),
             route_version: 0,
             used_tickets: HashSet::new(),
+            last_pong: HashMap::new(),
         }
     }
 
@@ -163,6 +177,80 @@ impl ControlNode {
     /// Access the whitelist.
     pub fn whitelist(&self) -> &HashMap<String, NodeInfo> {
         &self.whitelist
+    }
+
+    // -- Ticket validation (2B-06) --
+
+    /// Validate a join ticket and consume its nonce if valid.
+    ///
+    /// Checks expiration, replay (nonce already used), and endpoint identity.
+    /// On success the nonce is recorded so the same ticket cannot be reused.
+    pub fn validate_ticket(
+        &mut self,
+        ticket: &JoinTicket,
+        from_endpoint_id: &str,
+        now_epoch: u64,
+    ) -> Result<(), TicketError> {
+        if ticket.is_expired(now_epoch) {
+            return Err(TicketError::Expired);
+        }
+        if self.used_tickets.contains(&ticket.nonce) {
+            return Err(TicketError::AlreadyUsed);
+        }
+        if ticket.endpoint_id != from_endpoint_id {
+            return Err(TicketError::EndpointMismatch);
+        }
+        self.used_tickets.insert(ticket.nonce);
+        Ok(())
+    }
+
+    // -- Heartbeat tracking (2B-07) --
+
+    /// Record a pong received from an edge node.
+    pub fn record_pong(&mut self, endpoint_id: &str, now_epoch: u64) {
+        self.last_pong.insert(endpoint_id.to_owned(), now_epoch);
+    }
+
+    /// Returns endpoint IDs of nodes whose last pong is older than
+    /// `HEARTBEAT_TIMEOUT_SECS` relative to `now_epoch`.
+    pub fn check_heartbeats(&self, now_epoch: u64) -> Vec<String> {
+        self.last_pong
+            .iter()
+            .filter(|(_, last)| {
+                now_epoch.saturating_sub(**last) > mesh_proto::HEARTBEAT_TIMEOUT_SECS
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    // -- Health aggregation (2B-08) --
+
+    /// Update health state for services reported by an edge node.
+    ///
+    /// Unknown services (not in the registry) are logged and skipped
+    /// rather than causing a panic.
+    pub fn aggregate_health(
+        &mut self,
+        from_endpoint_id: &str,
+        services: Vec<mesh_proto::ServiceHealthEntry>,
+    ) {
+        for entry in services {
+            let sid = ServiceId {
+                endpoint_id: from_endpoint_id.to_owned(),
+                service_name: entry.service_name.clone(),
+            };
+            if let Some(record) = self.services.get_mut(&sid) {
+                record.health_state = entry.health_state;
+                // We don't have a clock here — caller should set last_seen
+                // via a separate method if needed, but we update what we can.
+            } else {
+                tracing::warn!(
+                    endpoint_id = from_endpoint_id,
+                    service_name = entry.service_name,
+                    "unknown service in health report, skipping"
+                );
+            }
+        }
     }
 }
 
@@ -291,5 +379,119 @@ mod tests {
         let nonce = [1u8; 16];
         assert!(cn.consume_ticket(nonce), "first use should succeed");
         assert!(!cn.consume_ticket(nonce), "replay should fail");
+    }
+
+    // -- Ticket validation tests (2B-06) --
+
+    fn make_ticket(endpoint_id: &str, created_at: u64, ttl: u64, nonce: [u8; 16]) -> JoinTicket {
+        JoinTicket {
+            endpoint_id: endpoint_id.to_owned(),
+            created_at,
+            ttl_seconds: ttl,
+            nonce,
+        }
+    }
+
+    #[test]
+    fn test_validate_ticket_valid() {
+        let mut cn = ControlNode::new();
+        let ticket = make_ticket("node-a", 1000, 3600, [10u8; 16]);
+        assert!(cn.validate_ticket(&ticket, "node-a", 2000).is_ok());
+    }
+
+    #[test]
+    fn test_validate_ticket_expired() {
+        let mut cn = ControlNode::new();
+        let ticket = make_ticket("node-a", 1000, 100, [11u8; 16]);
+        // now = 1101 → expired (1101 - 1000 = 101 > 100)
+        let result = cn.validate_ticket(&ticket, "node-a", 1101);
+        assert!(matches!(result, Err(TicketError::Expired)));
+    }
+
+    #[test]
+    fn test_validate_ticket_replay() {
+        let mut cn = ControlNode::new();
+        let ticket = make_ticket("node-a", 1000, 3600, [12u8; 16]);
+        assert!(cn.validate_ticket(&ticket, "node-a", 2000).is_ok());
+        // Same ticket again → replay
+        let result = cn.validate_ticket(&ticket, "node-a", 2001);
+        assert!(matches!(result, Err(TicketError::AlreadyUsed)));
+    }
+
+    #[test]
+    fn test_validate_ticket_endpoint_mismatch() {
+        let mut cn = ControlNode::new();
+        let ticket = make_ticket("node-a", 1000, 3600, [13u8; 16]);
+        let result = cn.validate_ticket(&ticket, "node-b", 2000);
+        assert!(matches!(result, Err(TicketError::EndpointMismatch)));
+    }
+
+    // -- Heartbeat tests (2B-07) --
+
+    #[test]
+    fn test_heartbeat_timeout_detection() {
+        let mut cn = ControlNode::new();
+        cn.record_pong("node-x", 1000);
+        cn.record_pong("node-y", 1050);
+
+        // At now = 1091 → node-x is 91s behind (> 90), node-y is 41s (ok)
+        let timed_out = cn.check_heartbeats(1091);
+        assert_eq!(timed_out.len(), 1);
+        assert_eq!(timed_out[0], "node-x");
+    }
+
+    #[test]
+    fn test_heartbeat_no_timeout() {
+        let mut cn = ControlNode::new();
+        cn.record_pong("node-x", 1000);
+
+        // At now = 1090 → exactly 90s (not > 90)
+        let timed_out = cn.check_heartbeats(1090);
+        assert!(timed_out.is_empty());
+    }
+
+    // -- Health aggregation tests (2B-08) --
+
+    #[test]
+    fn test_aggregate_health_updates_known_service() {
+        let mut cn = ControlNode::new();
+        cn.add_node(make_node("ep1", 5));
+        let (sid, rec) = make_service("ep1", "web");
+        cn.services.insert(sid, rec);
+
+        cn.aggregate_health(
+            "ep1",
+            vec![mesh_proto::ServiceHealthEntry {
+                service_name: "web".to_owned(),
+                health_state: mesh_proto::HealthState::Healthy,
+                last_error: None,
+            }],
+        );
+
+        let sid = ServiceId {
+            endpoint_id: "ep1".to_owned(),
+            service_name: "web".to_owned(),
+        };
+        assert_eq!(
+            cn.services.get(&sid).unwrap().health_state,
+            mesh_proto::HealthState::Healthy
+        );
+    }
+
+    #[test]
+    fn test_aggregate_health_skips_unknown_service() {
+        let mut cn = ControlNode::new();
+
+        // No services registered — should not panic, just skip.
+        cn.aggregate_health(
+            "ep-unknown",
+            vec![mesh_proto::ServiceHealthEntry {
+                service_name: "ghost".to_owned(),
+                health_state: mesh_proto::HealthState::Unhealthy,
+                last_error: Some("timeout".to_owned()),
+            }],
+        );
+
+        assert!(cn.services.is_empty());
     }
 }

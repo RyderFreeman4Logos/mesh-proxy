@@ -18,3 +18,4 @@ bs58.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+proptest = { version = "=1.10.0", default-features = false, features = ["std", "bit-set"] }
