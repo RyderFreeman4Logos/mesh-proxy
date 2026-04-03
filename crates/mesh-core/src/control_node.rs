@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use mesh_proto::{
@@ -8,6 +8,8 @@ use mesh_proto::{
     ServiceRecord,
 };
 use tokio::sync::RwLock;
+use tokio::task::JoinSet;
+use tokio::time::timeout;
 use tracing::{info, warn};
 
 use crate::port_allocator::PortAllocator;
@@ -787,28 +789,53 @@ async fn broadcast_routes(
     active_connections: &Arc<ActiveControlConnections>,
     exclude_endpoint_id: Option<&str>,
 ) {
+    const ROUTE_BROADCAST_TIMEOUT: Duration = Duration::from_secs(5);
+
     let (routes, version) = {
         let n = node.read().await;
         (n.routes().clone(), n.route_version())
     };
     let targets = active_connections.snapshot(exclude_endpoint_id).await;
 
-    let update = ControlMessage::RouteTableUpdate { routes, version };
+    let update = Arc::new(ControlMessage::RouteTableUpdate { routes, version });
+    let mut broadcasts = JoinSet::new();
 
-    for (eid, connection) in targets {
-        let result: anyhow::Result<()> = async {
-            let (mut send, _recv) = connection.open_bi().await.context("open_bi failed")?;
-            mesh_proto::frame::write_json(&mut send, &update)
-                .await
-                .context("write route update failed")?;
-            send.finish()
-                .map_err(|e| anyhow::anyhow!("finish failed: {e}"))?;
-            Ok(())
-        }
-        .await;
+    for (endpoint_id, connection) in targets {
+        let update = Arc::clone(&update);
+        broadcasts.spawn(async move {
+            match timeout(ROUTE_BROADCAST_TIMEOUT, async {
+                let (mut send, _recv) = connection.open_bi().await.context("open_bi failed")?;
+                mesh_proto::frame::write_json(&mut send, update.as_ref())
+                    .await
+                    .context("write route update failed")?;
+                send.finish()
+                    .map_err(|error| anyhow::anyhow!("finish failed: {error}"))?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            {
+                Ok(Ok(())) => Ok::<(), (String, anyhow::Error)>(()),
+                Ok(Err(error)) => Err((endpoint_id, error)),
+                Err(_) => Err((
+                    endpoint_id,
+                    anyhow::anyhow!(
+                        "route broadcast timed out after {}s",
+                        ROUTE_BROADCAST_TIMEOUT.as_secs()
+                    ),
+                )),
+            }
+        });
+    }
 
-        if let Err(e) = result {
-            warn!(endpoint_id = %eid, error = %e, "route broadcast to node failed");
+    while let Some(result) = broadcasts.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err((endpoint_id, error))) => {
+                warn!(endpoint_id = %endpoint_id, error = %error, "route broadcast to node failed");
+            }
+            Err(error) => {
+                warn!(error = %error, "route broadcast task join failed");
+            }
         }
     }
 }
