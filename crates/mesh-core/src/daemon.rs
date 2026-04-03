@@ -6,6 +6,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use mesh_proto::{MeshConfig, NodeRole, ServiceEntry};
 use tokio::sync::{broadcast, mpsc};
+use tokio::task;
 use tracing::{error, info, warn};
 
 use crate::ConfigWatcher;
@@ -165,7 +166,7 @@ impl Daemon {
                         break;
                     };
 
-                    if let Err(error) = self.reload_config() {
+                    if let Err(error) = self.reload_config().await {
                         error!(error = %error, path = %self.config_path.display(), "failed to reload config");
                     }
                 }
@@ -228,8 +229,11 @@ impl Daemon {
         }
     }
 
-    fn reload_config(&mut self) -> Result<()> {
-        let new_config = MeshConfig::load(&self.config_path)?;
+    async fn reload_config(&mut self) -> Result<()> {
+        let config_path = self.config_path.clone();
+        let new_config = task::spawn_blocking(move || MeshConfig::load(&config_path))
+            .await
+            .map_err(anyhow::Error::from)??;
 
         if self.config.role == NodeRole::Edge {
             let diff = ServiceDiff::between(&self.config.services, &new_config.services);

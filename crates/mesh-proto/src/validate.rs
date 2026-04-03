@@ -62,6 +62,8 @@ pub fn validate_port_in_service_range(port: u16) -> Result<(), String> {
 
 /// Validate that a health-check target resolves to localhost or a private IP.
 pub fn validate_health_target(target: &str) -> Result<(), String> {
+    let target = normalize_health_target_host(target);
+
     if target == "localhost" {
         return Ok(());
     }
@@ -75,6 +77,13 @@ pub fn validate_health_target(target: &str) -> Result<(), String> {
     }
 
     Err("health target must be localhost or a private/loopback IP".to_string())
+}
+
+fn normalize_health_target_host(target: &str) -> &str {
+    target
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(target)
 }
 
 fn is_allowed_health_ip(ip: IpAddr) -> bool {
@@ -183,6 +192,7 @@ mod tests {
             "127.0.0.1",
             "127.255.255.255",
             "::1",
+            "[::1]",
             "10.0.0.0",
             "10.255.255.255",
             "172.16.0.0",

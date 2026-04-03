@@ -4,11 +4,12 @@ use hyper::Uri;
 use mesh_proto::{
     HealthCheckConfig, HealthCheckMode, HealthState, validate_health_target, validate_local_addr,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_STATUS_LINE_LEN: u64 = 8192;
 
 /// Probes local services using the configured health-check mode.
 pub struct HealthProber;
@@ -96,6 +97,7 @@ fn validate_tcp_target(target: &str) -> Result<(), String> {
     let Some(_port) = uri.port_u16() else {
         return Err("invalid TCP health check target: missing port".to_string());
     };
+    let host = normalize_uri_host(host);
 
     validate_health_target(host)
         .map_err(|error| format!("invalid TCP health check target: {error}"))?;
@@ -126,6 +128,7 @@ fn build_http_probe_request(target: &str) -> Result<HttpProbeRequest, String> {
     let host = uri
         .host()
         .ok_or_else(|| "invalid HTTP health check target: missing host".to_string())?;
+    let host = normalize_uri_host(host);
     validate_health_target(host)
         .map_err(|error| format!("invalid HTTP health check target: {error}"))?;
 
@@ -157,13 +160,19 @@ async fn execute_http_probe(request: &HttpProbeRequest) -> std::io::Result<Strin
     );
     stream.write_all(request_bytes.as_bytes()).await?;
 
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::new(stream).take(MAX_STATUS_LINE_LEN);
     let mut status_line = String::new();
     let bytes_read = reader.read_line(&mut status_line).await?;
     if bytes_read == 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "missing HTTP status line",
+        ));
+    }
+    if bytes_read == MAX_STATUS_LINE_LEN as usize && !status_line.ends_with('\n') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HTTP status line exceeds maximum length",
         ));
     }
 
@@ -194,6 +203,12 @@ fn format_host_port(host: &str, port: u16) -> String {
     } else {
         format!("{host}:{port}")
     }
+}
+
+fn normalize_uri_host(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host)
 }
 
 fn healthy() -> (HealthState, Option<String>) {
@@ -323,6 +338,55 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("timed out")),
             "expected timeout error, got {last_error:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_http_probe_request_normalizes_ipv6_host_without_port() {
+        let request =
+            super::build_http_probe_request("http://[::1]/healthz").expect("request should build");
+
+        assert_eq!(request.connect_addr, "[::1]:80");
+        assert_eq!(request.host_header, "[::1]");
+        assert_eq!(request.path_and_query, "/healthz");
+    }
+
+    #[tokio::test]
+    async fn test_probe_http_get_rejects_overlong_status_line() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener should expose local addr");
+
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _peer) = listener.accept().await.expect("probe should connect");
+            let overlong_reason = "A".repeat(super::MAX_STATUS_LINE_LEN as usize);
+            let response = format!(
+                "HTTP/1.1 200 {overlong_reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("server should write response");
+        });
+
+        let config = HealthCheckConfig {
+            mode: HealthCheckMode::HttpGet,
+            target: Some(format!("http://{addr}/healthz")),
+            interval_seconds: 10,
+        };
+
+        let (state, last_error) = HealthProber::probe(&config).await;
+        server_task.await.expect("server task should complete");
+
+        assert_eq!(state, HealthState::Unhealthy);
+        assert!(
+            last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("exceeds maximum length")),
+            "expected status line length error, got {last_error:?}"
         );
     }
 

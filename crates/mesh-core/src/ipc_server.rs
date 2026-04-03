@@ -11,6 +11,7 @@ use mesh_proto::{
 };
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
+use tokio::task;
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 use tracing::{info, warn};
 
@@ -388,19 +389,28 @@ async fn handle_expose_service(
         };
     }
 
-    if let Err(error) = load_config_document(&state.config_path)
-        .and_then(|mut document| {
-            upsert_service_entry(
-                &mut document,
-                name,
-                local_addr,
-                protocol,
-                health_check.as_ref(),
-            )?;
-            Ok(document)
-        })
-        .and_then(|document| write_config_document_atomic(&state.config_path, &document))
-    {
+    let mut document = match load_config_document(&state.config_path).await {
+        Ok(document) => document,
+        Err(error) => {
+            return IpcResponse::Error {
+                message: format!("failed to update config.toml: {error}"),
+            };
+        }
+    };
+
+    if let Err(error) = upsert_service_entry(
+        &mut document,
+        name,
+        local_addr,
+        protocol,
+        health_check.as_ref(),
+    ) {
+        return IpcResponse::Error {
+            message: format!("failed to update config.toml: {error}"),
+        };
+    }
+
+    if let Err(error) = write_config_document_atomic(&state.config_path, &document).await {
         return IpcResponse::Error {
             message: format!("failed to update config.toml: {error}"),
         };
@@ -470,8 +480,9 @@ fn validate_http_health_target(target: &str) -> Result<()> {
     Ok(())
 }
 
-fn load_config_document(path: &Path) -> Result<DocumentMut> {
-    let content = std::fs::read_to_string(path)
+async fn load_config_document(path: &Path) -> Result<DocumentMut> {
+    let content = tokio::fs::read_to_string(path)
+        .await
         .with_context(|| format!("failed to read config at {}", path.display()))?;
     DocumentMut::from_str(&content)
         .with_context(|| format!("failed to parse config at {}", path.display()))
@@ -563,27 +574,39 @@ fn health_check_mode_name(mode: &mesh_proto::HealthCheckMode) -> &'static str {
     }
 }
 
-fn write_config_document_atomic(path: &Path, document: &DocumentMut) -> Result<()> {
+async fn write_config_document_atomic(path: &Path, document: &DocumentMut) -> Result<()> {
+    let path = path.to_path_buf();
+    let content = document.to_string();
+
+    task::spawn_blocking(move || write_config_document_atomic_blocking(&path, &content))
+        .await
+        .context("config write task panicked")?
+}
+
+fn write_config_document_atomic_blocking(path: &Path, content: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create config dir {}", parent.display()))?;
     }
 
     let tmp_path = path.with_extension("toml.tmp");
-    let mut file = std::fs::File::create(&tmp_path)
-        .with_context(|| format!("failed to create temp config at {}", tmp_path.display()))?;
-    file.write_all(document.to_string().as_bytes())
-        .with_context(|| format!("failed to write temp config at {}", tmp_path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("failed to fsync temp config at {}", tmp_path.display()))?;
+    let mut open_options = std::fs::OpenOptions::new();
+    open_options.create(true).truncate(true).write(true);
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::OpenOptionsExt;
 
-        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to set permissions on {}", tmp_path.display()))?;
+        open_options.mode(0o600);
     }
+
+    let mut file = open_options
+        .open(&tmp_path)
+        .with_context(|| format!("failed to create temp config at {}", tmp_path.display()))?;
+    file.write_all(content.as_bytes())
+        .with_context(|| format!("failed to write temp config at {}", tmp_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to fsync temp config at {}", tmp_path.display()))?;
 
     std::fs::rename(&tmp_path, path).with_context(|| {
         format!(
