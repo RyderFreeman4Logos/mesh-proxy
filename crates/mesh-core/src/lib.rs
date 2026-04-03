@@ -2,6 +2,7 @@ mod config_watcher;
 mod control_node;
 mod daemon;
 mod edge_node;
+pub mod health_prober;
 mod ipc_server;
 mod mesh_node;
 mod persistence;
