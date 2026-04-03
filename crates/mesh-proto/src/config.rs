@@ -209,8 +209,10 @@ mod tests {
         let config = MeshConfig::default();
         assert!(config.is_default());
 
-        let mut modified = MeshConfig::default();
-        modified.role = NodeRole::Control;
+        let modified = MeshConfig {
+            role: NodeRole::Control,
+            ..Default::default()
+        };
         assert!(!modified.is_default());
     }
 
@@ -219,8 +221,10 @@ mod tests {
         let entry = ServiceEntry::default();
         assert!(entry.is_default());
 
-        let mut modified = ServiceEntry::default();
-        modified.name = "svc".to_string();
+        let modified = ServiceEntry {
+            name: "svc".to_string(),
+            ..Default::default()
+        };
         assert!(!modified.is_default());
     }
 
@@ -229,8 +233,10 @@ mod tests {
         let hc = HealthCheckConfig::default();
         assert!(hc.is_default());
 
-        let mut modified = HealthCheckConfig::default();
-        modified.interval_seconds = 30;
+        let modified = HealthCheckConfig {
+            interval_seconds: 30,
+            ..Default::default()
+        };
         assert!(!modified.is_default());
     }
 
