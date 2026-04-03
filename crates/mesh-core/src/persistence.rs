@@ -3,18 +3,27 @@ use std::path::Path;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+/// Errors arising from persistence operations.
+#[derive(Debug, thiserror::Error)]
+pub enum PersistenceError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("JSON serialization error: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
 /// Atomically persist `data` as JSON to `path`.
 ///
-/// Writes to a temporary file (`.json.tmp`), fsyncs, then renames into place.
-/// This ensures that a crash mid-write never leaves a partially-written file.
-pub async fn save_atomic<T: Serialize>(path: &Path, data: &T) -> anyhow::Result<()> {
+/// Creates → writes → fsyncs → renames on the same file handle, so a crash
+/// mid-write never leaves a partially-written file.
+pub async fn save_atomic<T: Serialize>(path: &Path, data: &T) -> Result<(), PersistenceError> {
+    use tokio::io::AsyncWriteExt;
+
     let tmp_path = path.with_extension("json.tmp");
     let json = serde_json::to_string_pretty(data)?;
 
-    tokio::fs::write(&tmp_path, json.as_bytes()).await?;
-
-    // fsync the temporary file to ensure data reaches disk before rename.
-    let file = tokio::fs::File::open(&tmp_path).await?;
+    let mut file = tokio::fs::File::create(&tmp_path).await?;
+    file.write_all(json.as_bytes()).await?;
     file.sync_all().await?;
 
     tokio::fs::rename(&tmp_path, path).await?;
@@ -26,7 +35,7 @@ pub async fn save_atomic<T: Serialize>(path: &Path, data: &T) -> anyhow::Result<
 ///
 /// Returns `Ok(None)` if the file does not exist, `Ok(Some(T))` if it does,
 /// and `Err` on parse or IO errors (other than not-found).
-pub fn load_state<T: DeserializeOwned>(path: &Path) -> anyhow::Result<Option<T>> {
+pub fn load_state<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, PersistenceError> {
     match std::fs::read_to_string(path) {
         Ok(contents) => {
             let value = serde_json::from_str(&contents)?;
@@ -68,7 +77,7 @@ mod tests {
     fn test_load_missing_file_returns_none() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nonexistent.json");
-        let result: anyhow::Result<Option<TestData>> = load_state(&path);
+        let result: Result<Option<TestData>, PersistenceError> = load_state(&path);
         assert!(result.unwrap().is_none());
     }
 

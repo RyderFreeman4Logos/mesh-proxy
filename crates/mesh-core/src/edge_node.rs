@@ -1,6 +1,15 @@
 use std::collections::HashMap;
+use std::fmt;
 
 use mesh_proto::RouteEntry;
+
+/// Error returned when a state transition is not allowed.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("illegal transition from {from} to {to}")]
+pub struct TransitionError {
+    pub from: ConnectionState,
+    pub to: ConnectionState,
+}
 
 /// Connection lifecycle states for an edge node communicating with the control plane.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10,6 +19,12 @@ pub enum ConnectionState {
     Unauthenticated,
     Registering,
     Authenticated,
+}
+
+impl fmt::Display for ConnectionState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self, f)
+    }
 }
 
 /// Local state container for an edge node.
@@ -52,7 +67,7 @@ impl EdgeNode {
     /// - Unauthenticated → Registering
     /// - Registering → Authenticated
     /// - Any state → Disconnected (error fallback)
-    pub fn transition_to(&mut self, new_state: ConnectionState) -> Result<(), &'static str> {
+    pub fn transition_to(&mut self, new_state: ConnectionState) -> Result<(), TransitionError> {
         let allowed = matches!(
             (&self.state, &new_state),
             (_, ConnectionState::Disconnected)
@@ -72,7 +87,10 @@ impl EdgeNode {
             self.state = new_state;
             Ok(())
         } else {
-            Err("illegal state transition")
+            Err(TransitionError {
+                from: self.state.clone(),
+                to: new_state,
+            })
         }
     }
 

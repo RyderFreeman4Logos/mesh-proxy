@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use mesh_proto::{JoinTicket, NodeInfo, RouteEntry, ServiceId, ServiceRecord};
 
@@ -46,7 +46,8 @@ pub struct ControlNode {
     services: HashMap<ServiceId, ServiceRecord>,
     routes: HashMap<u16, RouteEntry>,
     route_version: u64,
-    used_tickets: HashSet<[u8; 16]>,
+    /// Maps ticket nonce → expiry epoch for replay prevention with bounded growth.
+    used_tickets: HashMap<[u8; 16], u64>,
     /// Epoch timestamp of the most recent pong received from each endpoint.
     last_pong: HashMap<String, u64>,
 }
@@ -66,7 +67,7 @@ impl ControlNode {
             services: HashMap::new(),
             routes: HashMap::new(),
             route_version: 0,
-            used_tickets: HashSet::new(),
+            used_tickets: HashMap::new(),
             last_pong: HashMap::new(),
         }
     }
@@ -88,9 +89,11 @@ impl ControlNode {
         self.whitelist.insert(info.endpoint_id.clone(), info);
     }
 
-    /// Remove a node from the whitelist and release all its allocated ports.
+    /// Remove a node from the whitelist, release all its allocated ports,
+    /// and clean up heartbeat tracking.
     pub fn remove_node(&mut self, endpoint_id: &str) {
         self.whitelist.remove(endpoint_id);
+        self.last_pong.remove(endpoint_id);
 
         // Collect service IDs belonging to this node.
         let owned_services: Vec<ServiceId> = self
@@ -154,9 +157,22 @@ impl ControlNode {
         &mut self.allocator
     }
 
-    /// Record a ticket nonce as used. Returns `false` if already consumed.
-    pub fn consume_ticket(&mut self, nonce: [u8; 16]) -> bool {
-        self.used_tickets.insert(nonce)
+    /// Record a ticket nonce as used with the given expiry epoch.
+    /// Returns `false` if already consumed.
+    pub fn consume_ticket(&mut self, nonce: [u8; 16], expiry_epoch: u64) -> bool {
+        use std::collections::hash_map::Entry;
+        match self.used_tickets.entry(nonce) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(e) => {
+                e.insert(expiry_epoch);
+                true
+            }
+        }
+    }
+
+    /// Remove all ticket nonces whose expiry epoch is at or before `now_epoch`.
+    pub fn prune_expired_tickets(&mut self, now_epoch: u64) {
+        self.used_tickets.retain(|_, expiry| *expiry > now_epoch);
     }
 
     /// Returns the current route version counter.
@@ -194,13 +210,14 @@ impl ControlNode {
         if ticket.is_expired(now_epoch) {
             return Err(TicketError::Expired);
         }
-        if self.used_tickets.contains(&ticket.nonce) {
+        if self.used_tickets.contains_key(&ticket.nonce) {
             return Err(TicketError::AlreadyUsed);
         }
         if ticket.endpoint_id != from_endpoint_id {
             return Err(TicketError::EndpointMismatch);
         }
-        self.used_tickets.insert(ticket.nonce);
+        let expiry = ticket.created_at.saturating_add(ticket.ttl_seconds);
+        self.used_tickets.insert(ticket.nonce, expiry);
         Ok(())
     }
 
@@ -377,8 +394,27 @@ mod tests {
     fn test_consume_ticket_prevents_replay() {
         let mut cn = ControlNode::new();
         let nonce = [1u8; 16];
-        assert!(cn.consume_ticket(nonce), "first use should succeed");
-        assert!(!cn.consume_ticket(nonce), "replay should fail");
+        assert!(cn.consume_ticket(nonce, 5000), "first use should succeed");
+        assert!(!cn.consume_ticket(nonce, 5000), "replay should fail");
+    }
+
+    #[test]
+    fn test_prune_expired_tickets() {
+        let mut cn = ControlNode::new();
+        let ticket_a = make_ticket("node-a", 1000, 100, [20u8; 16]); // expires at 1100
+        let ticket_b = make_ticket("node-b", 1000, 3600, [21u8; 16]); // expires at 4600
+
+        assert!(cn.validate_ticket(&ticket_a, "node-a", 1050).is_ok());
+        assert!(cn.validate_ticket(&ticket_b, "node-b", 1050).is_ok());
+
+        // Prune at epoch 1100 — ticket_a expiry (1100) is not > 1100, so pruned.
+        cn.prune_expired_tickets(1100);
+
+        // ticket_a's nonce should be pruned (can be re-inserted, but the ticket
+        // itself is expired so validate_ticket would reject it anyway).
+        assert!(!cn.used_tickets.contains_key(&[20u8; 16]));
+        // ticket_b should still be tracked.
+        assert!(cn.used_tickets.contains_key(&[21u8; 16]));
     }
 
     // -- Ticket validation tests (2B-06) --
@@ -448,6 +484,21 @@ mod tests {
         // At now = 1090 → exactly 90s (not > 90)
         let timed_out = cn.check_heartbeats(1090);
         assert!(timed_out.is_empty());
+    }
+
+    #[test]
+    fn test_remove_node_cleans_last_pong() {
+        let mut cn = ControlNode::new();
+        cn.add_node(make_node("pong-node", 5));
+        cn.record_pong("pong-node", 1000);
+
+        // Before removal, stale pong should be reported.
+        assert_eq!(cn.check_heartbeats(1200).len(), 1);
+
+        cn.remove_node("pong-node");
+
+        // After removal, check_heartbeats must not report the removed node.
+        assert!(cn.check_heartbeats(1200).is_empty());
     }
 
     // -- Health aggregation tests (2B-08) --
