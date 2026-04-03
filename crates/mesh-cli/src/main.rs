@@ -288,11 +288,17 @@ async fn cmd_status(config_path: &Path, output: OutputFormat) -> Result<()> {
         IpcResponse::Ok { message } => {
             println!("{message}");
         }
+        IpcResponse::Reloaded => {
+            println!("Configuration reloaded");
+        }
         IpcResponse::ServiceExposed {
             name,
             assigned_port,
         } => {
             println!("Service '{name}' exposed (port: {assigned_port:?})");
+        }
+        IpcResponse::ListenerStatus { port, state } => {
+            println!("Listener {port}: {state:?}");
         }
     }
 

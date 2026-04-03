@@ -202,9 +202,7 @@ async fn dispatch(request: &IpcRequest, state: &SharedState) -> IpcResponse {
                 message: "shutting down".to_string(),
             }
         }
-        IpcRequest::Reload => IpcResponse::Ok {
-            message: "reload not yet implemented".to_string(),
-        },
+        IpcRequest::Reload => IpcResponse::Reloaded,
         IpcRequest::Restart => {
             let _ = state.shutdown_tx.send(());
             IpcResponse::Ok {

@@ -163,6 +163,13 @@ impl MeshConfig {
 mod tests {
     use super::*;
 
+    fn writable_tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("mesh-proto-")
+            .tempdir_in("/tmp")
+            .unwrap()
+    }
+
     fn sample_config() -> MeshConfig {
         MeshConfig {
             node_name: "test-node".to_string(),
@@ -182,7 +189,7 @@ mod tests {
 
     #[test]
     fn test_config_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = writable_tempdir();
         let path = dir.path().join("config.toml");
 
         let original = sample_config();
@@ -194,7 +201,7 @@ mod tests {
 
     #[test]
     fn test_config_default_creation() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = writable_tempdir();
         let path = dir.path().join("sub").join("config.toml");
 
         assert!(!path.exists());
@@ -245,7 +252,7 @@ mod tests {
     fn test_config_file_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = writable_tempdir();
         let path = dir.path().join("config.toml");
 
         let config = sample_config();

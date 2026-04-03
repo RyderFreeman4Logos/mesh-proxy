@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Protocol;
 use crate::health::HealthCheckConfig;
+use crate::listener::ListenerState;
 
 /// Request from CLI client to the local daemon via Unix socket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +37,8 @@ pub enum IpcResponse {
     Status(StatusInfo),
     /// Operation succeeded.
     Ok { message: String },
+    /// Configuration was reloaded from disk.
+    Reloaded,
     /// Operation failed.
     Error { message: String },
     /// A service was successfully exposed and (optionally) assigned a port.
@@ -43,6 +46,8 @@ pub enum IpcResponse {
         name: String,
         assigned_port: Option<u16>,
     },
+    /// Runtime status for a specific managed listener.
+    ListenerStatus { port: u16, state: ListenerState },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
