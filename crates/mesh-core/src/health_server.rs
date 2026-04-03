@@ -130,6 +130,18 @@ pub async fn run_health_server(
     run_health_server_with_state(bind_addr, HealthServerState::from(state), shutdown_rx).await
 }
 
+/// Run the local health query HTTP server for a control node.
+///
+/// The server always binds to `127.0.0.1` for security, using the port from
+/// `bind_addr`.
+pub async fn run_control_health_server(
+    bind_addr: SocketAddr,
+    state: Arc<RwLock<ControlNode>>,
+    shutdown_rx: broadcast::Receiver<()>,
+) -> Result<()> {
+    run_health_server_with_state(bind_addr, HealthServerState::from(state), shutdown_rx).await
+}
+
 pub(crate) async fn run_health_server_with_state(
     bind_addr: SocketAddr,
     state: HealthServerState,

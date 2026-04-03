@@ -119,6 +119,20 @@ impl IpcServer {
         }
     }
 
+    /// Attach an initialized control node so quota and status requests can
+    /// observe live control-plane state.
+    pub async fn attach_control_node(&self, control: Arc<tokio::sync::RwLock<ControlNode>>) {
+        let mut node_state = self.state.node_state.write().await;
+        *node_state = NodeState::Control(control);
+    }
+
+    /// Attach an initialized edge node so status requests can observe live
+    /// edge-side route state.
+    pub async fn attach_edge_node(&self, edge: Arc<tokio::sync::RwLock<EdgeNode>>) {
+        let mut node_state = self.state.node_state.write().await;
+        *node_state = NodeState::Edge(edge);
+    }
+
     /// Returns a handle for setting the node-role state after initialization.
     pub(crate) fn node_state_handle(&self) -> Arc<tokio::sync::RwLock<NodeState>> {
         Arc::clone(&self.state.node_state)
