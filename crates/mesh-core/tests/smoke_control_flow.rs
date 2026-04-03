@@ -156,6 +156,7 @@ async fn test_smoke_complete_registration_flow() {
                 last_error: Some("high latency".to_owned()),
             },
         ],
+        now,
     );
 
     // Verify health states updated.
@@ -190,6 +191,7 @@ async fn test_smoke_complete_registration_flow() {
             health_state: HealthState::Unhealthy,
             last_error: None,
         }],
+        now,
     );
     // No panic, no new service added.
     assert_eq!(cn.services().len(), 5);

@@ -268,6 +268,10 @@ impl ControlNode {
     /// Record a pong received from an edge node.
     pub fn record_pong(&mut self, endpoint_id: &str, now_epoch: u64) {
         self.last_pong.insert(endpoint_id.to_owned(), now_epoch);
+        if let Some(node) = self.whitelist.get_mut(endpoint_id) {
+            node.is_online = true;
+            node.last_heartbeat = Some(now_epoch);
+        }
     }
 
     /// Returns endpoint IDs of nodes whose last pong is older than
@@ -412,7 +416,13 @@ impl ControlNode {
         &mut self,
         from_endpoint_id: &str,
         services: Vec<mesh_proto::ServiceHealthEntry>,
+        now_epoch: u64,
     ) {
+        if let Some(node) = self.whitelist.get_mut(from_endpoint_id) {
+            node.is_online = true;
+            node.last_heartbeat = Some(now_epoch);
+        }
+
         for entry in services {
             let sid = ServiceId {
                 endpoint_id: from_endpoint_id.to_owned(),
@@ -420,8 +430,7 @@ impl ControlNode {
             };
             if let Some(record) = self.services.get_mut(&sid) {
                 record.health_state = entry.health_state;
-                // We don't have a clock here — caller should set last_seen
-                // via a separate method if needed, but we update what we can.
+                record.last_seen = Some(now_epoch);
             } else {
                 tracing::warn!(
                     endpoint_id = from_endpoint_id,
@@ -554,7 +563,7 @@ async fn handle_connection(
                 services,
             } => {
                 let mut n = node.write().await;
-                n.aggregate_health(&endpoint_id, services);
+                n.aggregate_health(&endpoint_id, services, now_epoch());
             }
             ControlMessage::Ping => {
                 if let Err(e) =
@@ -966,6 +975,7 @@ mod tests {
                 health_state: mesh_proto::HealthState::Healthy,
                 last_error: None,
             }],
+            1234,
         );
 
         let sid = ServiceId {
@@ -976,6 +986,8 @@ mod tests {
             cn.services.get(&sid).unwrap().health_state,
             mesh_proto::HealthState::Healthy
         );
+        assert_eq!(cn.services.get(&sid).unwrap().last_seen, Some(1234));
+        assert_eq!(cn.whitelist["ep1"].last_heartbeat, Some(1234));
     }
 
     #[test]
@@ -990,8 +1002,10 @@ mod tests {
                 health_state: mesh_proto::HealthState::Unhealthy,
                 last_error: Some("timeout".to_owned()),
             }],
+            4321,
         );
 
         assert!(cn.services.is_empty());
+        assert_eq!(cn.whitelist.get("ep-unknown"), None);
     }
 }
