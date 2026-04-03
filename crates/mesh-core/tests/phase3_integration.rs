@@ -300,7 +300,9 @@ async fn test_health_server_responds() -> Result<()> {
                 "node_name": "edge-a",
                 "endpoint_id": "endpoint-a",
                 "target_local_addr": "127.0.0.1:3000",
-                "protocol": "tcp"
+                "protocol": "tcp",
+                "health_state": "unknown",
+                "last_seen": null
             },
             {
                 "published_port": 41001,
@@ -308,7 +310,9 @@ async fn test_health_server_responds() -> Result<()> {
                 "node_name": "edge-b",
                 "endpoint_id": "endpoint-b",
                 "target_local_addr": "/tmp/beta.sock",
-                "protocol": "unix"
+                "protocol": "unix",
+                "health_state": "unknown",
+                "last_seen": null
             }
         ]))
     );

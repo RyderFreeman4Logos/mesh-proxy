@@ -119,6 +119,20 @@ impl IpcServer {
         }
     }
 
+    /// Attach an initialized control node so quota and status requests can
+    /// observe live control-plane state.
+    pub async fn attach_control_node(&self, control: Arc<tokio::sync::RwLock<ControlNode>>) {
+        let mut node_state = self.state.node_state.write().await;
+        *node_state = NodeState::Control(control);
+    }
+
+    /// Attach an initialized edge node so status requests can observe live
+    /// edge-side route state.
+    pub async fn attach_edge_node(&self, edge: Arc<tokio::sync::RwLock<EdgeNode>>) {
+        let mut node_state = self.state.node_state.write().await;
+        *node_state = NodeState::Edge(edge);
+    }
+
     /// Returns a handle for setting the node-role state after initialization.
     pub(crate) fn node_state_handle(&self) -> Arc<tokio::sync::RwLock<NodeState>> {
         Arc::clone(&self.state.node_state)
@@ -207,6 +221,10 @@ async fn handle_connection(mut stream: UnixStream, state: Arc<SharedState>) {
 async fn dispatch(request: &IpcRequest, state: &SharedState) -> IpcResponse {
     match request {
         IpcRequest::Status => build_status(state).await,
+        IpcRequest::QuotaShow => handle_quota_show(state).await,
+        IpcRequest::QuotaSet { endpoint_id, limit } => {
+            handle_quota_set(state, endpoint_id, *limit).await
+        }
         IpcRequest::Stop => {
             let _ = state.shutdown_tx.send(());
             IpcResponse::Ok {
@@ -262,6 +280,7 @@ async fn build_status(state: &SharedState) -> IpcResponse {
                 .values()
                 .map(|r| ServiceStatus {
                     name: r.service_id.service_name.clone(),
+                    node_name: r.node_name.clone(),
                     assigned_port: r.published_port,
                     status: format!("{:?}", r.health_state),
                 })
@@ -275,6 +294,7 @@ async fn build_status(state: &SharedState) -> IpcResponse {
                 .iter()
                 .map(|(port, entry)| ServiceStatus {
                     name: entry.service_name.clone(),
+                    node_name: entry.node_name.clone(),
                     assigned_port: Some(*port),
                     status: "cached".to_string(),
                 })
@@ -294,6 +314,58 @@ async fn build_status(state: &SharedState) -> IpcResponse {
         health_bind: state.config.health_bind.clone(),
         route_table_version,
     })
+}
+
+async fn handle_quota_show(state: &SharedState) -> IpcResponse {
+    if state.config.role != NodeRole::Control {
+        return IpcResponse::Error {
+            message: "quota is only available on control nodes".to_string(),
+        };
+    }
+
+    let node_state = state.node_state.read().await;
+    let NodeState::Control(cn) = &*node_state else {
+        return IpcResponse::Error {
+            message: "control node not initialized".to_string(),
+        };
+    };
+
+    let cn = cn.read().await;
+    IpcResponse::QuotaInfo {
+        quotas: cn.quota_snapshot(),
+    }
+}
+
+async fn handle_quota_set(state: &SharedState, endpoint_id: &str, limit: usize) -> IpcResponse {
+    if state.config.role != NodeRole::Control {
+        return IpcResponse::Error {
+            message: "quota is only available on control nodes".to_string(),
+        };
+    }
+
+    let limit = match u16::try_from(limit) {
+        Ok(limit) => limit,
+        Err(_) => {
+            return IpcResponse::Error {
+                message: format!("invalid quota limit {limit}: must be <= {}", u16::MAX),
+            };
+        }
+    };
+
+    let node_state = state.node_state.read().await;
+    let NodeState::Control(cn) = &*node_state else {
+        return IpcResponse::Error {
+            message: "control node not initialized".to_string(),
+        };
+    };
+
+    let mut cn = cn.write().await;
+    match cn.set_quota_limit(endpoint_id, limit) {
+        Ok(()) => IpcResponse::QuotaUpdated,
+        Err(error) => IpcResponse::Error {
+            message: error.to_string(),
+        },
+    }
 }
 
 /// Handle AcceptNode: validate ticket and add node to whitelist (control only).
@@ -622,7 +694,10 @@ fn write_config_document_atomic_blocking(path: &Path, content: &str) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mesh_proto::{HealthCheckConfig, HealthCheckMode, NodeRole, Protocol, ServiceEntry};
+    use mesh_proto::{
+        HealthCheckConfig, HealthCheckMode, NodeInfo, NodeRole, Protocol, ServiceEntry,
+        ServiceRegistration,
+    };
     use tempfile::Builder;
     use tokio::sync::{broadcast, mpsc};
 
@@ -684,6 +759,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_status_includes_service_node_name_for_control_services() {
+        let (state, _dir, _reload_rx) = shared_state(NodeRole::Control);
+        let mut control = ControlNode::new();
+        control.add_node(NodeInfo {
+            endpoint_id: "edge-1".to_string(),
+            node_name: "node-alpha".to_string(),
+            quota_limit: 5,
+            quota_used: 1,
+            is_online: true,
+            last_heartbeat: None,
+            addr: None,
+        });
+        control
+            .register_services(
+                "edge-1",
+                "node-alpha",
+                &[ServiceRegistration {
+                    name: "web".to_string(),
+                    local_addr: "127.0.0.1:8080".to_string(),
+                    protocol: Protocol::Tcp,
+                    health_check: None,
+                }],
+                1,
+            )
+            .unwrap();
+        *state.node_state.write().await =
+            NodeState::Control(Arc::new(tokio::sync::RwLock::new(control)));
+
+        let response = dispatch(&IpcRequest::Status, &state).await;
+
+        let IpcResponse::Status(info) = response else {
+            panic!("expected status response");
+        };
+        assert_eq!(info.services.len(), 1);
+        assert_eq!(info.services[0].node_name, "node-alpha");
+    }
+
+    #[tokio::test]
     async fn test_accept_node_requires_control_role() {
         let (state, _dir, _reload_rx) = shared_state(NodeRole::Edge);
 
@@ -731,6 +844,72 @@ mod tests {
 
         assert!(matches!(response, IpcResponse::Reloaded));
         assert_eq!(reload_rx.recv().await, Some(()));
+    }
+
+    #[tokio::test]
+    async fn test_quota_show_returns_control_snapshot() {
+        let (state, _dir, _reload_rx) = shared_state(NodeRole::Control);
+        let mut control = ControlNode::new();
+        control.add_node(NodeInfo {
+            endpoint_id: "edge-1".to_string(),
+            node_name: "node-alpha".to_string(),
+            quota_limit: 5,
+            quota_used: 0,
+            is_online: true,
+            last_heartbeat: None,
+            addr: None,
+        });
+        control
+            .register_services(
+                "edge-1",
+                "node-alpha",
+                &[ServiceRegistration {
+                    name: "web".to_string(),
+                    local_addr: "127.0.0.1:8080".to_string(),
+                    protocol: Protocol::Tcp,
+                    health_check: None,
+                }],
+                1,
+            )
+            .unwrap();
+        *state.node_state.write().await =
+            NodeState::Control(Arc::new(tokio::sync::RwLock::new(control)));
+
+        let response = dispatch(&IpcRequest::QuotaShow, &state).await;
+
+        let IpcResponse::QuotaInfo { quotas } = response else {
+            panic!("expected quota info response");
+        };
+        assert_eq!(quotas, vec![("edge-1".to_string(), 1, 5)]);
+    }
+
+    #[tokio::test]
+    async fn test_quota_set_updates_existing_limit() {
+        let (state, _dir, _reload_rx) = shared_state(NodeRole::Control);
+        let mut control = ControlNode::new();
+        control.add_node(NodeInfo {
+            endpoint_id: "edge-1".to_string(),
+            node_name: "node-alpha".to_string(),
+            quota_limit: 5,
+            quota_used: 0,
+            is_online: true,
+            last_heartbeat: None,
+            addr: None,
+        });
+        let control = Arc::new(tokio::sync::RwLock::new(control));
+        *state.node_state.write().await = NodeState::Control(Arc::clone(&control));
+
+        let response = dispatch(
+            &IpcRequest::QuotaSet {
+                endpoint_id: "edge-1".to_string(),
+                limit: 9,
+            },
+            &state,
+        )
+        .await;
+
+        assert!(matches!(response, IpcResponse::QuotaUpdated));
+        assert_eq!(control.read().await.whitelist()["edge-1"].quota_limit, 9);
     }
 
     #[tokio::test]

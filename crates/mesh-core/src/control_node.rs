@@ -155,6 +155,40 @@ impl ControlNode {
         Ok(())
     }
 
+    /// Returns a stable snapshot of quota usage for every whitelisted node.
+    pub fn quota_snapshot(&self) -> Vec<(String, usize, usize)> {
+        let mut quotas = self
+            .whitelist
+            .values()
+            .map(|node| {
+                let used = self
+                    .services
+                    .keys()
+                    .filter(|sid| sid.endpoint_id == node.endpoint_id)
+                    .count();
+                (
+                    node.endpoint_id.clone(),
+                    used,
+                    usize::from(node.quota_limit),
+                )
+            })
+            .collect::<Vec<_>>();
+        quotas.sort_by(|left, right| left.0.cmp(&right.0));
+        quotas
+    }
+
+    /// Updates the configured service quota for a whitelisted node.
+    pub fn set_quota_limit(&mut self, endpoint_id: &str, limit: u16) -> Result<(), QuotaError> {
+        let node = self
+            .whitelist
+            .get_mut(endpoint_id)
+            .ok_or_else(|| QuotaError::NodeNotFound {
+                endpoint_id: endpoint_id.to_owned(),
+            })?;
+        node.quota_limit = limit;
+        Ok(())
+    }
+
     /// Returns an immutable reference to the port allocator.
     pub fn allocator(&self) -> &PortAllocator {
         &self.allocator
@@ -234,6 +268,10 @@ impl ControlNode {
     /// Record a pong received from an edge node.
     pub fn record_pong(&mut self, endpoint_id: &str, now_epoch: u64) {
         self.last_pong.insert(endpoint_id.to_owned(), now_epoch);
+        if let Some(node) = self.whitelist.get_mut(endpoint_id) {
+            node.is_online = true;
+            node.last_heartbeat = Some(now_epoch);
+        }
     }
 
     /// Returns endpoint IDs of nodes whose last pong is older than
@@ -311,6 +349,9 @@ impl ControlNode {
         if let Some(info) = self.whitelist.get_mut(endpoint_id) {
             info.is_online = true;
             info.last_heartbeat = Some(now_epoch);
+            info.quota_used = current_count
+                .saturating_add(registrations.len())
+                .min(u16::MAX as usize) as u16;
         }
 
         for (reg, assignment) in registrations.iter().zip(assignments.iter()) {
@@ -375,7 +416,13 @@ impl ControlNode {
         &mut self,
         from_endpoint_id: &str,
         services: Vec<mesh_proto::ServiceHealthEntry>,
+        now_epoch: u64,
     ) {
+        if let Some(node) = self.whitelist.get_mut(from_endpoint_id) {
+            node.is_online = true;
+            node.last_heartbeat = Some(now_epoch);
+        }
+
         for entry in services {
             let sid = ServiceId {
                 endpoint_id: from_endpoint_id.to_owned(),
@@ -383,8 +430,7 @@ impl ControlNode {
             };
             if let Some(record) = self.services.get_mut(&sid) {
                 record.health_state = entry.health_state;
-                // We don't have a clock here — caller should set last_seen
-                // via a separate method if needed, but we update what we can.
+                record.last_seen = Some(now_epoch);
             } else {
                 tracing::warn!(
                     endpoint_id = from_endpoint_id,
@@ -517,7 +563,7 @@ async fn handle_connection(
                 services,
             } => {
                 let mut n = node.write().await;
-                n.aggregate_health(&endpoint_id, services);
+                n.aggregate_health(&endpoint_id, services, now_epoch());
             }
             ControlMessage::Ping => {
                 if let Err(e) =
@@ -752,6 +798,32 @@ mod tests {
     }
 
     #[test]
+    fn test_quota_snapshot_reports_used_and_limit_per_node() {
+        let mut cn = ControlNode::new();
+        cn.add_node(make_node("node-a", 3));
+        cn.add_node(make_node("node-b", 5));
+        let (service_id, service_record) = make_service("node-a", "web");
+        cn.services.insert(service_id, service_record);
+
+        let quotas = cn.quota_snapshot();
+
+        assert_eq!(
+            quotas,
+            vec![("node-a".to_string(), 1, 3), ("node-b".to_string(), 0, 5),]
+        );
+    }
+
+    #[test]
+    fn test_set_quota_limit_updates_existing_node() {
+        let mut cn = ControlNode::new();
+        cn.add_node(make_node("node-a", 3));
+
+        cn.set_quota_limit("node-a", 9).unwrap();
+
+        assert_eq!(cn.whitelist["node-a"].quota_limit, 9);
+    }
+
+    #[test]
     fn test_remove_node_cleans_services_and_routes() {
         let mut cn = ControlNode::new();
         cn.add_node(make_node("eee", 5));
@@ -903,6 +975,7 @@ mod tests {
                 health_state: mesh_proto::HealthState::Healthy,
                 last_error: None,
             }],
+            1234,
         );
 
         let sid = ServiceId {
@@ -913,6 +986,8 @@ mod tests {
             cn.services.get(&sid).unwrap().health_state,
             mesh_proto::HealthState::Healthy
         );
+        assert_eq!(cn.services.get(&sid).unwrap().last_seen, Some(1234));
+        assert_eq!(cn.whitelist["ep1"].last_heartbeat, Some(1234));
     }
 
     #[test]
@@ -927,8 +1002,10 @@ mod tests {
                 health_state: mesh_proto::HealthState::Unhealthy,
                 last_error: Some("timeout".to_owned()),
             }],
+            4321,
         );
 
         assert!(cn.services.is_empty());
+        assert_eq!(cn.whitelist.get("ep-unknown"), None);
     }
 }
