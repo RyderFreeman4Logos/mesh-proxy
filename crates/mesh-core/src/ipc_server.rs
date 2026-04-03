@@ -1,13 +1,18 @@
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::RwLock;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use mesh_proto::{
     ConnectedNode, DEFAULT_SERVICE_QUOTA, IpcRequest, IpcResponse, MeshConfig, NodeInfo, NodeRole,
     ServiceStatus, StatusInfo,
 };
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::mpsc;
+use tokio::task;
+use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 use tracing::{info, warn};
 
 use crate::control_node::ControlNode;
@@ -63,6 +68,8 @@ pub(crate) enum NodeState {
 struct SharedState {
     shutdown_tx: ShutdownTx,
     config: MeshConfig,
+    config_path: PathBuf,
+    reload_tx: mpsc::Sender<()>,
     runtime: Arc<RwLock<MeshRuntimeState>>,
     node_state: Arc<tokio::sync::RwLock<NodeState>>,
 }
@@ -79,6 +86,8 @@ impl IpcServer {
         socket_path: &Path,
         shutdown_tx: ShutdownTx,
         config: MeshConfig,
+        config_path: PathBuf,
+        reload_tx: mpsc::Sender<()>,
     ) -> Result<Self> {
         if socket_path.exists() {
             std::fs::remove_file(socket_path)?;
@@ -94,6 +103,8 @@ impl IpcServer {
         let state = Arc::new(SharedState {
             shutdown_tx,
             config,
+            config_path,
+            reload_tx,
             runtime: Arc::new(RwLock::new(MeshRuntimeState::default())),
             node_state: Arc::new(tokio::sync::RwLock::new(NodeState::Uninit)),
         });
@@ -202,9 +213,7 @@ async fn dispatch(request: &IpcRequest, state: &SharedState) -> IpcResponse {
                 message: "shutting down".to_string(),
             }
         }
-        IpcRequest::Reload => IpcResponse::Ok {
-            message: "reload not yet implemented".to_string(),
-        },
+        IpcRequest::Reload => handle_reload(state).await,
         IpcRequest::Restart => {
             let _ = state.shutdown_tx.send(());
             IpcResponse::Ok {
@@ -351,13 +360,22 @@ async fn handle_accept_node(
     }
 }
 
+async fn handle_reload(state: &SharedState) -> IpcResponse {
+    match state.reload_tx.send(()).await {
+        Ok(()) => IpcResponse::Reloaded,
+        Err(error) => IpcResponse::Error {
+            message: format!("failed to trigger reload: {error}"),
+        },
+    }
+}
+
 /// Handle ExposeService: add service entry to config (edge only).
 async fn handle_expose_service(
     state: &SharedState,
     name: &str,
     local_addr: &str,
-    _protocol: mesh_proto::Protocol,
-    _health_check: Option<mesh_proto::HealthCheckConfig>,
+    protocol: mesh_proto::Protocol,
+    health_check: Option<mesh_proto::HealthCheckConfig>,
 ) -> IpcResponse {
     if state.config.role != NodeRole::Edge {
         return IpcResponse::Error {
@@ -365,49 +383,279 @@ async fn handle_expose_service(
         };
     }
 
-    // Validate inputs.
-    if let Err(e) = mesh_proto::validate_service_name(name) {
+    if let Err(error) = validate_expose_service_request(name, local_addr, health_check.as_ref()) {
         return IpcResponse::Error {
-            message: format!("invalid service name: {e}"),
-        };
-    }
-    if let Err(e) = mesh_proto::validate_local_addr(local_addr) {
-        return IpcResponse::Error {
-            message: format!("invalid local address: {e}"),
+            message: error.to_string(),
         };
     }
 
-    // Note: In a full implementation this would also update the config file
-    // on disk and trigger a re-registration with the control node.
-    // For now, we acknowledge the request.
+    let mut document = match load_config_document(&state.config_path).await {
+        Ok(document) => document,
+        Err(error) => {
+            return IpcResponse::Error {
+                message: format!("failed to update config.toml: {error}"),
+            };
+        }
+    };
+
+    if let Err(error) = upsert_service_entry(
+        &mut document,
+        name,
+        local_addr,
+        protocol,
+        health_check.as_ref(),
+    ) {
+        return IpcResponse::Error {
+            message: format!("failed to update config.toml: {error}"),
+        };
+    }
+
+    if let Err(error) = write_config_document_atomic(&state.config_path, &document).await {
+        return IpcResponse::Error {
+            message: format!("failed to update config.toml: {error}"),
+        };
+    }
+
     IpcResponse::ServiceExposed {
         name: name.to_owned(),
-        assigned_port: None,
+        assigned_port: Some(0),
     }
+}
+
+fn validate_expose_service_request(
+    name: &str,
+    local_addr: &str,
+    health_check: Option<&mesh_proto::HealthCheckConfig>,
+) -> Result<()> {
+    mesh_proto::validate_service_name(name)
+        .map_err(|error| anyhow::anyhow!("invalid service name: {error}"))?;
+    mesh_proto::validate_local_addr(local_addr)
+        .map_err(|error| anyhow::anyhow!("invalid local address: {error}"))?;
+
+    if let Some(health_check) = health_check {
+        validate_health_check_config(health_check)?;
+    }
+
+    Ok(())
+}
+
+fn validate_health_check_config(health_check: &mesh_proto::HealthCheckConfig) -> Result<()> {
+    if health_check.interval_seconds == 0 {
+        anyhow::bail!("invalid health check interval: must be greater than 0");
+    }
+
+    let Some(target) = &health_check.target else {
+        return Ok(());
+    };
+
+    if target.is_empty() {
+        anyhow::bail!("invalid health check target: must not be empty");
+    }
+
+    match health_check.mode {
+        mesh_proto::HealthCheckMode::HttpGet => validate_http_health_target(target),
+        mesh_proto::HealthCheckMode::TcpConnect | mesh_proto::HealthCheckMode::UnixConnect => {
+            mesh_proto::validate_local_addr(target)
+                .map_err(|error| anyhow::anyhow!("invalid health check target: {error}"))
+        }
+    }
+}
+
+fn validate_http_health_target(target: &str) -> Result<()> {
+    let uri = target
+        .parse::<hyper::Uri>()
+        .context("invalid health check target: expected absolute http:// or https:// URL")?;
+
+    match uri.scheme_str() {
+        Some("http" | "https") => {}
+        _ => anyhow::bail!("invalid health check target: expected http:// or https:// URL"),
+    }
+
+    let host = uri
+        .host()
+        .context("invalid health check target: missing host")?;
+    mesh_proto::validate_health_target(host)
+        .map_err(|error| anyhow::anyhow!("invalid health check target: {error}"))?;
+
+    Ok(())
+}
+
+async fn load_config_document(path: &Path) -> Result<DocumentMut> {
+    let content = tokio::fs::read_to_string(path)
+        .await
+        .with_context(|| format!("failed to read config at {}", path.display()))?;
+    DocumentMut::from_str(&content)
+        .with_context(|| format!("failed to parse config at {}", path.display()))
+}
+
+fn upsert_service_entry(
+    document: &mut DocumentMut,
+    name: &str,
+    local_addr: &str,
+    protocol: mesh_proto::Protocol,
+    health_check: Option<&mesh_proto::HealthCheckConfig>,
+) -> Result<()> {
+    let services = ensure_services_array(document)?;
+
+    if let Some(existing_service) = services
+        .iter_mut()
+        .find(|table| table.get("name").and_then(|item| item.as_str()) == Some(name))
+    {
+        populate_service_table(existing_service, name, local_addr, protocol, health_check);
+        return Ok(());
+    }
+
+    let mut service_table = Table::new();
+    populate_service_table(&mut service_table, name, local_addr, protocol, health_check);
+    services.push(service_table);
+    Ok(())
+}
+
+fn ensure_services_array(document: &mut DocumentMut) -> Result<&mut ArrayOfTables> {
+    let should_initialize = match document.as_table().get("services") {
+        None => true,
+        Some(Item::Value(value)) => value.as_array().is_some_and(|array| array.is_empty()),
+        Some(_) => false,
+    };
+
+    if should_initialize {
+        document["services"] = Item::ArrayOfTables(ArrayOfTables::new());
+    }
+
+    document["services"]
+        .as_array_of_tables_mut()
+        .context("services must be an array of tables")
+}
+
+fn populate_service_table(
+    service_table: &mut Table,
+    name: &str,
+    local_addr: &str,
+    protocol: mesh_proto::Protocol,
+    health_check: Option<&mesh_proto::HealthCheckConfig>,
+) {
+    service_table["name"] = value(name);
+    service_table["local_addr"] = value(local_addr);
+    service_table["protocol"] = value(protocol_name(protocol));
+
+    match health_check {
+        Some(health_check) => {
+            let mut health_table = Table::new();
+            health_table["mode"] = value(health_check_mode_name(&health_check.mode));
+            health_table["interval_seconds"] =
+                value(i64::try_from(health_check.interval_seconds).unwrap_or(i64::MAX));
+
+            if let Some(target) = &health_check.target {
+                health_table["target"] = value(target.as_str());
+            } else {
+                health_table.remove("target");
+            }
+
+            service_table["health_check"] = Item::Table(health_table);
+        }
+        None => {
+            service_table.remove("health_check");
+        }
+    }
+}
+
+fn protocol_name(protocol: mesh_proto::Protocol) -> &'static str {
+    match protocol {
+        mesh_proto::Protocol::Tcp => "tcp",
+        mesh_proto::Protocol::Unix => "unix",
+    }
+}
+
+fn health_check_mode_name(mode: &mesh_proto::HealthCheckMode) -> &'static str {
+    match mode {
+        mesh_proto::HealthCheckMode::TcpConnect => "tcp_connect",
+        mesh_proto::HealthCheckMode::UnixConnect => "unix_connect",
+        mesh_proto::HealthCheckMode::HttpGet => "http_get",
+    }
+}
+
+async fn write_config_document_atomic(path: &Path, document: &DocumentMut) -> Result<()> {
+    let path = path.to_path_buf();
+    let content = document.to_string();
+
+    task::spawn_blocking(move || write_config_document_atomic_blocking(&path, &content))
+        .await
+        .context("config write task panicked")?
+}
+
+fn write_config_document_atomic_blocking(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create config dir {}", parent.display()))?;
+    }
+
+    let tmp_path = path.with_extension("toml.tmp");
+    let mut open_options = std::fs::OpenOptions::new();
+    open_options.create(true).truncate(true).write(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        open_options.mode(0o600);
+    }
+
+    let mut file = open_options
+        .open(&tmp_path)
+        .with_context(|| format!("failed to create temp config at {}", tmp_path.display()))?;
+    file.write_all(content.as_bytes())
+        .with_context(|| format!("failed to write temp config at {}", tmp_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to fsync temp config at {}", tmp_path.display()))?;
+
+    std::fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "failed to rename {} to {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mesh_proto::NodeRole;
-    use tokio::sync::broadcast;
+    use mesh_proto::{HealthCheckConfig, HealthCheckMode, NodeRole, Protocol, ServiceEntry};
+    use tempfile::Builder;
+    use tokio::sync::{broadcast, mpsc};
 
-    fn shared_state() -> SharedState {
+    fn shared_state(role: NodeRole) -> (SharedState, tempfile::TempDir, mpsc::Receiver<()>) {
+        let dir = Builder::new()
+            .prefix("mesh-core-ipc-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let config_path = dir.path().join("config.toml");
+        let config = MeshConfig {
+            role,
+            data_dir: dir.path().join("data"),
+            ..MeshConfig::default()
+        };
+        config.save(&config_path).unwrap();
+
         let (shutdown_tx, _) = broadcast::channel(1);
-        SharedState {
+        let (reload_tx, reload_rx) = mpsc::channel(4);
+        let state = SharedState {
             shutdown_tx,
-            config: MeshConfig {
-                role: NodeRole::Control,
-                ..MeshConfig::default()
-            },
+            config,
+            config_path,
+            reload_tx,
             runtime: Arc::new(RwLock::new(MeshRuntimeState::default())),
             node_state: Arc::new(tokio::sync::RwLock::new(NodeState::Uninit)),
-        }
+        };
+
+        (state, dir, reload_rx)
     }
 
     #[tokio::test]
     async fn test_status_reports_initializing_before_mesh_node_is_ready() {
-        let state = shared_state();
+        let (state, _dir, _reload_rx) = shared_state(NodeRole::Control);
 
         let response = dispatch(&IpcRequest::Status, &state).await;
 
@@ -420,7 +668,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_status_reports_mesh_node_state_after_update() {
-        let state = shared_state();
+        let (state, _dir, _reload_rx) = shared_state(NodeRole::Control);
         let handle = IpcStatusHandle {
             runtime: Arc::clone(&state.runtime),
         };
@@ -437,16 +685,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_accept_node_requires_control_role() {
-        let (shutdown_tx, _) = broadcast::channel(1);
-        let state = SharedState {
-            shutdown_tx,
-            config: MeshConfig {
-                role: NodeRole::Edge,
-                ..MeshConfig::default()
-            },
-            runtime: Arc::new(RwLock::new(MeshRuntimeState::default())),
-            node_state: Arc::new(tokio::sync::RwLock::new(NodeState::Uninit)),
-        };
+        let (state, _dir, _reload_rx) = shared_state(NodeRole::Edge);
 
         let response = dispatch(
             &IpcRequest::AcceptNode {
@@ -465,7 +704,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_expose_service_requires_edge_role() {
-        let state = shared_state(); // role = Control
+        let (state, _dir, _reload_rx) = shared_state(NodeRole::Control);
 
         let response = dispatch(
             &IpcRequest::ExposeService {
@@ -482,5 +721,125 @@ mod tests {
             panic!("expected error response");
         };
         assert!(message.contains("edge nodes"));
+    }
+
+    #[tokio::test]
+    async fn test_reload_triggers_daemon_signal() {
+        let (state, _dir, mut reload_rx) = shared_state(NodeRole::Edge);
+
+        let response = dispatch(&IpcRequest::Reload, &state).await;
+
+        assert!(matches!(response, IpcResponse::Reloaded));
+        assert_eq!(reload_rx.recv().await, Some(()));
+    }
+
+    #[tokio::test]
+    async fn test_expose_service_writes_service_to_config() {
+        let (state, _dir, _reload_rx) = shared_state(NodeRole::Edge);
+        let health_check = Some(HealthCheckConfig {
+            mode: HealthCheckMode::HttpGet,
+            target: Some("http://127.0.0.1:8080/health".to_string()),
+            interval_seconds: 30,
+        });
+
+        let response = dispatch(
+            &IpcRequest::ExposeService {
+                name: "web".to_string(),
+                local_addr: "127.0.0.1:8080".to_string(),
+                protocol: Protocol::Tcp,
+                health_check: health_check.clone(),
+            },
+            &state,
+        )
+        .await;
+
+        let IpcResponse::ServiceExposed {
+            name,
+            assigned_port,
+        } = response
+        else {
+            panic!("expected service exposed response");
+        };
+        assert_eq!(name, "web");
+        assert_eq!(assigned_port, Some(0));
+
+        let updated = MeshConfig::load(&state.config_path).unwrap();
+        assert_eq!(
+            updated.services,
+            vec![ServiceEntry {
+                name: "web".to_string(),
+                local_addr: "127.0.0.1:8080".to_string(),
+                protocol: Protocol::Tcp,
+                health_check,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_expose_service_updates_existing_service_entry() {
+        let (state, _dir, _reload_rx) = shared_state(NodeRole::Edge);
+        let original = MeshConfig {
+            services: vec![ServiceEntry {
+                name: "web".to_string(),
+                local_addr: "127.0.0.1:8080".to_string(),
+                protocol: Protocol::Tcp,
+                health_check: None,
+            }],
+            ..state.config.clone()
+        };
+        original.save(&state.config_path).unwrap();
+
+        let response = dispatch(
+            &IpcRequest::ExposeService {
+                name: "web".to_string(),
+                local_addr: "/tmp/web.sock".to_string(),
+                protocol: Protocol::Unix,
+                health_check: None,
+            },
+            &state,
+        )
+        .await;
+
+        assert!(matches!(response, IpcResponse::ServiceExposed { .. }));
+
+        let updated = MeshConfig::load(&state.config_path).unwrap();
+        assert_eq!(updated.services.len(), 1);
+        assert_eq!(
+            updated.services[0],
+            ServiceEntry {
+                name: "web".to_string(),
+                local_addr: "/tmp/web.sock".to_string(),
+                protocol: Protocol::Unix,
+                health_check: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_expose_service_rejects_public_http_health_target() {
+        let (state, _dir, _reload_rx) = shared_state(NodeRole::Edge);
+
+        let response = dispatch(
+            &IpcRequest::ExposeService {
+                name: "web".to_string(),
+                local_addr: "127.0.0.1:8080".to_string(),
+                protocol: Protocol::Tcp,
+                health_check: Some(HealthCheckConfig {
+                    mode: HealthCheckMode::HttpGet,
+                    target: Some("https://example.com/health".to_string()),
+                    interval_seconds: 30,
+                }),
+            },
+            &state,
+        )
+        .await;
+
+        let IpcResponse::Error { message } = response else {
+            panic!("expected error response");
+        };
+        assert!(message.contains("health check target"));
+
+        let updated = MeshConfig::load(&state.config_path).unwrap();
+        assert!(updated.services.is_empty());
     }
 }

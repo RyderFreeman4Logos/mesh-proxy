@@ -2,6 +2,7 @@ mod config;
 pub mod frame;
 pub mod health;
 mod ipc;
+pub mod listener;
 mod message;
 mod service;
 mod ticket;
@@ -10,12 +11,14 @@ mod validate;
 pub use config::{MeshConfig, NodeRole, Protocol, ServiceEntry};
 pub use health::{HealthCheckConfig, HealthCheckMode, HealthState};
 pub use ipc::{ConnectedNode, IpcRequest, IpcResponse, ServiceStatus, StatusInfo};
+pub use listener::ListenerState;
 pub use message::{ControlMessage, PortAssignment, RouteEntry, ServiceRegistration};
 pub use service::{NodeInfo, ServiceHealthEntry, ServiceId, ServiceRecord};
 pub use ticket::{JoinTicket, TicketError, TicketStatus};
 pub use validate::{
     MAX_LOCAL_ADDR_LEN, MAX_SERVICE_NAME_LEN, MAX_SERVICES_PER_REGISTRATION, MAX_TICKET_LEN,
-    validate_local_addr, validate_service_name,
+    validate_health_target, validate_local_addr, validate_port_in_service_range,
+    validate_service_name,
 };
 
 /// ALPN identifier for control plane communication.
@@ -41,6 +44,9 @@ pub const DEFAULT_HEALTH_PORT: u16 = 49000;
 
 /// Default maximum services per edge node.
 pub const DEFAULT_SERVICE_QUOTA: usize = 5;
+
+/// Maximum number of dynamic listeners a node may manage.
+pub const MAX_LISTENERS: usize = 100;
 
 /// Heartbeat ping interval in seconds.
 pub const HEARTBEAT_INTERVAL_SECS: u64 = 30;
