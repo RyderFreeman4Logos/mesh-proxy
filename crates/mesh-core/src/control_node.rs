@@ -643,6 +643,21 @@ async fn handle_register(
             mesh_proto::frame::write_json(send, &ControlMessage::RegisterAck { assignments })
                 .await
                 .context("failed to send RegisterAck")?;
+
+            let routes_and_version = {
+                let n = node.read().await;
+                (n.routes().clone(), n.route_version())
+            };
+            let route_update = ControlMessage::RouteTableUpdate {
+                routes: routes_and_version.0,
+                version: routes_and_version.1,
+            };
+            if let Err(error) = mesh_proto::frame::write_json(send, &route_update).await {
+                warn!(
+                    error = %error,
+                    "failed to send initial route table after registration"
+                );
+            }
         }
         Err(reason) => {
             warn!(%reason, "register rejected");

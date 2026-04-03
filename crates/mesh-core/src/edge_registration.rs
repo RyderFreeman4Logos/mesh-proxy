@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -143,12 +144,70 @@ async fn apply_register_ack(
             .context("failed to persist route cache after register ack")?;
     }
 
+    Ok(())
+}
+
+fn log_register_ack_assignments(assignments: &[PortAssignment]) {
     for assignment in assignments {
         info!(
             service_name = %assignment.service_name,
             assigned_port = assignment.assigned_port,
             "registered service with control node"
         );
+    }
+}
+
+fn is_graceful_stream_end(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| io_error.kind() == ErrorKind::UnexpectedEof)
+    })
+}
+
+async fn read_registration_follow_up(
+    recv: &mut iroh::endpoint::RecvStream,
+) -> Result<Option<(HashMap<u16, RouteEntry>, u64)>> {
+    let mut route_update = None;
+
+    loop {
+        let message: ControlMessage = match read_json(recv).await {
+            Ok(message) => message,
+            Err(error) if is_graceful_stream_end(&error) => return Ok(route_update),
+            Err(error) => return Err(error).context("failed to read registration follow-up"),
+        };
+
+        match message {
+            ControlMessage::RouteTableUpdate { routes, version } => {
+                route_update = Some((routes, version));
+            }
+            other => {
+                warn!(
+                    ?other,
+                    "unexpected follow-up control message after register ack"
+                );
+            }
+        }
+    }
+}
+
+async fn apply_route_table_update(
+    edge_node: &Arc<RwLock<EdgeNode>>,
+    config: &Arc<RwLock<MeshConfig>>,
+    routes: HashMap<u16, RouteEntry>,
+    version: u64,
+) -> Result<()> {
+    let data_dir = {
+        let config = config.read().await;
+        config.data_dir.clone()
+    };
+
+    let mut edge = edge_node.write().await;
+    let applied = edge.apply_route_update(routes, version).await;
+    if applied {
+        edge.save_route_cache(&data_dir)
+            .await
+            .context("failed to persist route cache after route update")?;
     }
 
     Ok(())
@@ -199,9 +258,30 @@ async fn send_register(
 
     match response {
         ControlMessage::RegisterAck { assignments } => {
-            apply_register_ack(edge_node, endpoint_id, node_name, &snapshot, &assignments)
-                .await
-                .context("failed to apply register ack")?;
+            let initial_route_update = match read_registration_follow_up(&mut recv).await {
+                Ok(route_update) => route_update,
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "failed to read route table follow-up after register ack"
+                    );
+                    None
+                }
+            };
+
+            if let Some((routes, version)) = initial_route_update {
+                apply_route_table_update(edge_node, config, routes, version)
+                    .await
+                    .context("failed to apply initial route table after register ack")?;
+            } else {
+                // Older control nodes may only return RegisterAck, so keep the
+                // synthetic merge path as a compatibility fallback.
+                apply_register_ack(edge_node, endpoint_id, node_name, &snapshot, &assignments)
+                    .await
+                    .context("failed to apply register ack")?;
+            }
+
+            log_register_ack_assignments(&assignments);
             if matches!(mode, RegistrationMode::Initial) {
                 transition_edge_state(edge_node, ConnectionState::Authenticated).await;
             }
@@ -220,18 +300,7 @@ async fn handle_control_message(
 ) -> Result<()> {
     match message {
         ControlMessage::RouteTableUpdate { routes, version } => {
-            let data_dir = {
-                let config = config.read().await;
-                config.data_dir.clone()
-            };
-
-            let mut edge = edge_node.write().await;
-            let applied = edge.apply_route_update(routes, version).await;
-            if applied {
-                edge.save_route_cache(&data_dir)
-                    .await
-                    .context("failed to persist route cache after route update")?;
-            }
+            apply_route_table_update(edge_node, config, routes, version).await?;
         }
         ControlMessage::Ping => {
             write_json(send, &ControlMessage::Pong)
