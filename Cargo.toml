@@ -19,9 +19,13 @@ iroh = "0.97"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
+# File watching / config reload
+notify = { version = "6", default-features = false, features = ["macos_fsevent"] }
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml_edit = "0.22"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -29,6 +33,11 @@ clap = { version = "4", features = ["derive"] }
 # Error handling
 anyhow = "1"
 thiserror = "2"
+
+# HTTP health checks
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 
 # Logging
 tracing = "0.1"
