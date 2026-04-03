@@ -9,6 +9,10 @@ use crate::listener::ListenerState;
 pub enum IpcRequest {
     /// Get daemon status (role, connected nodes, services, routes).
     Status,
+    /// Show per-node service quota usage (control node only).
+    QuotaShow,
+    /// Update the service quota for a specific node (control node only).
+    QuotaSet { endpoint_id: String, limit: usize },
     /// Gracefully stop the daemon.
     Stop,
     /// Restart the daemon (stop + start with current config).
@@ -35,8 +39,15 @@ pub enum IpcRequest {
 pub enum IpcResponse {
     /// Status information.
     Status(StatusInfo),
+    /// Service quota usage for all known nodes.
+    QuotaInfo {
+        /// Tuples of (endpoint_id, used, limit).
+        quotas: Vec<(String, usize, usize)>,
+    },
     /// Operation succeeded.
     Ok { message: String },
+    /// A quota update was applied.
+    QuotaUpdated,
     /// Configuration was reloaded from disk.
     Reloaded,
     /// Operation failed.
@@ -74,6 +85,7 @@ pub struct ConnectedNode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceStatus {
     pub name: String,
+    pub node_name: String,
     pub assigned_port: Option<u16>,
     pub status: String,
 }

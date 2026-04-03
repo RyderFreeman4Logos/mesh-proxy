@@ -300,6 +300,9 @@ async fn cmd_status(config_path: &Path, output: OutputFormat) -> Result<()> {
         IpcResponse::ListenerStatus { port, state } => {
             println!("Listener {port}: {state:?}");
         }
+        other => {
+            anyhow::bail!("unexpected response: {other:?}");
+        }
     }
 
     Ok(())
