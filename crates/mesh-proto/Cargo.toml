@@ -9,6 +9,7 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
+bs58.workspace = true
 dirs-next.workspace = true
 hostname.workspace = true
 toml.workspace = true
