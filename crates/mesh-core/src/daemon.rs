@@ -1,14 +1,16 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
-use mesh_proto::{MeshConfig, NodeRole, ServiceEntry};
-use tokio::sync::{broadcast, mpsc};
+use anyhow::{Context, Result};
+use mesh_proto::{JoinTicket, MeshConfig, NodeRole, ServiceEntry};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task;
 use tracing::{error, info, warn};
 
@@ -25,6 +27,69 @@ pub type ShutdownRx = broadcast::Receiver<()>;
 
 const PROXY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const PROXY_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const JOIN_TICKET_FILE_NAME: &str = "join_ticket.txt";
+const JOIN_TICKET_TTL_SECONDS: u64 = 3600;
+
+fn now_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+fn save_join_ticket(data_dir: &Path, endpoint_id: &str) -> Result<String> {
+    let ticket = JoinTicket {
+        endpoint_id: endpoint_id.to_owned(),
+        created_at: now_epoch(),
+        ttl_seconds: JOIN_TICKET_TTL_SECONDS,
+        nonce: rand::random(),
+    };
+    let ticket_bs58 = ticket.to_bs58().context("failed to encode join ticket")?;
+    write_join_ticket_file(data_dir, &ticket_bs58)?;
+    Ok(ticket_bs58)
+}
+
+fn write_join_ticket_file(data_dir: &Path, ticket_bs58: &str) -> Result<()> {
+    fs::create_dir_all(data_dir)
+        .with_context(|| format!("failed to create data dir {}", data_dir.display()))?;
+
+    let ticket_path = data_dir.join(JOIN_TICKET_FILE_NAME);
+    let mut open_options = fs::OpenOptions::new();
+    open_options.create(true).write(true).truncate(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        open_options.mode(0o600);
+    }
+
+    let mut ticket_file = open_options
+        .open(&ticket_path)
+        .with_context(|| format!("failed to open join ticket file {}", ticket_path.display()))?;
+    ticket_file
+        .write_all(ticket_bs58.as_bytes())
+        .with_context(|| format!("failed to write join ticket file {}", ticket_path.display()))?;
+    ticket_file
+        .sync_all()
+        .with_context(|| format!("failed to sync join ticket file {}", ticket_path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&ticket_path, fs::Permissions::from_mode(0o600)).with_context(
+            || {
+                format!(
+                    "failed to set join ticket permissions {}",
+                    ticket_path.display()
+                )
+            },
+        )?;
+    }
+
+    Ok(())
+}
 
 /// The mesh-proxy daemon engine.
 pub struct Daemon {
@@ -32,6 +97,7 @@ pub struct Daemon {
     config_path: PathBuf,
     shutdown_tx: ShutdownTx,
     startup_ready: Option<StartupReadyWriter>,
+    service_change_tx: Option<watch::Sender<()>>,
 }
 
 impl Daemon {
@@ -47,6 +113,7 @@ impl Daemon {
             config_path,
             shutdown_tx,
             startup_ready: Some(startup_ready),
+            service_change_tx: None,
         }
     }
 
@@ -114,79 +181,122 @@ impl Daemon {
         // Initialize iroh endpoint
         let mesh_node =
             crate::mesh_node::MeshNode::new(&mut self.config, &self.config_path).await?;
-        ipc_status.set_mesh_node(mesh_node.id().to_string(), true);
-        info!(endpoint_id = %mesh_node.id(), "mesh node initialized");
+        let endpoint_id = mesh_node.id().to_string();
+        let endpoint_addr = serde_json::to_string(&mesh_node.endpoint().addr())
+            .context("failed to serialize endpoint address")?;
+        ipc_status.set_mesh_node(endpoint_id.clone(), Some(endpoint_addr), true);
+        info!(endpoint_id = %endpoint_id, "mesh node initialized");
+
+        if self.config.role == NodeRole::Edge {
+            let ticket_bs58 = save_join_ticket(&self.config.data_dir, &endpoint_id)?;
+            tracing::info!(
+                "Join ticket saved. Run on control node: mesh-proxy accept {}",
+                ticket_bs58
+            );
+        }
 
         // Branch by role: create node state and start role-specific tasks.
-        let (accept_handle, _config_watcher, shared_config, health_state, active_connections) =
-            match self.config.role {
-                NodeRole::Control => {
-                    let cn = Arc::new(tokio::sync::RwLock::new(ControlNode::new()));
-                    {
-                        let mut ns = node_state_handle.write().await;
-                        *ns = NodeState::Control(Arc::clone(&cn));
-                    }
-                    let shutdown_rx = self.shutdown_rx();
-                    let endpoint = mesh_node.endpoint().clone();
-                    let cn_clone = Arc::clone(&cn);
-                    (
-                        Some(tokio::spawn(async move {
-                            crate::control_node::run_accept_loop(cn_clone, endpoint, shutdown_rx)
-                                .await;
-                        })),
-                        None,
-                        None,
-                        Some(HealthServerState::from(Arc::clone(&cn))),
-                        None,
-                    )
+        let (
+            accept_handle,
+            registration_handle,
+            _config_watcher,
+            shared_config,
+            service_change_tx,
+            health_state,
+            active_connections,
+        ) = match self.config.role {
+            NodeRole::Control => {
+                let cn = Arc::new(tokio::sync::RwLock::new(ControlNode::new()));
+                {
+                    let mut ns = node_state_handle.write().await;
+                    *ns = NodeState::Control(Arc::clone(&cn));
                 }
-                NodeRole::Edge => {
-                    let runtime_config = Arc::new(tokio::sync::RwLock::new(self.config.clone()));
-                    let shared_runtime_config = Arc::clone(&runtime_config);
-                    let en = Arc::new(tokio::sync::RwLock::new(EdgeNode::with_endpoint(
-                        mesh_node.endpoint().clone(),
-                    )));
-                    let health_state = HealthServerState::from(Arc::clone(&en));
-                    let edge_active_connections = Arc::new(AtomicUsize::new(0));
-                    let shutdown_active_connections = Arc::clone(&edge_active_connections);
-                    // Load persisted route cache if available.
-                    if let Some((routes, version)) =
-                        EdgeNode::load_route_cache(&self.config.data_dir)
-                    {
-                        let mut edge = en.write().await;
-                        edge.update_routes(routes, version);
-                        info!(version, "loaded persisted route cache");
-                    }
-                    {
-                        let mut ns = node_state_handle.write().await;
-                        *ns = NodeState::Edge(Arc::clone(&en));
-                    }
-                    let config_watcher =
-                        ConfigWatcher::new(self.config_path.clone(), config_tx.clone())?;
-                    info!(path = %self.config_path.display(), "config watcher started");
+                let shutdown_rx = self.shutdown_rx();
+                let endpoint = mesh_node.endpoint().clone();
+                let cn_clone = Arc::clone(&cn);
+                (
+                    Some(tokio::spawn(async move {
+                        crate::control_node::run_accept_loop(cn_clone, endpoint, shutdown_rx).await;
+                    })),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(HealthServerState::from(Arc::clone(&cn))),
+                    None,
+                )
+            }
+            NodeRole::Edge => {
+                let runtime_config = Arc::new(tokio::sync::RwLock::new(self.config.clone()));
+                let shared_runtime_config = Arc::clone(&runtime_config);
+                let en = Arc::new(tokio::sync::RwLock::new(EdgeNode::with_endpoint(
+                    mesh_node.endpoint().clone(),
+                )));
+                let health_state = HealthServerState::from(Arc::clone(&en));
+                let edge_active_connections = Arc::new(AtomicUsize::new(0));
+                let shutdown_active_connections = Arc::clone(&edge_active_connections);
+                // Load persisted route cache if available.
+                if let Some((routes, version)) = EdgeNode::load_route_cache(&self.config.data_dir) {
+                    let mut edge = en.write().await;
+                    edge.update_routes(routes, version);
+                    info!(version, "loaded persisted route cache");
+                }
+                {
+                    let mut ns = node_state_handle.write().await;
+                    *ns = NodeState::Edge(Arc::clone(&en));
+                }
+                let config_watcher =
+                    ConfigWatcher::new(self.config_path.clone(), config_tx.clone())?;
+                info!(path = %self.config_path.display(), "config watcher started");
+                let (svc_tx, svc_rx) = watch::channel(());
+                let reg_handle = if let Some(ref control_addr) = self.config.control_addr {
                     let endpoint = mesh_node.endpoint().clone();
-                    let data_dir = self.config.data_dir.clone();
+                    let control_addr = control_addr.clone();
+                    let node_name = self.config.node_name.clone();
+                    let config = Arc::clone(&runtime_config);
+                    let en = Arc::clone(&en);
                     let shutdown_rx = self.shutdown_rx();
-                    let accept_handle = tokio::spawn(async move {
-                        crate::edge_node::run_edge_accept_loop(
-                            en,
+                    Some(tokio::spawn(async move {
+                        crate::edge_registration::run_registration_loop(
                             endpoint,
-                            runtime_config,
-                            data_dir,
-                            edge_active_connections,
+                            control_addr,
+                            node_name,
+                            config,
+                            en,
+                            svc_rx,
                             shutdown_rx,
                         )
                         .await;
-                    });
-                    (
-                        Some(accept_handle),
-                        Some(config_watcher),
-                        Some(shared_runtime_config),
-                        Some(health_state),
-                        Some(shutdown_active_connections),
+                    }))
+                } else {
+                    None
+                };
+                let endpoint = mesh_node.endpoint().clone();
+                let data_dir = self.config.data_dir.clone();
+                let shutdown_rx = self.shutdown_rx();
+                let accept_handle = tokio::spawn(async move {
+                    crate::edge_node::run_edge_accept_loop(
+                        en,
+                        endpoint,
+                        runtime_config,
+                        data_dir,
+                        edge_active_connections,
+                        shutdown_rx,
                     )
-                }
-            };
+                    .await;
+                });
+                (
+                    Some(accept_handle),
+                    reg_handle,
+                    Some(config_watcher),
+                    Some(shared_runtime_config),
+                    Some(svc_tx),
+                    Some(health_state),
+                    Some(shutdown_active_connections),
+                )
+            }
+        };
+        self.service_change_tx = service_change_tx;
 
         let health_handle = if let Some(health_bind) = self.config.health_bind.as_deref() {
             let bind_addr: SocketAddr = health_bind
@@ -245,6 +355,12 @@ impl Daemon {
             && let Err(error) = handle.await
         {
             warn!(error = %error, "accept loop task join failed");
+        }
+
+        if let Some(handle) = registration_handle
+            && let Err(error) = handle.await
+        {
+            warn!(error = %error, "registration loop task join failed");
         }
 
         if let Some(active_connections) = active_connections.as_deref() {
@@ -364,6 +480,19 @@ impl Daemon {
         if self.config.role == NodeRole::Edge {
             let diff = ServiceDiff::between(&self.config.services, &new_config.services);
             diff.log(&self.config_path, new_config.services.len());
+            let services_changed = !diff.is_empty();
+
+            if let Some(shared_config) = shared_config {
+                *shared_config.write().await = new_config.clone();
+            }
+
+            self.config = new_config;
+
+            if services_changed && let Some(service_change_tx) = self.service_change_tx.as_ref() {
+                let _ = service_change_tx.send(());
+            }
+
+            return Ok(());
         } else {
             info!(path = %self.config_path.display(), "config reloaded from disk");
         }
@@ -493,6 +622,7 @@ fn services_by_name(services: &[ServiceEntry]) -> BTreeMap<String, ServiceEntry>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::Builder;
 
     #[tokio::test]
     async fn test_wait_for_inflight_proxy_connections_returns_after_drain() {
@@ -525,5 +655,37 @@ mod tests {
         .await;
 
         assert_eq!(active_connections.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn test_save_join_ticket_creates_valid_bs58_file() {
+        let dir = Builder::new()
+            .prefix("mesh-daemon-join-ticket-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let data_dir = dir.path().join("data");
+        let endpoint_id = "edge-endpoint-123";
+        let before = now_epoch();
+
+        save_join_ticket(&data_dir, endpoint_id).unwrap();
+
+        let after = now_epoch();
+        let ticket_path = data_dir.join(JOIN_TICKET_FILE_NAME);
+        assert!(ticket_path.exists());
+
+        let ticket_bs58 = fs::read_to_string(&ticket_path).unwrap();
+        let ticket = JoinTicket::from_bs58(&ticket_bs58).unwrap();
+        assert_eq!(ticket.endpoint_id, endpoint_id);
+        assert_eq!(ticket.ttl_seconds, JOIN_TICKET_TTL_SECONDS);
+        assert!(ticket.created_at >= before);
+        assert!(ticket.created_at <= after);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = fs::metadata(&ticket_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 }
