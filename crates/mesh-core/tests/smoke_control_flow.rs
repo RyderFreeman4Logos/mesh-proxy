@@ -108,7 +108,7 @@ async fn test_smoke_complete_registration_flow() {
     cn.check_quota(edge_id)
         .expect("quota should not be exceeded with 2 of 5 services");
 
-    // Register 3 more to hit the limit.
+    // Re-register with the original 2 plus 3 more to hit the limit.
     let more_services: Vec<ServiceRegistration> = (0..3)
         .map(|i| ServiceRegistration {
             name: format!("svc-extra-{i}"),
@@ -117,20 +117,23 @@ async fn test_smoke_complete_registration_flow() {
             health_check: None,
         })
         .collect();
+    let mut full_quota_services = registrations.clone();
+    full_quota_services.extend(more_services);
 
-    cn.register_services(edge_id, "smoke-edge", &more_services, now)
-        .expect("registering 3 more services should succeed (total 5 = quota)");
+    cn.register_services(edge_id, "smoke-edge", &full_quota_services, now)
+        .expect("re-registering the full 5-service set should succeed");
 
     assert_eq!(cn.services().len(), 5, "should have 5 services total");
     assert_eq!(cn.routes().len(), 5, "route table should have 5 entries");
 
-    // Now quota is full — one more should fail.
-    let over_quota = vec![ServiceRegistration {
+    // Now quota is full — re-registering with one extra service should fail.
+    let mut over_quota = full_quota_services.clone();
+    over_quota.push(ServiceRegistration {
         name: "svc-overflow".to_owned(),
         local_addr: "127.0.0.1:5000".to_owned(),
         protocol: Protocol::Tcp,
         health_check: None,
-    }];
+    });
     let overflow_result = cn.register_services(edge_id, "smoke-edge", &over_quota, now);
     assert!(
         overflow_result.is_err(),

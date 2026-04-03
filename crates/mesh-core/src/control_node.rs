@@ -343,78 +343,124 @@ impl ControlNode {
         registrations: &[mesh_proto::ServiceRegistration],
         now_epoch: u64,
     ) -> Result<Vec<PortAssignment>, String> {
-        // Quota check: ensure enough capacity for all requested services.
+        let node = self
+            .whitelist
+            .get(endpoint_id)
+            .ok_or_else(|| format!("node not found in whitelist: {endpoint_id}"))?;
         let current_count = self
             .services
             .keys()
             .filter(|sid| sid.endpoint_id == endpoint_id)
             .count();
-        let node = self
-            .whitelist
-            .get(endpoint_id)
-            .ok_or_else(|| format!("node not found in whitelist: {endpoint_id}"))?;
-        if current_count + registrations.len() > node.quota_limit as usize {
-            return Err(format!(
-                "quota exceeded: have {current_count}, want {} more, limit {}",
-                registrations.len(),
-                node.quota_limit
-            ));
-        }
 
-        // Allocate ports for each service (tentative).
-        let mut assignments = Vec::with_capacity(registrations.len());
-        let mut allocated_ports = Vec::with_capacity(registrations.len());
-
+        let mut requested_services = HashMap::with_capacity(registrations.len());
+        let mut requested_order = Vec::with_capacity(registrations.len());
         for reg in registrations {
             let sid = ServiceId {
                 endpoint_id: endpoint_id.to_owned(),
                 service_name: reg.name.clone(),
             };
-            match self.allocator.allocate(&sid, now_epoch) {
-                Some(port) => {
-                    allocated_ports.push(port);
-                    assignments.push(PortAssignment {
-                        service_name: reg.name.clone(),
-                        assigned_port: port,
-                    });
-                }
-                None => {
-                    // Rollback all tentative allocations.
-                    for port in &allocated_ports {
-                        self.allocator.release(*port);
-                    }
-                    return Err("port pool exhausted".to_owned());
-                }
+            if requested_services.insert(sid.clone(), reg).is_some() {
+                return Err(format!("duplicate service registration: {}", reg.name));
+            }
+            requested_order.push(sid);
+        }
+
+        let final_count = requested_order.len();
+        if final_count > node.quota_limit as usize {
+            return Err(format!(
+                "quota exceeded: have {current_count}, want final {final_count}, limit {}",
+                node.quota_limit
+            ));
+        }
+
+        let existing_services = self
+            .services
+            .iter()
+            .filter(|(sid, _)| sid.endpoint_id == endpoint_id)
+            .map(|(sid, record)| (sid.clone(), record.clone()))
+            .collect::<HashMap<_, _>>();
+
+        // Stage allocator changes first so failures do not partially mutate state.
+        let mut staged_allocator = self.allocator.clone();
+        for (sid, record) in &existing_services {
+            if !requested_services.contains_key(sid)
+                && let Some(port) = record.published_port
+            {
+                staged_allocator.release(port);
             }
         }
 
-        // Commit: update whitelist online status, services, and routes.
+        let mut assignments = Vec::with_capacity(registrations.len());
+        let mut newly_allocated_ports = Vec::new();
+
+        for (sid, reg) in requested_order.iter().zip(registrations.iter()) {
+            let assigned_port = match existing_services
+                .get(sid)
+                .and_then(|record| record.published_port)
+            {
+                Some(port) => port,
+                None => match staged_allocator.allocate(sid, now_epoch) {
+                    Some(port) => {
+                        newly_allocated_ports.push(port);
+                        port
+                    }
+                    None => return Err("port pool exhausted".to_owned()),
+                },
+            };
+
+            assignments.push(PortAssignment {
+                service_name: reg.name.clone(),
+                assigned_port,
+            });
+        }
+
+        for port in newly_allocated_ports {
+            staged_allocator.confirm(port);
+        }
+        self.allocator = staged_allocator;
+
+        let registered_service_ids = existing_services.keys().cloned().collect::<Vec<_>>();
+        for sid in registered_service_ids {
+            self.services.remove(&sid);
+        }
+
+        let existing_route_ports = self
+            .routes
+            .iter()
+            .filter(|(_, entry)| entry.endpoint_id == endpoint_id)
+            .map(|(&port, _)| port)
+            .collect::<Vec<_>>();
+        for port in existing_route_ports {
+            self.routes.remove(&port);
+        }
+
         if let Some(info) = self.whitelist.get_mut(endpoint_id) {
             info.is_online = true;
             info.last_heartbeat = Some(now_epoch);
-            info.quota_used = current_count
-                .saturating_add(registrations.len())
-                .min(u16::MAX as usize) as u16;
+            info.quota_used = final_count.min(u16::MAX as usize) as u16;
         }
 
-        for (reg, assignment) in registrations.iter().zip(assignments.iter()) {
-            let sid = ServiceId {
-                endpoint_id: endpoint_id.to_owned(),
-                service_name: reg.name.clone(),
-            };
+        for ((sid, reg), assignment) in requested_order
+            .iter()
+            .zip(registrations.iter())
+            .zip(assignments.iter())
+        {
+            let health_state = existing_services
+                .get(sid)
+                .map_or(mesh_proto::HealthState::Unknown, |record| {
+                    record.health_state
+                });
             let record = ServiceRecord {
                 service_id: sid.clone(),
                 node_name: node_name.to_owned(),
                 local_addr: reg.local_addr.clone(),
                 protocol: reg.protocol,
                 published_port: Some(assignment.assigned_port),
-                health_state: mesh_proto::HealthState::Unknown,
+                health_state,
                 last_seen: Some(now_epoch),
             };
-            self.services.insert(sid, record);
-
-            // Confirm the pending port allocation.
-            self.allocator.confirm(assignment.assigned_port);
+            self.services.insert(sid.clone(), record);
 
             // Insert route entry.
             self.routes.insert(
@@ -802,6 +848,15 @@ mod tests {
         (sid, rec)
     }
 
+    fn make_registration(name: &str, local_addr: &str) -> mesh_proto::ServiceRegistration {
+        mesh_proto::ServiceRegistration {
+            name: name.to_owned(),
+            local_addr: local_addr.to_owned(),
+            protocol: mesh_proto::Protocol::Tcp,
+            health_check: None,
+        }
+    }
+
     #[test]
     fn test_add_and_remove_node() {
         let mut cn = ControlNode::new();
@@ -886,6 +941,96 @@ mod tests {
         cn.set_quota_limit("node-a", 9).unwrap();
 
         assert_eq!(cn.whitelist["node-a"].quota_limit, 9);
+    }
+
+    #[test]
+    fn test_register_services_preserves_port_on_reregistration() {
+        let mut cn = ControlNode::new();
+        cn.add_node(make_node("node-a", 4));
+        let registrations = vec![make_registration("llm-api", "127.0.0.1:3000")];
+
+        let first_assignments = cn
+            .register_services("node-a", "node-node-a", &registrations, 100)
+            .expect("initial registration should succeed");
+        let first_port = first_assignments[0].assigned_port;
+
+        let second_assignments = cn
+            .register_services("node-a", "node-node-a", &registrations, 200)
+            .expect("re-registration should succeed");
+
+        let service_id = ServiceId {
+            endpoint_id: "node-a".to_owned(),
+            service_name: "llm-api".to_owned(),
+        };
+        assert_eq!(second_assignments[0].assigned_port, first_port);
+        assert_eq!(
+            cn.services
+                .get(&service_id)
+                .and_then(|record| record.published_port),
+            Some(first_port)
+        );
+        assert_eq!(cn.routes.len(), 1, "re-registration should not leak routes");
+        assert!(cn.routes.contains_key(&first_port));
+    }
+
+    #[test]
+    fn test_register_services_releases_removed_service() {
+        let mut cn = ControlNode::new();
+        cn.add_node(make_node("node-a", 5));
+        let initial_registrations = vec![
+            make_registration("llm-api", "127.0.0.1:3000"),
+            make_registration("metrics", "127.0.0.1:3001"),
+        ];
+
+        let initial_assignments = cn
+            .register_services("node-a", "node-node-a", &initial_registrations, 100)
+            .expect("initial registration should succeed");
+        let llm_port = initial_assignments[0].assigned_port;
+        let metrics_port = initial_assignments[1].assigned_port;
+
+        let llm_only = vec![make_registration("llm-api", "127.0.0.1:3000")];
+        let retained_assignments = cn
+            .register_services("node-a", "node-node-a", &llm_only, 200)
+            .expect("reconcile should succeed");
+
+        let removed_service_id = ServiceId {
+            endpoint_id: "node-a".to_owned(),
+            service_name: "metrics".to_owned(),
+        };
+        assert_eq!(retained_assignments[0].assigned_port, llm_port);
+        assert!(!cn.services.contains_key(&removed_service_id));
+        assert!(!cn.routes.contains_key(&metrics_port));
+        assert_eq!(cn.allocator().allocated_count(), 1);
+
+        let expanded_registrations = vec![
+            make_registration("llm-api", "127.0.0.1:3000"),
+            make_registration("admin", "127.0.0.1:3002"),
+        ];
+        let expanded_assignments = cn
+            .register_services("node-a", "node-node-a", &expanded_registrations, 300)
+            .expect("adding a replacement service should succeed");
+
+        assert_eq!(expanded_assignments[1].assigned_port, metrics_port);
+    }
+
+    #[test]
+    fn test_register_services_quota_reflects_final_count() {
+        let mut cn = ControlNode::new();
+        cn.add_node(make_node("node-a", 5));
+        let initial_registrations = vec![
+            make_registration("llm-api", "127.0.0.1:3000"),
+            make_registration("metrics", "127.0.0.1:3001"),
+        ];
+
+        cn.register_services("node-a", "node-node-a", &initial_registrations, 100)
+            .expect("initial registration should succeed");
+        assert_eq!(cn.whitelist["node-a"].quota_used, 2);
+
+        let reconciled_registrations = vec![make_registration("llm-api", "127.0.0.1:3000")];
+        cn.register_services("node-a", "node-node-a", &reconciled_registrations, 200)
+            .expect("re-registration should succeed");
+
+        assert_eq!(cn.whitelist["node-a"].quota_used, 1);
     }
 
     #[test]
