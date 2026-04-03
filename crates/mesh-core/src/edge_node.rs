@@ -1,21 +1,63 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::Context;
+use anyhow::{Context, Result, anyhow};
+use iroh::endpoint::Connection;
 use iroh::endpoint::presets;
-use mesh_proto::{MAX_LISTENERS, ProxyHandshake, RouteEntry};
+use mesh_proto::{
+    ALPN_CONTROL, ALPN_PROXY, ControlMessage, MAX_LISTENERS, MAX_PROXY_CONNECTIONS, MeshConfig,
+    PROXY_HANDSHAKE_TIMEOUT_SECS, Protocol, ProxyHandshake, RouteEntry,
+};
 use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::UnixListener;
-use tokio::sync::broadcast;
+use tokio::sync::{RwLock as AsyncRwLock, broadcast};
 use tokio::task::JoinHandle;
 
 #[cfg(unix)]
 use crate::connection_pool::bridge_unix_streams;
 use crate::connection_pool::{ConnectionPool, bridge_streams};
 use crate::persistence::{self, PersistenceError};
+
+#[derive(Debug)]
+struct ActiveProxyConnection {
+    active_connections: Arc<AtomicUsize>,
+}
+
+impl Drop for ActiveProxyConnection {
+    fn drop(&mut self) {
+        self.active_connections.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn now_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn try_acquire_proxy_connection(
+    active_connections: &Arc<AtomicUsize>,
+) -> Option<ActiveProxyConnection> {
+    active_connections
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            (current < MAX_PROXY_CONNECTIONS).then_some(current + 1)
+        })
+        .ok()?;
+
+    Some(ActiveProxyConnection {
+        active_connections: Arc::clone(active_connections),
+    })
+}
+
+fn reject_connection(connection: &Connection, reason: &'static [u8]) {
+    connection.close(0u32.into(), reason);
+}
 
 /// Error returned when a state transition is not allowed.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -208,6 +250,288 @@ async fn forward_unix_stream(
         .with_context(|| format!("failed to bridge Unix stream for port {port}"))?;
 
     Ok(())
+}
+
+async fn handle_control_inbound(
+    node: Arc<AsyncRwLock<EdgeNode>>,
+    connection: Connection,
+    data_dir: &Path,
+) -> Result<()> {
+    let remote_id = connection.remote_id();
+    tracing::info!(%remote_id, "edge control connection established");
+
+    loop {
+        let (mut send, mut recv) = match connection.accept_bi().await {
+            Ok(pair) => pair,
+            Err(error) => {
+                tracing::info!(%remote_id, error = %error, "edge control connection closed");
+                break;
+            }
+        };
+
+        let message: ControlMessage = match mesh_proto::frame::read_json(&mut recv).await {
+            Ok(message) => message,
+            Err(error) => {
+                tracing::warn!(%remote_id, error = %error, "failed to read edge control message");
+                break;
+            }
+        };
+
+        match message {
+            ControlMessage::RouteTableUpdate { routes, version } => {
+                let mut edge = node.write().await;
+                let applied = edge.apply_route_update(routes, version).await;
+                if applied {
+                    edge.save_route_cache(data_dir)
+                        .await
+                        .context("failed to persist route cache after update")?;
+                }
+            }
+            ControlMessage::Ping => {
+                mesh_proto::frame::write_json(&mut send, &ControlMessage::Pong)
+                    .await
+                    .context("failed to respond to control Ping")?;
+                let mut edge = node.write().await;
+                edge.record_ping(now_epoch());
+            }
+            ControlMessage::Pong => {
+                let mut edge = node.write().await;
+                edge.record_ping(now_epoch());
+            }
+            other => {
+                tracing::warn!(%remote_id, ?other, "unexpected inbound control message on edge");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_proxy_stream(
+    connection: Connection,
+    config: Arc<AsyncRwLock<MeshConfig>>,
+    send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
+) -> Result<()> {
+    let handshake: ProxyHandshake = match tokio::time::timeout(
+        Duration::from_secs(PROXY_HANDSHAKE_TIMEOUT_SECS),
+        mesh_proto::frame::read_json(&mut recv),
+    )
+    .await
+    {
+        Ok(Ok(handshake)) => handshake,
+        Ok(Err(error)) => {
+            reject_connection(&connection, b"invalid proxy handshake");
+            return Err(error).context("failed to read proxy handshake");
+        }
+        Err(_) => {
+            reject_connection(&connection, b"proxy handshake timeout");
+            return Err(anyhow!("timed out waiting for proxy handshake"));
+        }
+    };
+
+    let remote_id = connection.remote_id();
+    let service = {
+        let config = config.read().await;
+        config
+            .services
+            .iter()
+            .find(|service| service.name == handshake.service_name)
+            .cloned()
+    };
+
+    let Some(service) = service else {
+        tracing::warn!(
+            %remote_id,
+            service_name = %handshake.service_name,
+            "rejecting inbound proxy stream for unknown local service"
+        );
+        reject_connection(&connection, b"unknown service");
+        return Err(anyhow!(
+            "unknown local service requested: {}",
+            handshake.service_name
+        ));
+    };
+
+    if service.protocol != handshake.protocol {
+        tracing::warn!(
+            %remote_id,
+            service_name = %handshake.service_name,
+            expected = ?service.protocol,
+            received = ?handshake.protocol,
+            "rejecting inbound proxy stream with mismatched protocol"
+        );
+        reject_connection(&connection, b"proxy protocol mismatch");
+        return Err(anyhow!(
+            "protocol mismatch for service {}",
+            handshake.service_name
+        ));
+    }
+
+    match service.protocol {
+        Protocol::Tcp => {
+            let local_stream = tokio::net::TcpStream::connect(&service.local_addr)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to connect to local TCP service {} at {}",
+                        service.name, service.local_addr
+                    )
+                })?;
+            bridge_streams(local_stream, send, recv)
+                .await
+                .with_context(|| {
+                    format!("failed to bridge inbound proxy stream for {}", service.name)
+                })?;
+        }
+        Protocol::Unix => {
+            #[cfg(unix)]
+            {
+                let local_stream = tokio::net::UnixStream::connect(&service.local_addr)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to connect to local Unix service {} at {}",
+                            service.name, service.local_addr
+                        )
+                    })?;
+                bridge_unix_streams(local_stream, send, recv)
+                    .await
+                    .with_context(|| {
+                        format!("failed to bridge inbound proxy stream for {}", service.name)
+                    })?;
+            }
+
+            #[cfg(not(unix))]
+            {
+                let _ = &mut send;
+                let _ = &mut recv;
+                reject_connection(&connection, b"unix proxy unsupported");
+                return Err(anyhow!(
+                    "unix proxying is not supported on this platform for {}",
+                    service.name
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn handle_proxy_inbound(
+    connection: Connection,
+    config: Arc<AsyncRwLock<MeshConfig>>,
+    active_connections: Arc<AtomicUsize>,
+) -> Result<()> {
+    let remote_id = connection.remote_id();
+    let Some(_connection_guard) = try_acquire_proxy_connection(&active_connections) else {
+        reject_connection(&connection, b"proxy connection limit reached");
+        return Err(anyhow!(
+            "rejecting inbound proxy connection from {} because the limit is {}",
+            remote_id,
+            MAX_PROXY_CONNECTIONS
+        ));
+    };
+
+    tracing::info!(%remote_id, "inbound proxy connection established");
+
+    loop {
+        let (send, recv) = match connection.accept_bi().await {
+            Ok(pair) => pair,
+            Err(error) => {
+                tracing::info!(%remote_id, error = %error, "inbound proxy connection closed");
+                break;
+            }
+        };
+
+        let stream_connection = connection.clone();
+        let stream_config = Arc::clone(&config);
+        tokio::spawn(async move {
+            if let Err(error) =
+                handle_proxy_stream(stream_connection.clone(), stream_config, send, recv).await
+            {
+                tracing::warn!(
+                    remote_id = %stream_connection.remote_id(),
+                    error = %error,
+                    "inbound proxy stream failed"
+                );
+            }
+        });
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn run_edge_accept_loop(
+    node: Arc<AsyncRwLock<EdgeNode>>,
+    endpoint: iroh::Endpoint,
+    config: Arc<AsyncRwLock<MeshConfig>>,
+    data_dir: std::path::PathBuf,
+    active_connections: Arc<AtomicUsize>,
+    mut shutdown: broadcast::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            incoming = endpoint.accept() => {
+                let Some(incoming) = incoming else {
+                    tracing::info!("edge endpoint closed, stopping accept loop");
+                    break;
+                };
+
+                let connection = match incoming.accept() {
+                    Ok(connecting) => match connecting.await {
+                        Ok(connection) => connection,
+                        Err(error) => {
+                            tracing::warn!(error = %error, "failed to complete edge inbound handshake");
+                            continue;
+                        }
+                    },
+                    Err(error) => {
+                        tracing::warn!(error = %error, "failed to accept edge inbound connection");
+                        continue;
+                    }
+                };
+
+                if connection.alpn() == ALPN_CONTROL {
+                    let node = Arc::clone(&node);
+                    let data_dir = data_dir.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = handle_control_inbound(node, connection, &data_dir).await {
+                            tracing::warn!(error = %error, "edge control connection handler error");
+                        }
+                    });
+                    continue;
+                }
+
+                if connection.alpn() == ALPN_PROXY {
+                    if connection.remote_id() == endpoint.id() {
+                        tracing::warn!("rejecting self-referential proxy connection");
+                        reject_connection(&connection, b"self proxy loop");
+                        continue;
+                    }
+
+                    let config = Arc::clone(&config);
+                    let active_connections = Arc::clone(&active_connections);
+                    tokio::spawn(async move {
+                        if let Err(error) = handle_proxy_inbound(connection, config, active_connections).await {
+                            tracing::warn!(error = %error, "edge proxy connection handler error");
+                        }
+                    });
+                    continue;
+                }
+
+                tracing::warn!(
+                    alpn = ?String::from_utf8_lossy(connection.alpn()),
+                    "rejecting edge connection with unexpected ALPN"
+                );
+                reject_connection(&connection, b"wrong ALPN");
+            }
+            _ = shutdown.recv() => {
+                tracing::info!("edge accept loop received shutdown signal");
+                break;
+            }
+        }
+    }
 }
 
 /// Spawn a forwarding TCP listener for a dynamically assigned route port.
@@ -542,7 +866,11 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    use mesh_proto::{MAX_LISTENERS, Protocol};
+    use anyhow::{Context, Result};
+    use iroh::address_lookup::memory::MemoryLookup;
+    use mesh_proto::{
+        MAX_LISTENERS, MAX_PROXY_CONNECTIONS, MeshConfig, Protocol, ProxyHandshake, ServiceEntry,
+    };
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpStream;
     use tokio::sync::broadcast;
@@ -571,6 +899,52 @@ mod tests {
 
     fn shared_routes(routes: HashMap<u16, RouteEntry>) -> Arc<RwLock<HashMap<u16, RouteEntry>>> {
         Arc::new(RwLock::new(routes))
+    }
+
+    async fn proxy_connection_pair()
+    -> Result<(iroh::Endpoint, iroh::Endpoint, Connection, Connection)> {
+        let address_lookup = MemoryLookup::new();
+        let server_endpoint = iroh::Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN_PROXY.to_vec()])
+            .bind()
+            .await
+            .context("failed to bind proxy test server endpoint")?;
+        let client_endpoint = iroh::Endpoint::builder(presets::N0)
+            .address_lookup(address_lookup.clone())
+            .alpns(vec![ALPN_PROXY.to_vec()])
+            .bind()
+            .await
+            .context("failed to bind proxy test client endpoint")?;
+        address_lookup.add_endpoint_info(server_endpoint.addr());
+
+        let accept_endpoint = server_endpoint.clone();
+        let accept_task = tokio::spawn(async move {
+            let incoming = accept_endpoint
+                .accept()
+                .await
+                .context("proxy test accept returned none")?;
+            incoming
+                .accept()
+                .context("failed to accept proxy test incoming connection")?
+                .await
+                .context("proxy test handshake failed")
+        });
+
+        let client_connection = client_endpoint
+            .connect(server_endpoint.id(), ALPN_PROXY)
+            .await
+            .context("failed to connect proxy test client")?;
+        let server_connection = timeout(Duration::from_secs(5), accept_task)
+            .await
+            .context("timed out waiting for proxy test accept task")?
+            .context("proxy test accept task panicked")??;
+
+        Ok((
+            server_endpoint,
+            client_endpoint,
+            server_connection,
+            client_connection,
+        ))
     }
 
     async fn assert_tcp_connection_closed(port: u16) {
@@ -846,6 +1220,87 @@ mod tests {
         for (_, handle) in edge.listener_pool.drain() {
             handle.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn test_proxy_inbound_rejects_unknown_service() -> Result<()> {
+        let (server_endpoint, client_endpoint, server_connection, client_connection) =
+            proxy_connection_pair().await?;
+        let config = Arc::new(AsyncRwLock::new(MeshConfig {
+            services: vec![ServiceEntry {
+                name: "known-service".to_string(),
+                local_addr: "127.0.0.1:1".to_string(),
+                protocol: Protocol::Tcp,
+                health_check: None,
+            }],
+            ..MeshConfig::default()
+        }));
+        let active_connections = Arc::new(AtomicUsize::new(0));
+
+        let handler = tokio::spawn(handle_proxy_inbound(
+            server_connection,
+            Arc::clone(&config),
+            Arc::clone(&active_connections),
+        ));
+
+        let (mut send, _recv) = client_connection.open_bi().await?;
+        mesh_proto::frame::write_json(
+            &mut send,
+            &ProxyHandshake {
+                service_name: "missing-service".to_string(),
+                port: 42_000,
+                protocol: Protocol::Tcp,
+            },
+        )
+        .await?;
+        send.finish()
+            .map_err(|error| anyhow::anyhow!("failed to finish proxy test handshake: {error}"))?;
+
+        timeout(Duration::from_secs(5), client_connection.closed())
+            .await
+            .context("timed out waiting for unknown-service rejection")?;
+        timeout(Duration::from_secs(5), handler)
+            .await
+            .context("timed out waiting for proxy handler shutdown")?
+            .context("proxy handler task panicked")??;
+
+        assert_eq!(active_connections.load(Ordering::Relaxed), 0);
+
+        client_endpoint.close().await;
+        server_endpoint.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_proxy_inbound_connection_limit() -> Result<()> {
+        let (server_endpoint, client_endpoint, server_connection, client_connection) =
+            proxy_connection_pair().await?;
+        let config = Arc::new(AsyncRwLock::new(MeshConfig::default()));
+        let active_connections = Arc::new(AtomicUsize::new(MAX_PROXY_CONNECTIONS));
+
+        let handler = tokio::spawn(handle_proxy_inbound(
+            server_connection,
+            Arc::clone(&config),
+            Arc::clone(&active_connections),
+        ));
+
+        timeout(Duration::from_secs(5), client_connection.closed())
+            .await
+            .context("timed out waiting for connection-limit rejection")?;
+        let result = timeout(Duration::from_secs(5), handler)
+            .await
+            .context("timed out waiting for proxy limit handler shutdown")?
+            .context("proxy limit handler task panicked")?;
+
+        assert!(result.is_err());
+        assert_eq!(
+            active_connections.load(Ordering::Relaxed),
+            MAX_PROXY_CONNECTIONS
+        );
+
+        client_endpoint.close().await;
+        server_endpoint.close().await;
+        Ok(())
     }
 }
 
