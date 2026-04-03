@@ -3,6 +3,7 @@ mod control_node;
 mod daemon;
 mod edge_node;
 pub mod health_prober;
+pub mod health_server;
 mod ipc_server;
 mod mesh_node;
 mod persistence;
