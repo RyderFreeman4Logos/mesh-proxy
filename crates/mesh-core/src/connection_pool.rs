@@ -73,7 +73,8 @@ impl ConnectionPool {
     }
 }
 
-async fn bridge_io<LocalRead, LocalWrite, RemoteWrite, RemoteRead>(
+/// Copy bytes bidirectionally between two pairs of split streams.
+pub async fn bridge_bidirectional<LocalRead, LocalWrite, RemoteWrite, RemoteRead>(
     local_read: &mut LocalRead,
     local_write: &mut LocalWrite,
     remote_write: &mut RemoteWrite,
@@ -98,7 +99,7 @@ pub async fn bridge_streams(
     mut recv: RecvStream,
 ) -> Result<()> {
     let (mut local_read, mut local_write) = local.into_split();
-    bridge_io(&mut local_read, &mut local_write, &mut send, &mut recv).await?;
+    bridge_bidirectional(&mut local_read, &mut local_write, &mut send, &mut recv).await?;
     send.finish().context("failed to finish QUIC send stream")?;
     Ok(())
 }
@@ -110,7 +111,7 @@ pub(crate) async fn bridge_unix_streams(
     mut recv: RecvStream,
 ) -> Result<()> {
     let (mut local_read, mut local_write) = tokio::io::split(local);
-    bridge_io(&mut local_read, &mut local_write, &mut send, &mut recv).await?;
+    bridge_bidirectional(&mut local_read, &mut local_write, &mut send, &mut recv).await?;
     send.finish().context("failed to finish QUIC send stream")?;
     Ok(())
 }
@@ -199,7 +200,7 @@ mod tests {
         let (mut remote_recv, _) = tokio::io::split(remote_recv_bridge);
 
         let bridge_task = tokio::spawn(async move {
-            bridge_io(
+            bridge_bidirectional(
                 &mut local_read,
                 &mut local_write,
                 &mut remote_send,

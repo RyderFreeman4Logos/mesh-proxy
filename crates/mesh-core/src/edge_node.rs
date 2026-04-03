@@ -10,7 +10,7 @@ use iroh::endpoint::Connection;
 use iroh::endpoint::presets;
 use mesh_proto::{
     ALPN_CONTROL, ALPN_PROXY, ControlMessage, MAX_LISTENERS, MAX_PROXY_CONNECTIONS, MeshConfig,
-    PROXY_HANDSHAKE_TIMEOUT_SECS, Protocol, ProxyHandshake, RouteEntry,
+    PROXY_HANDSHAKE_TIMEOUT_SECS, Protocol, ProxyHandshake, RouteEntry, ServiceEntry,
 };
 use tokio::net::TcpListener;
 #[cfg(unix)]
@@ -24,14 +24,30 @@ use crate::connection_pool::{ConnectionPool, bridge_streams};
 use crate::persistence::{self, PersistenceError};
 
 #[derive(Debug)]
-struct ActiveProxyConnection {
+/// RAII guard that keeps an inbound proxy connection slot reserved.
+pub struct ProxyConnectionPermit {
     active_connections: Arc<AtomicUsize>,
 }
 
-impl Drop for ActiveProxyConnection {
+impl Drop for ProxyConnectionPermit {
     fn drop(&mut self) {
         self.active_connections.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+/// Validation errors for inbound proxy handshakes before local dial-out begins.
+pub enum ProxyHandshakeValidationError {
+    #[error("unknown local service requested: {service_name}")]
+    UnknownService { service_name: String },
+    #[error(
+        "protocol mismatch for service {service_name}: expected {expected:?}, received {received:?}"
+    )]
+    ProtocolMismatch {
+        service_name: String,
+        expected: Protocol,
+        received: Protocol,
+    },
 }
 
 fn now_epoch() -> u64 {
@@ -41,18 +57,44 @@ fn now_epoch() -> u64 {
         .as_secs()
 }
 
-fn try_acquire_proxy_connection(
-    active_connections: &Arc<AtomicUsize>,
-) -> Option<ActiveProxyConnection> {
+/// Reserve one inbound proxy connection slot until the returned guard is dropped.
+pub fn try_reserve_proxy_connection_slot(
+    active_connections: Arc<AtomicUsize>,
+) -> Option<ProxyConnectionPermit> {
     active_connections
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             (current < MAX_PROXY_CONNECTIONS).then_some(current + 1)
         })
         .ok()?;
 
-    Some(ActiveProxyConnection {
-        active_connections: Arc::clone(active_connections),
-    })
+    Some(ProxyConnectionPermit { active_connections })
+}
+
+/// Resolve the target local service for an inbound proxy handshake.
+pub fn validate_inbound_proxy_handshake(
+    config: &MeshConfig,
+    handshake: &ProxyHandshake,
+) -> std::result::Result<ServiceEntry, ProxyHandshakeValidationError> {
+    let Some(service) = config
+        .services
+        .iter()
+        .find(|service| service.name == handshake.service_name)
+        .cloned()
+    else {
+        return Err(ProxyHandshakeValidationError::UnknownService {
+            service_name: handshake.service_name.clone(),
+        });
+    };
+
+    if service.protocol != handshake.protocol {
+        return Err(ProxyHandshakeValidationError::ProtocolMismatch {
+            service_name: handshake.service_name.clone(),
+            expected: service.protocol,
+            received: handshake.protocol,
+        });
+    }
+
+    Ok(service)
 }
 
 fn reject_connection(connection: &Connection, reason: &'static [u8]) {
@@ -333,40 +375,39 @@ async fn handle_proxy_stream(
     let remote_id = connection.remote_id();
     let service = {
         let config = config.read().await;
-        config
-            .services
-            .iter()
-            .find(|service| service.name == handshake.service_name)
-            .cloned()
+        match validate_inbound_proxy_handshake(&config, &handshake) {
+            Ok(service) => service,
+            Err(error @ ProxyHandshakeValidationError::UnknownService { .. }) => {
+                if let ProxyHandshakeValidationError::UnknownService { service_name } = &error {
+                    tracing::warn!(
+                        %remote_id,
+                        service_name = %service_name,
+                        "rejecting inbound proxy stream for unknown local service"
+                    );
+                }
+                reject_connection(&connection, b"unknown service");
+                return Err(error.into());
+            }
+            Err(error @ ProxyHandshakeValidationError::ProtocolMismatch { .. }) => {
+                if let ProxyHandshakeValidationError::ProtocolMismatch {
+                    service_name,
+                    expected,
+                    received,
+                } = &error
+                {
+                    tracing::warn!(
+                        %remote_id,
+                        service_name = %service_name,
+                        expected = ?expected,
+                        received = ?received,
+                        "rejecting inbound proxy stream with mismatched protocol"
+                    );
+                }
+                reject_connection(&connection, b"proxy protocol mismatch");
+                return Err(error.into());
+            }
+        }
     };
-
-    let Some(service) = service else {
-        tracing::warn!(
-            %remote_id,
-            service_name = %handshake.service_name,
-            "rejecting inbound proxy stream for unknown local service"
-        );
-        reject_connection(&connection, b"unknown service");
-        return Err(anyhow!(
-            "unknown local service requested: {}",
-            handshake.service_name
-        ));
-    };
-
-    if service.protocol != handshake.protocol {
-        tracing::warn!(
-            %remote_id,
-            service_name = %handshake.service_name,
-            expected = ?service.protocol,
-            received = ?handshake.protocol,
-            "rejecting inbound proxy stream with mismatched protocol"
-        );
-        reject_connection(&connection, b"proxy protocol mismatch");
-        return Err(anyhow!(
-            "protocol mismatch for service {}",
-            handshake.service_name
-        ));
-    }
 
     match service.protocol {
         Protocol::Tcp => {
@@ -424,7 +465,9 @@ pub async fn handle_proxy_inbound(
     active_connections: Arc<AtomicUsize>,
 ) -> Result<()> {
     let remote_id = connection.remote_id();
-    let Some(_connection_guard) = try_acquire_proxy_connection(&active_connections) else {
+    let Some(_connection_guard) =
+        try_reserve_proxy_connection_slot(Arc::clone(&active_connections))
+    else {
         reject_connection(&connection, b"proxy connection limit reached");
         return Err(anyhow!(
             "rejecting inbound proxy connection from {} because the limit is {}",
