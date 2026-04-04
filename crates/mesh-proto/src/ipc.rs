@@ -54,11 +54,10 @@ pub enum IpcResponse {
     Reloaded,
     /// Operation failed.
     Error { message: String },
-    /// A service was successfully exposed and (optionally) assigned a port.
-    ServiceExposed {
-        name: String,
-        assigned_port: Option<u16>,
-    },
+    /// A service was successfully exposed and assigned a port by the control node.
+    ServiceExposed { name: String, assigned_port: u16 },
+    /// A service was saved locally, but the control node did not confirm a port in time.
+    ServiceExposeTimedOut { name: String, timeout_seconds: u64 },
     /// A service was removed from the local config.
     ServiceUnexposed { name: String },
     /// Runtime status for a specific managed listener.
@@ -142,5 +141,26 @@ mod tests {
             panic!("expected service unexposed response");
         };
         assert_eq!(name, "web");
+    }
+
+    #[test]
+    fn test_ipc_response_service_expose_timed_out_roundtrip() {
+        let response = IpcResponse::ServiceExposeTimedOut {
+            name: "web".to_string(),
+            timeout_seconds: 15,
+        };
+
+        let encoded = serde_json::to_string(&response).unwrap();
+        let decoded: IpcResponse = serde_json::from_str(&encoded).unwrap();
+
+        let IpcResponse::ServiceExposeTimedOut {
+            name,
+            timeout_seconds,
+        } = decoded
+        else {
+            panic!("expected service expose timed out response");
+        };
+        assert_eq!(name, "web");
+        assert_eq!(timeout_seconds, 15);
     }
 }

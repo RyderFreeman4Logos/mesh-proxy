@@ -513,7 +513,15 @@ async fn cmd_status(config_path: &Path, output: OutputFormat) -> Result<()> {
             name,
             assigned_port,
         } => {
-            println!("Service '{name}' exposed (port: {assigned_port:?})");
+            println!("Service '{name}' exposed on port {assigned_port}");
+        }
+        IpcResponse::ServiceExposeTimedOut {
+            name,
+            timeout_seconds,
+        } => {
+            println!(
+                "Service '{name}' saved, but port assignment did not arrive within {timeout_seconds}s"
+            );
         }
         IpcResponse::ServiceUnexposed { name } => {
             println!("Service '{name}' unexposed");
@@ -592,13 +600,15 @@ async fn cmd_expose(
             name,
             assigned_port,
         } => {
-            if let Some(port) = assigned_port
-                && port != 0
-            {
-                println!("Service '{name}' exposed on port {port}");
-            } else {
-                println!("Service '{name}' exposed (port pending assignment)");
-            }
+            println!("Service '{name}' exposed on port {assigned_port}");
+        }
+        IpcResponse::ServiceExposeTimedOut {
+            name,
+            timeout_seconds,
+        } => {
+            anyhow::bail!(
+                "service '{name}' saved, but the control node did not assign a port within {timeout_seconds}s"
+            );
         }
         IpcResponse::Error { message } => {
             anyhow::bail!("expose failed: {message}");
