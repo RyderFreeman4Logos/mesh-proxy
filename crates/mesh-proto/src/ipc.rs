@@ -26,6 +26,8 @@ pub enum IpcRequest {
         protocol: Protocol,
         health_check: Option<HealthCheckConfig>,
     },
+    /// Remove a previously exposed local service (edge node only).
+    UnexposeService { name: String },
     /// Accept a new edge node (control node only).
     AcceptNode {
         ticket: String,
@@ -57,6 +59,8 @@ pub enum IpcResponse {
         name: String,
         assigned_port: Option<u16>,
     },
+    /// A service was removed from the local config.
+    ServiceUnexposed { name: String },
     /// Runtime status for a specific managed listener.
     ListenerStatus { port: u16, state: ListenerState },
 }
@@ -69,6 +73,7 @@ pub struct StatusInfo {
     /// Serialized `EndpointAddr` used to connect back to this node.
     pub endpoint_addr: Option<String>,
     pub online: bool,
+    pub peer_count: usize,
     pub connected_nodes: Vec<ConnectedNode>,
     pub services: Vec<ServiceStatus>,
     /// Bind address for the local health query endpoint, if configured.
@@ -84,10 +89,58 @@ pub struct ConnectedNode {
     pub online: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceDisplayStatus {
+    Healthy,
+    Degraded,
+    Unhealthy,
+    #[default]
+    Unknown,
+    Ok,
+    Unreachable,
+    Routed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceStatus {
     pub name: String,
     pub node_name: String,
     pub assigned_port: Option<u16>,
-    pub status: String,
+    pub status: ServiceDisplayStatus,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ipc_request_unexpose_service_roundtrip() {
+        let request = IpcRequest::UnexposeService {
+            name: "web".to_string(),
+        };
+
+        let encoded = serde_json::to_string(&request).unwrap();
+        let decoded: IpcRequest = serde_json::from_str(&encoded).unwrap();
+
+        let IpcRequest::UnexposeService { name } = decoded else {
+            panic!("expected unexpose service request");
+        };
+        assert_eq!(name, "web");
+    }
+
+    #[test]
+    fn test_ipc_response_service_unexposed_roundtrip() {
+        let response = IpcResponse::ServiceUnexposed {
+            name: "web".to_string(),
+        };
+
+        let encoded = serde_json::to_string(&response).unwrap();
+        let decoded: IpcResponse = serde_json::from_str(&encoded).unwrap();
+
+        let IpcResponse::ServiceUnexposed { name } = decoded else {
+            panic!("expected service unexposed response");
+        };
+        assert_eq!(name, "web");
+    }
 }

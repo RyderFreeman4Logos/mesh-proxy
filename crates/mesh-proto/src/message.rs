@@ -27,6 +27,8 @@ pub enum ControlMessage {
         routes: HashMap<u16, RouteEntry>,
         version: u64,
     },
+    /// Edge -> Control: request a full route table snapshot.
+    RouteTableRequest,
     /// Edge -> Control: periodic health status report.
     HealthReport {
         endpoint_id: String,

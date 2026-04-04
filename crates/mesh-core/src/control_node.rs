@@ -1,18 +1,22 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use mesh_proto::{
-    ALPN_CONTROL, ControlMessage, JoinTicket, NodeInfo, PortAssignment, RouteEntry, ServiceId,
-    ServiceRecord,
+    ALPN_CONTROL, ControlMessage, DEFAULT_SERVICE_QUOTA, JoinTicket, NodeInfo, PortAssignment,
+    RouteEntry, ServiceId, ServiceRecord,
 };
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, watch};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{info, warn};
 
-use crate::port_allocator::PortAllocator;
+use crate::{
+    persistence::{self, PersistenceError},
+    port_allocator::PortAllocator,
+};
 
 /// Error returned when a node exceeds its service quota.
 #[derive(Debug, thiserror::Error)]
@@ -21,6 +25,8 @@ pub enum QuotaError {
     Exceeded { current: usize, limit: u16 },
     #[error("node not found in whitelist: {endpoint_id}")]
     NodeNotFound { endpoint_id: String },
+    #[error("failed to persist quota limit: {0}")]
+    Persistence(#[from] PersistenceError),
 }
 
 /// Error returned when ticket validation fails.
@@ -56,10 +62,43 @@ pub struct ControlNode {
     services: HashMap<ServiceId, ServiceRecord>,
     routes: HashMap<u16, RouteEntry>,
     route_version: u64,
+    route_change_tx: watch::Sender<u64>,
+    accepted_at: HashMap<String, u64>,
+    data_dir: Option<PathBuf>,
     /// Maps ticket nonce → expiry epoch for replay prevention with bounded growth.
     used_tickets: HashMap<[u8; 16], u64>,
     /// Epoch timestamp of the most recent pong received from each endpoint.
     last_pong: HashMap<String, u64>,
+}
+
+#[derive(Debug, Clone)]
+struct ControlNodeRollbackState {
+    whitelist: HashMap<String, NodeInfo>,
+    allocator: PortAllocator,
+    services: HashMap<ServiceId, ServiceRecord>,
+    routes: HashMap<u16, RouteEntry>,
+    route_version: u64,
+    accepted_at: HashMap<String, u64>,
+    last_pong: HashMap<String, u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PersistedWhitelistEntry {
+    endpoint_id: String,
+    node_name: String,
+    #[serde(default = "default_persisted_quota_limit")]
+    quota_limit: u32,
+    accepted_at: u64,
+}
+
+const fn default_persisted_quota_limit() -> u32 {
+    DEFAULT_SERVICE_QUOTA as u32
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct PersistedRoutes {
+    routes: HashMap<u16, RouteEntry>,
+    version: u64,
 }
 
 #[derive(Debug, Default)]
@@ -114,15 +153,70 @@ impl Default for ControlNode {
 impl ControlNode {
     /// Create a new control node with empty state.
     pub fn new() -> Self {
+        let (route_change_tx, _) = watch::channel(0);
         Self {
             whitelist: HashMap::new(),
             allocator: PortAllocator::new(),
             services: HashMap::new(),
             routes: HashMap::new(),
             route_version: 0,
+            route_change_tx,
+            accepted_at: HashMap::new(),
+            data_dir: None,
             used_tickets: HashMap::new(),
             last_pong: HashMap::new(),
         }
+    }
+
+    /// Create a control node backed by persisted disk state.
+    pub fn load_from_disk(data_dir: impl Into<PathBuf>) -> Self {
+        let data_dir = data_dir.into();
+        let mut node = Self {
+            data_dir: Some(data_dir.clone()),
+            ..Self::new()
+        };
+
+        let persisted_whitelist = node.load_whitelist_entries();
+        node.whitelist = persisted_whitelist
+            .iter()
+            .map(|entry| {
+                let quota_limit = match u16::try_from(entry.quota_limit) {
+                    Ok(limit) => limit,
+                    Err(_) => {
+                        warn!(
+                            endpoint_id = %entry.endpoint_id,
+                            quota_limit = entry.quota_limit,
+                            fallback = DEFAULT_SERVICE_QUOTA as u16,
+                            "persisted quota_limit exceeds supported range, falling back to default"
+                        );
+                        DEFAULT_SERVICE_QUOTA as u16
+                    }
+                };
+                (
+                    entry.endpoint_id.clone(),
+                    NodeInfo {
+                        endpoint_id: entry.endpoint_id.clone(),
+                        node_name: entry.node_name.clone(),
+                        quota_limit,
+                        quota_used: 0,
+                        is_online: false,
+                        last_heartbeat: None,
+                        addr: None,
+                    },
+                )
+            })
+            .collect();
+        node.accepted_at = persisted_whitelist
+            .into_iter()
+            .map(|entry| (entry.endpoint_id, entry.accepted_at))
+            .collect();
+
+        let persisted_routes = node.load_routes();
+        node.route_version = persisted_routes.version;
+        node.routes = persisted_routes.routes;
+        node.rebuild_runtime_state_from_routes();
+        let _ = node.route_change_tx.send(node.route_version);
+        node
     }
 
     /// Take a read-only snapshot of the core state (whitelist, services,
@@ -136,16 +230,199 @@ impl ControlNode {
         }
     }
 
+    fn rollback_state(&self) -> ControlNodeRollbackState {
+        ControlNodeRollbackState {
+            whitelist: self.whitelist.clone(),
+            allocator: self.allocator.clone(),
+            services: self.services.clone(),
+            routes: self.routes.clone(),
+            route_version: self.route_version,
+            accepted_at: self.accepted_at.clone(),
+            last_pong: self.last_pong.clone(),
+        }
+    }
+
+    fn restore_rollback_state(&mut self, state: ControlNodeRollbackState) {
+        self.whitelist = state.whitelist;
+        self.allocator = state.allocator;
+        self.services = state.services;
+        self.routes = state.routes;
+        self.route_version = state.route_version;
+        self.accepted_at = state.accepted_at;
+        self.last_pong = state.last_pong;
+    }
+
+    fn notify_route_change(&self) {
+        let _ = self.route_change_tx.send(self.route_version);
+    }
+
+    fn whitelist_path(&self) -> Option<PathBuf> {
+        self.data_dir.as_ref().map(|dir| dir.join("whitelist.json"))
+    }
+
+    fn routes_path(&self) -> Option<PathBuf> {
+        self.data_dir.as_ref().map(|dir| dir.join("routes.json"))
+    }
+
+    fn load_whitelist_entries(&self) -> Vec<PersistedWhitelistEntry> {
+        let Some(path) = self.whitelist_path() else {
+            return Vec::new();
+        };
+
+        match persistence::load_state::<Vec<PersistedWhitelistEntry>>(&path) {
+            Ok(Some(entries)) => entries,
+            Ok(None) => Vec::new(),
+            Err(error) => {
+                warn!(path = %path.display(), error = %error, "failed to load whitelist, starting fresh");
+                Vec::new()
+            }
+        }
+    }
+
+    fn load_routes(&self) -> PersistedRoutes {
+        let Some(path) = self.routes_path() else {
+            return PersistedRoutes {
+                routes: HashMap::new(),
+                version: 0,
+            };
+        };
+
+        match persistence::load_state::<PersistedRoutes>(&path) {
+            Ok(Some(routes)) => routes,
+            Ok(None) => PersistedRoutes {
+                routes: HashMap::new(),
+                version: 0,
+            },
+            Err(error) => {
+                warn!(path = %path.display(), error = %error, "failed to load persisted routes, starting fresh");
+                PersistedRoutes {
+                    routes: HashMap::new(),
+                    version: 0,
+                }
+            }
+        }
+    }
+
+    fn persist_whitelist(&self) -> Result<(), PersistenceError> {
+        let Some(path) = self.whitelist_path() else {
+            return Ok(());
+        };
+
+        let mut entries = self
+            .whitelist
+            .values()
+            .map(|node| PersistedWhitelistEntry {
+                endpoint_id: node.endpoint_id.clone(),
+                node_name: node.node_name.clone(),
+                quota_limit: u32::from(node.quota_limit),
+                accepted_at: self
+                    .accepted_at
+                    .get(&node.endpoint_id)
+                    .copied()
+                    .unwrap_or(0),
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
+
+        persistence::save_atomic_sync(&path, &entries)
+    }
+
+    fn persist_routes(&self) -> Result<(), PersistenceError> {
+        let Some(path) = self.routes_path() else {
+            return Ok(());
+        };
+
+        persistence::save_atomic_sync(
+            &path,
+            &PersistedRoutes {
+                routes: self.routes.clone(),
+                version: self.route_version,
+            },
+        )
+    }
+
+    fn rebuild_runtime_state_from_routes(&mut self) {
+        self.allocator = PortAllocator::new();
+        self.services.clear();
+        self.last_pong.clear();
+
+        for node in self.whitelist.values_mut() {
+            node.quota_used = 0;
+            node.is_online = false;
+            node.last_heartbeat = None;
+            node.addr = None;
+        }
+
+        let mut sorted_routes = self.routes.iter().collect::<Vec<_>>();
+        sorted_routes.sort_by_key(|(port, _)| **port);
+
+        let mut restored_routes = HashMap::with_capacity(self.routes.len());
+
+        for (&port, route) in sorted_routes {
+            let Some(node) = self.whitelist.get_mut(&route.endpoint_id) else {
+                warn!(
+                    endpoint_id = %route.endpoint_id,
+                    service_name = %route.service_name,
+                    port,
+                    "skipping persisted route for unknown whitelist entry"
+                );
+                continue;
+            };
+
+            let service_id = ServiceId {
+                endpoint_id: route.endpoint_id.clone(),
+                service_name: route.service_name.clone(),
+            };
+            self.allocator.restore_active(port, service_id.clone());
+            self.services.insert(
+                service_id.clone(),
+                ServiceRecord {
+                    service_id,
+                    node_name: route.node_name.clone(),
+                    local_addr: route.target_local_addr.clone(),
+                    protocol: route.protocol,
+                    published_port: Some(port),
+                    health_state: mesh_proto::HealthState::Unknown,
+                    last_seen: None,
+                },
+            );
+            node.quota_used = node.quota_used.saturating_add(1);
+            restored_routes.insert(port, route.clone());
+        }
+
+        self.routes = restored_routes;
+    }
+
     /// Add a node to the whitelist. Overwrites any existing entry with the
     /// same endpoint ID.
     pub fn add_node(&mut self, info: NodeInfo) {
         self.whitelist.insert(info.endpoint_id.clone(), info);
     }
 
+    /// Add a node to the whitelist and persist the accepted-node list.
+    pub fn accept_node(
+        &mut self,
+        info: NodeInfo,
+        accepted_at: u64,
+    ) -> Result<(), PersistenceError> {
+        let rollback = self.rollback_state();
+        self.accepted_at
+            .insert(info.endpoint_id.clone(), accepted_at);
+        self.whitelist.insert(info.endpoint_id.clone(), info);
+
+        if let Err(error) = self.persist_whitelist() {
+            self.restore_rollback_state(rollback);
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
     /// Remove a node from the whitelist, release all its allocated ports,
     /// and clean up heartbeat tracking.
     pub fn remove_node(&mut self, endpoint_id: &str) {
         self.whitelist.remove(endpoint_id);
+        self.accepted_at.remove(endpoint_id);
         self.last_pong.remove(endpoint_id);
 
         // Collect service IDs belonging to this node.
@@ -167,10 +444,34 @@ impl ControlNode {
             .filter(|(_, entry)| entry.endpoint_id == endpoint_id)
             .map(|(&port, _)| port)
             .collect();
+        let routes_changed = !orphaned_ports.is_empty();
 
         for port in orphaned_ports {
             self.routes.remove(&port);
             self.allocator.release(port);
+        }
+
+        if routes_changed {
+            self.route_version += 1;
+        }
+
+        if let Err(error) = self.persist_whitelist() {
+            warn!(
+                endpoint_id,
+                error = %error,
+                "failed to persist whitelist after node removal"
+            );
+        }
+        if let Err(error) = self.persist_routes() {
+            warn!(
+                endpoint_id,
+                error = %error,
+                "failed to persist routes after node removal"
+            );
+        }
+
+        if routes_changed {
+            self.notify_route_change();
         }
     }
 
@@ -224,13 +525,22 @@ impl ControlNode {
 
     /// Updates the configured service quota for a whitelisted node.
     pub fn set_quota_limit(&mut self, endpoint_id: &str, limit: u16) -> Result<(), QuotaError> {
-        let node = self
-            .whitelist
-            .get_mut(endpoint_id)
-            .ok_or_else(|| QuotaError::NodeNotFound {
-                endpoint_id: endpoint_id.to_owned(),
-            })?;
-        node.quota_limit = limit;
+        let rollback = self.rollback_state();
+        {
+            let node =
+                self.whitelist
+                    .get_mut(endpoint_id)
+                    .ok_or_else(|| QuotaError::NodeNotFound {
+                        endpoint_id: endpoint_id.to_owned(),
+                    })?;
+            node.quota_limit = limit;
+        }
+
+        if let Err(error) = self.persist_whitelist() {
+            self.restore_rollback_state(rollback);
+            return Err(QuotaError::Persistence(error));
+        }
+
         Ok(())
     }
 
@@ -265,6 +575,11 @@ impl ControlNode {
     /// Returns the current route version counter.
     pub fn route_version(&self) -> u64 {
         self.route_version
+    }
+
+    /// Subscribe to route table change notifications.
+    pub fn subscribe_route_changes(&self) -> watch::Receiver<u64> {
+        self.route_change_tx.subscribe()
     }
 
     /// Access the service registry.
@@ -345,10 +660,11 @@ impl ControlNode {
         registrations: &[mesh_proto::ServiceRegistration],
         now_epoch: u64,
     ) -> Result<Vec<PortAssignment>, String> {
-        let node = self
+        let quota_limit = self
             .whitelist
             .get(endpoint_id)
-            .ok_or_else(|| format!("node not found in whitelist: {endpoint_id}"))?;
+            .ok_or_else(|| format!("node not found in whitelist: {endpoint_id}"))?
+            .quota_limit;
         let current_count = self
             .services
             .keys()
@@ -369,12 +685,14 @@ impl ControlNode {
         }
 
         let final_count = requested_order.len();
-        if final_count > node.quota_limit as usize {
+        if final_count > quota_limit as usize {
             return Err(format!(
                 "quota exceeded: have {current_count}, want final {final_count}, limit {}",
-                node.quota_limit
+                quota_limit
             ));
         }
+
+        let rollback = self.rollback_state();
 
         let existing_services = self
             .services
@@ -478,6 +796,11 @@ impl ControlNode {
         }
 
         self.route_version += 1;
+        if let Err(error) = self.persist_routes() {
+            self.restore_rollback_state(rollback);
+            return Err(format!("failed to persist routes: {error}"));
+        }
+        self.notify_route_change();
         Ok(assignments)
     }
 
@@ -659,6 +982,11 @@ async fn handle_connection(
                         warn!(error = %e, "register handler failed");
                     }
                 }
+                ControlMessage::RouteTableRequest => {
+                    if let Err(error) = write_full_route_table(&node, &mut send).await {
+                        warn!(error = %error, "failed to respond to route table request");
+                    }
+                }
                 ControlMessage::HealthReport {
                     endpoint_id,
                     services,
@@ -695,6 +1023,20 @@ async fn handle_connection(
         .remove_if_stale(&remote_id_string, &connection)
         .await;
     result
+}
+
+async fn write_full_route_table(
+    node: &Arc<RwLock<ControlNode>>,
+    send: &mut iroh::endpoint::SendStream,
+) -> anyhow::Result<()> {
+    let (routes, version) = {
+        let node = node.read().await;
+        (node.routes().clone(), node.route_version())
+    };
+    let route_update = ControlMessage::RouteTableUpdate { routes, version };
+    mesh_proto::frame::write_json(send, &route_update)
+        .await
+        .context("failed to send full route table")
 }
 
 /// Process a Register message: validate ticket, allocate ports, respond with Ack/Nack.
@@ -753,15 +1095,7 @@ async fn handle_register(
                 .await
                 .context("failed to send RegisterAck")?;
 
-            let routes_and_version = {
-                let n = node.read().await;
-                (n.routes().clone(), n.route_version())
-            };
-            let route_update = ControlMessage::RouteTableUpdate {
-                routes: routes_and_version.0,
-                version: routes_and_version.1,
-            };
-            if let Err(error) = mesh_proto::frame::write_json(send, &route_update).await {
+            if let Err(error) = write_full_route_table(node, send).await {
                 warn!(
                     error = %error,
                     "failed to send initial route table after registration"
@@ -843,8 +1177,13 @@ async fn broadcast_routes(
 #[cfg(test)]
 mod tests {
     use mesh_proto::DEFAULT_SERVICE_QUOTA;
+    use tempfile::Builder;
 
     use super::*;
+
+    fn writable_tempdir(prefix: &str) -> tempfile::TempDir {
+        Builder::new().prefix(prefix).tempdir_in("/tmp").unwrap()
+    }
 
     fn make_node(endpoint_id: &str, quota: u16) -> NodeInfo {
         NodeInfo {
@@ -882,6 +1221,126 @@ mod tests {
             protocol: mesh_proto::Protocol::Tcp,
             health_check: None,
         }
+    }
+
+    #[test]
+    fn test_whitelist_persistence_roundtrip_matches_saved_entries() {
+        let dir = writable_tempdir("control-whitelist-");
+        let mut cn = ControlNode::load_from_disk(dir.path());
+        let accepted_at = 1_700_000_000;
+        let quota_limit = 9;
+        let node = make_node("edge-a", quota_limit);
+
+        cn.accept_node(node, accepted_at).unwrap();
+
+        let stored: Vec<PersistedWhitelistEntry> =
+            crate::persistence::load_state(&dir.path().join("whitelist.json"))
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            stored,
+            vec![PersistedWhitelistEntry {
+                endpoint_id: "edge-a".to_owned(),
+                node_name: "node-edge-a".to_owned(),
+                quota_limit: u32::from(quota_limit),
+                accepted_at,
+            }]
+        );
+
+        let restored = ControlNode::load_from_disk(dir.path());
+        assert_eq!(restored.whitelist.len(), 1);
+        assert_eq!(restored.whitelist["edge-a"].node_name, "node-edge-a");
+        assert_eq!(restored.whitelist["edge-a"].quota_limit, quota_limit);
+        assert_eq!(restored.accepted_at["edge-a"], accepted_at);
+    }
+
+    #[test]
+    fn test_quota_limit_persistence_roundtrip_after_update() {
+        let dir = writable_tempdir("control-quota-");
+        let mut cn = ControlNode::load_from_disk(dir.path());
+        let accepted_at = 1_700_000_111;
+
+        cn.accept_node(
+            make_node("edge-a", DEFAULT_SERVICE_QUOTA as u16),
+            accepted_at,
+        )
+        .unwrap();
+        cn.set_quota_limit("edge-a", 12).unwrap();
+
+        let stored: Vec<PersistedWhitelistEntry> =
+            crate::persistence::load_state(&dir.path().join("whitelist.json"))
+                .unwrap()
+                .unwrap();
+        assert_eq!(stored[0].quota_limit, 12);
+
+        let restored = ControlNode::load_from_disk(dir.path());
+        assert_eq!(restored.whitelist["edge-a"].quota_limit, 12);
+        assert_eq!(restored.accepted_at["edge-a"], accepted_at);
+    }
+
+    #[test]
+    fn test_route_table_persistence_roundtrip_matches_saved_entries() {
+        let dir = writable_tempdir("control-routes-");
+        let mut cn = ControlNode::load_from_disk(dir.path());
+        cn.accept_node(make_node("edge-a", DEFAULT_SERVICE_QUOTA as u16), 100)
+            .unwrap();
+
+        let registrations = vec![
+            make_registration("llm-api", "127.0.0.1:3000"),
+            make_registration("metrics", "127.0.0.1:3001"),
+        ];
+        cn.register_services("edge-a", "node-edge-a", &registrations, 200)
+            .unwrap();
+
+        let stored: PersistedRoutes =
+            crate::persistence::load_state(&dir.path().join("routes.json"))
+                .unwrap()
+                .unwrap();
+        assert_eq!(stored.routes, *cn.routes());
+        assert_eq!(stored.version, cn.route_version());
+
+        let restored = ControlNode::load_from_disk(dir.path());
+        assert_eq!(restored.routes(), cn.routes());
+        assert_eq!(restored.route_version(), cn.route_version());
+        assert_eq!(restored.services.len(), 2);
+        assert_eq!(restored.whitelist["edge-a"].quota_used, 2);
+    }
+
+    #[tokio::test]
+    async fn test_route_change_subscribers_receive_register_service_updates() {
+        let mut cn = ControlNode::new();
+        cn.accept_node(make_node("edge-a", DEFAULT_SERVICE_QUOTA as u16), 100)
+            .unwrap();
+        let mut route_change_rx = cn.subscribe_route_changes();
+
+        assert_eq!(*route_change_rx.borrow_and_update(), 0);
+
+        let registrations = vec![make_registration("llm-api", "127.0.0.1:3000")];
+        cn.register_services("edge-a", "node-edge-a", &registrations, 200)
+            .unwrap();
+
+        route_change_rx
+            .changed()
+            .await
+            .expect("route change watcher should receive updates");
+        assert_eq!(*route_change_rx.borrow_and_update(), 1);
+    }
+
+    #[test]
+    fn test_load_from_disk_starts_empty_for_missing_or_empty_files() {
+        let missing_dir = writable_tempdir("control-missing-");
+        let missing = ControlNode::load_from_disk(missing_dir.path());
+        assert!(missing.whitelist.is_empty());
+        assert!(missing.routes.is_empty());
+
+        let empty_dir = writable_tempdir("control-empty-");
+        std::fs::write(empty_dir.path().join("whitelist.json"), "").unwrap();
+        std::fs::write(empty_dir.path().join("routes.json"), "").unwrap();
+
+        let empty = ControlNode::load_from_disk(empty_dir.path());
+        assert!(empty.whitelist.is_empty());
+        assert!(empty.routes.is_empty());
+        assert!(empty.services.is_empty());
     }
 
     #[test]

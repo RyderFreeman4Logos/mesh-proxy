@@ -52,6 +52,33 @@ impl ConnectionPool {
         self.connect_and_cache(endpoint_id_hex).await
     }
 
+    /// Return the endpoint ids for cached QUIC connections that are still open.
+    pub async fn active_endpoint_ids(&self) -> Vec<String> {
+        let cached = {
+            let pool = self.pool.read().await;
+            pool.iter()
+                .map(|(endpoint_id, connection)| (endpoint_id.clone(), connection.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        let mut active_endpoint_ids = Vec::with_capacity(cached.len());
+        for (endpoint_id, connection) in cached {
+            if let Some(error) = connection.close_reason() {
+                tracing::debug!(
+                    endpoint_id = %endpoint_id,
+                    error = %error,
+                    "evicting closed cached QUIC connection during status snapshot"
+                );
+                self.evict_if_stale(&endpoint_id, &connection).await;
+                continue;
+            }
+
+            active_endpoint_ids.push(endpoint_id);
+        }
+
+        active_endpoint_ids
+    }
+
     async fn cached_connection(&self, endpoint_id_hex: &str) -> Option<Connection> {
         let cached = {
             let pool = self.pool.read().await;

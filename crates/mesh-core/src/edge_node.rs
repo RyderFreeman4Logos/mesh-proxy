@@ -448,6 +448,7 @@ async fn handle_control_inbound(
     data_dir: &Path,
 ) -> Result<()> {
     let remote_id = connection.remote_id();
+    let remote_id_string = remote_id.to_string();
     tracing::info!(%remote_id, "edge control connection established");
 
     loop {
@@ -470,6 +471,7 @@ async fn handle_control_inbound(
         match message {
             ControlMessage::RouteTableUpdate { routes, version } => {
                 let mut edge = node.write().await;
+                edge.set_control_endpoint_id(Some(remote_id_string.clone()));
                 let applied = edge
                     .apply_route_update(routes, version, Arc::clone(&config))
                     .await;
@@ -695,10 +697,20 @@ pub(crate) async fn run_edge_accept_loop(
                     let node = Arc::clone(&node);
                     let config = Arc::clone(&config);
                     let data_dir = data_dir.clone();
+                    let remote_peer_id = connection.remote_id().to_string();
+                    {
+                        let mut edge = node.write().await;
+                        edge.record_peer_connected(remote_peer_id.clone());
+                    }
                     tokio::spawn(async move {
-                        if let Err(error) =
-                            handle_control_inbound(node, config, connection, &data_dir).await
-                        {
+                        let result =
+                            handle_control_inbound(Arc::clone(&node), config, connection, &data_dir)
+                                .await;
+                        let mut edge = node.write().await;
+                        edge.record_peer_disconnected(&remote_peer_id);
+                        drop(edge);
+
+                        if let Err(error) = result {
                             tracing::warn!(error = %error, "edge control connection handler error");
                         }
                     });
@@ -714,8 +726,20 @@ pub(crate) async fn run_edge_accept_loop(
 
                     let config = Arc::clone(&config);
                     let active_connections = Arc::clone(&active_connections);
+                    let node = Arc::clone(&node);
+                    let remote_peer_id = connection.remote_id().to_string();
+                    {
+                        let mut edge = node.write().await;
+                        edge.record_peer_connected(remote_peer_id.clone());
+                    }
                     tokio::spawn(async move {
-                        if let Err(error) = handle_proxy_inbound(connection, config, active_connections).await {
+                        let result =
+                            handle_proxy_inbound(connection, config, active_connections).await;
+                        let mut edge = node.write().await;
+                        edge.record_peer_disconnected(&remote_peer_id);
+                        drop(edge);
+
+                        if let Err(error) = result {
                             tracing::warn!(error = %error, "edge proxy connection handler error");
                         }
                     });
@@ -861,11 +885,13 @@ pub struct EdgeNode {
     cached_routes: HashMap<u16, RouteEntry>,
     shared_routes: Arc<RwLock<HashMap<u16, RouteEntry>>>,
     route_version: u64,
+    direct_peer_connections: HashMap<String, usize>,
     listener_pool: HashMap<u16, JoinHandle<()>>,
     connection_pool: Arc<ConnectionPool>,
     shutdown_tx: broadcast::Sender<()>,
     /// Epoch timestamp of the last ping received from the control node.
     last_ping_from_control: Option<u64>,
+    control_endpoint_id: Option<String>,
 }
 
 impl Default for EdgeNode {
@@ -892,10 +918,12 @@ impl EdgeNode {
             cached_routes: HashMap::new(),
             shared_routes: Arc::new(RwLock::new(HashMap::new())),
             route_version: 0,
+            direct_peer_connections: HashMap::new(),
             listener_pool: HashMap::new(),
             connection_pool,
             shutdown_tx,
             last_ping_from_control: None,
+            control_endpoint_id: None,
         }
     }
 
@@ -961,14 +989,73 @@ impl EdgeNode {
         self.route_version = version;
     }
 
+    /// Restore a persisted route cache snapshot, including control metadata.
+    pub(crate) fn restore_route_cache(&mut self, cache: PersistedRouteCache) {
+        let PersistedRouteCache {
+            routes,
+            version,
+            control_endpoint_id,
+        } = cache;
+        replace_shared_routes(&self.shared_routes, &routes);
+        self.cached_routes = routes;
+        self.route_version = version;
+        self.control_endpoint_id = control_endpoint_id;
+    }
+
     /// Returns the route table version.
     pub fn route_version(&self) -> u64 {
         self.route_version
     }
 
+    /// Record that a non-pooled QUIC connection is active for the given peer.
+    pub fn record_peer_connected(&mut self, endpoint_id: impl Into<String>) {
+        *self
+            .direct_peer_connections
+            .entry(endpoint_id.into())
+            .or_insert(0) += 1;
+    }
+
+    /// Record that a non-pooled QUIC connection has closed for the given peer.
+    pub fn record_peer_disconnected(&mut self, endpoint_id: &str) {
+        let Some(connection_count) = self.direct_peer_connections.get_mut(endpoint_id) else {
+            return;
+        };
+
+        if *connection_count <= 1 {
+            self.direct_peer_connections.remove(endpoint_id);
+        } else {
+            *connection_count -= 1;
+        }
+    }
+
+    /// Return peer ids tracked outside the outbound connection pool.
+    pub fn tracked_peer_ids(&self) -> Vec<String> {
+        self.direct_peer_connections.keys().cloned().collect()
+    }
+
+    /// Returns the cached control endpoint identity, if known.
+    pub fn control_endpoint_id(&self) -> Option<&str> {
+        self.control_endpoint_id.as_deref()
+    }
+
+    /// Update the cached control endpoint identity.
+    pub fn set_control_endpoint_id(&mut self, control_endpoint_id: Option<String>) {
+        self.control_endpoint_id = control_endpoint_id;
+    }
+
     /// Returns the number of active dynamic listeners currently tracked.
     pub fn listener_count(&self) -> usize {
         self.listener_pool.len()
+    }
+
+    /// Return the local endpoint id used by this edge's outbound pool.
+    pub fn local_endpoint_id(&self) -> String {
+        self.connection_pool.local_endpoint_id()
+    }
+
+    /// Clone the outbound connection pool for read-only status inspection.
+    pub fn connection_pool(&self) -> Arc<ConnectionPool> {
+        Arc::clone(&self.connection_pool)
     }
 
     /// Apply a route table update if the version is newer than the cached one.
@@ -996,6 +1083,22 @@ impl EdgeNode {
         }
         self.apply_route_update_inner(routes, version, config).await;
         true
+    }
+
+    /// Drop all cached routes and dynamic listeners.
+    pub async fn purge_route_cache(&mut self) {
+        replace_shared_routes(&self.shared_routes, &HashMap::new());
+        self.cached_routes.clear();
+        self.route_version = 0;
+
+        let listener_handles = self
+            .listener_pool
+            .drain()
+            .map(|(_, handle)| handle)
+            .collect::<Vec<_>>();
+        for handle in listener_handles {
+            abort_listener(handle).await;
+        }
     }
 
     async fn apply_route_update_inner(
@@ -1056,9 +1159,10 @@ impl EdgeNode {
 
     /// Persist the cached route table and version to disk atomically.
     pub async fn save_route_cache(&self, data_dir: &Path) -> Result<(), PersistenceError> {
-        let cache = RouteCache {
+        let cache = PersistedRouteCache {
             routes: self.cached_routes.clone(),
             version: self.route_version,
+            control_endpoint_id: self.control_endpoint_id.clone(),
         };
         let path = data_dir.join("route_cache.json");
         persistence::save_atomic(&path, &cache).await
@@ -1067,10 +1171,10 @@ impl EdgeNode {
     /// Load a previously persisted route cache from disk.
     ///
     /// Returns `None` if the file does not exist.
-    pub fn load_route_cache(data_dir: &Path) -> Option<(HashMap<u16, RouteEntry>, u64)> {
+    pub(crate) fn load_route_cache(data_dir: &Path) -> Option<PersistedRouteCache> {
         let path = data_dir.join("route_cache.json");
-        match persistence::load_state::<RouteCache>(&path) {
-            Ok(Some(cache)) => Some((cache.routes, cache.version)),
+        match persistence::load_state::<PersistedRouteCache>(&path) {
+            Ok(Some(cache)) => Some(cache),
             Ok(None) => None,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to load route cache, starting fresh");
@@ -1082,15 +1186,17 @@ impl EdgeNode {
 
 /// Serializable wrapper for the route cache on disk.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct RouteCache {
-    routes: HashMap<u16, RouteEntry>,
-    version: u64,
+pub(crate) struct PersistedRouteCache {
+    pub routes: HashMap<u16, RouteEntry>,
+    pub version: u64,
+    pub control_endpoint_id: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::fs;
 
     use anyhow::{Context, Result};
     use iroh::address_lookup::memory::MemoryLookup;
@@ -1292,6 +1398,35 @@ mod tests {
 
         edge.record_ping(2000);
         assert_eq!(edge.last_ping_from_control(), Some(2000));
+    }
+
+    #[test]
+    fn test_record_peer_connections_tracks_unique_peer_ids() {
+        let mut edge = EdgeNode::new();
+
+        edge.record_peer_connected("control-1");
+        edge.record_peer_connected("control-1");
+        edge.record_peer_connected("edge-2");
+
+        let mut tracked_peer_ids = edge.tracked_peer_ids();
+        tracked_peer_ids.sort();
+        assert_eq!(
+            tracked_peer_ids,
+            vec!["control-1".to_string(), "edge-2".to_string()]
+        );
+
+        edge.record_peer_disconnected("control-1");
+        let mut tracked_peer_ids = edge.tracked_peer_ids();
+        tracked_peer_ids.sort();
+        assert_eq!(
+            tracked_peer_ids,
+            vec!["control-1".to_string(), "edge-2".to_string()]
+        );
+
+        edge.record_peer_disconnected("control-1");
+        let mut tracked_peer_ids = edge.tracked_peer_ids();
+        tracked_peer_ids.sort();
+        assert_eq!(tracked_peer_ids, vec!["edge-2".to_string()]);
     }
 
     #[test]
@@ -1527,6 +1662,85 @@ mod tests {
         for (_, handle) in edge.listener_pool.drain() {
             handle.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn test_purge_route_cache_clears_routes_and_resets_version() {
+        let port = available_tcp_port();
+        let mut edge = EdgeNode::new();
+        let config = test_config(Vec::new());
+
+        edge.set_control_endpoint_id(Some("control-a".to_string()));
+        assert!(
+            edge.apply_route_update(
+                HashMap::from([(port, test_route("alpha", "endpoint-a"))]),
+                7,
+                Arc::clone(&config),
+            )
+            .await
+        );
+        assert_eq!(edge.listener_count(), 1);
+
+        edge.purge_route_cache().await;
+
+        assert!(edge.cached_routes().is_empty());
+        assert_eq!(edge.route_version(), 0);
+        assert_eq!(edge.control_endpoint_id(), Some("control-a"));
+        assert_eq!(edge.listener_count(), 0);
+        assert_tcp_listener_stopped(port).await;
+    }
+
+    #[tokio::test]
+    async fn test_route_cache_roundtrip_preserves_control_endpoint_id() -> Result<()> {
+        let tempdir = tempfile::tempdir_in("/tmp")?;
+        let mut edge = EdgeNode::new();
+
+        edge.update_routes(
+            HashMap::from([(41000, test_route("alpha", "endpoint-a"))]),
+            11,
+        );
+        edge.set_control_endpoint_id(Some("control-a".to_string()));
+        edge.save_route_cache(tempdir.path()).await?;
+
+        let cache = EdgeNode::load_route_cache(tempdir.path())
+            .context("route cache should be present after save")?;
+        assert_eq!(cache.version, 11);
+        assert_eq!(cache.control_endpoint_id.as_deref(), Some("control-a"));
+        assert_eq!(
+            cache.routes.get(&41000),
+            Some(&test_route("alpha", "endpoint-a"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_route_cache_accepts_legacy_format_without_control_identity() {
+        let tempdir = tempfile::tempdir_in("/tmp").unwrap();
+        let path = tempdir.path().join("route_cache.json");
+        let legacy_cache = serde_json::json!({
+            "routes": {
+                "41000": {
+                    "service_name": "alpha",
+                    "node_name": "edge-a",
+                "endpoint_id": "endpoint-a",
+                "target_local_addr": "127.0.0.1:8080",
+                    "protocol": "tcp"
+                }
+            },
+            "version": 3
+        });
+
+        fs::create_dir_all(tempdir.path()).unwrap();
+        fs::write(&path, serde_json::to_vec(&legacy_cache).unwrap()).unwrap();
+
+        let cache = EdgeNode::load_route_cache(tempdir.path())
+            .expect("legacy route cache should deserialize");
+        assert_eq!(cache.version, 3);
+        assert_eq!(cache.control_endpoint_id, None);
+        assert_eq!(
+            cache.routes.get(&41000),
+            Some(&test_route("alpha", "endpoint-a"))
+        );
     }
 
     #[tokio::test]

@@ -19,10 +19,12 @@ pub enum Protocol {
 pub struct MeshConfig {
     pub node_name: String,
     pub role: NodeRole,
-    /// Secret key bytes (base58-encoded Ed25519 seed), persisted across restarts.
-    pub secret_key: Option<String>,
     /// For edge nodes: the control node's endpoint address (serialized).
     pub control_addr: Option<String>,
+    /// For control nodes: also expose managed routes on localhost.
+    /// Requires daemon restart to take effect.
+    #[serde(default)]
+    pub enable_local_proxy: bool,
     /// Optional bind address for the local health query HTTP endpoint.
     #[serde(default)]
     pub health_bind: Option<String>,
@@ -70,8 +72,8 @@ impl Default for MeshConfig {
                 .map(|h| h.to_string_lossy().into_owned())
                 .unwrap_or_else(|_| "unnamed".to_string()),
             role: NodeRole::Edge,
-            secret_key: None,
             control_addr: None,
+            enable_local_proxy: false,
             health_bind: None,
             services: Vec::new(),
             data_dir: default_data_dir(),
@@ -138,7 +140,7 @@ impl MeshConfig {
         std::fs::write(&tmp_path, content.as_bytes())
             .with_context(|| format!("failed to write temp config at {}", tmp_path.display()))?;
 
-        // Set restrictive permissions (config may contain secret_key).
+        // Keep config private to the current user.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -174,8 +176,8 @@ mod tests {
         MeshConfig {
             node_name: "test-node".to_string(),
             role: NodeRole::Control,
-            secret_key: Some("5HueCGU8rMjxEXxiPuD5BDku4MkFqeZyd4dZ1jvhTVqvbTLvyTJ".to_string()),
             control_addr: None,
+            enable_local_proxy: true,
             health_bind: None,
             services: vec![ServiceEntry {
                 name: "llama3_api".to_string(),
@@ -208,19 +210,38 @@ mod tests {
         let config = MeshConfig::load(&path).unwrap();
         assert!(path.exists());
         assert_eq!(config.role, NodeRole::Edge);
-        assert!(config.secret_key.is_none());
     }
 
     #[test]
     fn test_mesh_config_is_default() {
         let config = MeshConfig::default();
         assert!(config.is_default());
+        assert!(!config.enable_local_proxy);
 
         let modified = MeshConfig {
             role: NodeRole::Control,
             ..Default::default()
         };
         assert!(!modified.is_default());
+    }
+
+    #[test]
+    fn test_config_load_defaults_enable_local_proxy_to_false() {
+        let dir = writable_tempdir();
+        let path = dir.path().join("config.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+node_name = "control"
+role = "control"
+data_dir = "/tmp/mesh-test"
+"#,
+        )
+        .unwrap();
+
+        let loaded = MeshConfig::load(&path).unwrap();
+        assert!(!loaded.enable_local_proxy);
     }
 
     #[test]
