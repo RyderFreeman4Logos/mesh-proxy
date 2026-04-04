@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,7 +8,8 @@ use mesh_core::edge_registration::run_registration_loop;
 use mesh_core::{ControlNode, Daemon, EdgeNode, run_accept_loop};
 use mesh_proto::{
     ALPN_CONTROL, DEFAULT_SERVICE_QUOTA, IpcRequest, IpcResponse, JoinTicket, MeshConfig, NodeInfo,
-    NodeRole, Protocol, ServiceEntry, ServiceRegistration, frame,
+    NodeRole, Protocol, RouteEntry, ServiceEntry, ServiceRegistration, ServiceStatus, StatusInfo,
+    frame,
 };
 use tempfile::Builder;
 use tokio::net::UnixStream;
@@ -63,13 +65,14 @@ fn make_service_registration(name: &str, local_addr: &str) -> ServiceRegistratio
     }
 }
 
-fn make_edge_config(
+fn make_named_edge_config(
+    node_name: &str,
     control_addr: String,
     data_dir: std::path::PathBuf,
     services: Vec<ServiceEntry>,
 ) -> MeshConfig {
     MeshConfig {
-        node_name: "edge-alpha".to_string(),
+        node_name: node_name.to_string(),
         role: NodeRole::Edge,
         control_addr: Some(control_addr),
         enable_local_proxy: false,
@@ -77,6 +80,14 @@ fn make_edge_config(
         services,
         data_dir,
     }
+}
+
+fn make_edge_config(
+    control_addr: String,
+    data_dir: std::path::PathBuf,
+    services: Vec<ServiceEntry>,
+) -> MeshConfig {
+    make_named_edge_config("edge-alpha", control_addr, data_dir, services)
 }
 
 async fn send_ipc_request(
@@ -147,6 +158,88 @@ async fn wait_for_route_cache_control_identity(
     })
     .await
     .context("timed out waiting for persisted control identity change")
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct RouteCacheSnapshot {
+    routes: HashMap<u16, RouteEntry>,
+    version: u64,
+    control_endpoint_id: Option<String>,
+}
+
+fn load_route_cache_snapshot(data_dir: &std::path::Path) -> Option<RouteCacheSnapshot> {
+    let route_cache_path = data_dir.join("route_cache.json");
+    let route_cache_json = std::fs::read_to_string(route_cache_path).ok()?;
+    serde_json::from_str(&route_cache_json).ok()
+}
+
+async fn wait_for_route_cache(
+    data_dir: &std::path::Path,
+    mut predicate: impl FnMut(&RouteCacheSnapshot) -> bool,
+) -> Result<RouteCacheSnapshot> {
+    let data_dir = data_dir.to_path_buf();
+    timeout(Duration::from_secs(5), async move {
+        loop {
+            if let Some(route_cache) = load_route_cache_snapshot(&data_dir)
+                && predicate(&route_cache)
+            {
+                return route_cache;
+            }
+
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .context("timed out waiting for route cache condition")
+}
+
+async fn wait_for_route_cache_service(
+    data_dir: &std::path::Path,
+    service_name: &str,
+    minimum_version: u64,
+) -> Result<(u16, RouteEntry)> {
+    let route_cache = wait_for_route_cache(data_dir, |route_cache| {
+        route_cache.version >= minimum_version
+            && route_cache
+                .routes
+                .values()
+                .any(|route| route.service_name == service_name)
+    })
+    .await?;
+
+    let (assigned_port, route) = route_cache
+        .routes
+        .iter()
+        .find(|(_, route)| route.service_name == service_name)
+        .context("route cache should contain the requested service")?;
+
+    Ok((*assigned_port, route.clone()))
+}
+
+async fn read_status(socket_path: &std::path::Path) -> Result<StatusInfo> {
+    match send_ipc_request(socket_path, &IpcRequest::Status).await? {
+        IpcResponse::Status(status) => Ok(status),
+        other => anyhow::bail!("expected status response, got {other:?}"),
+    }
+}
+
+async fn wait_for_status(
+    socket_path: &std::path::Path,
+    mut predicate: impl FnMut(&StatusInfo) -> bool,
+) -> Result<StatusInfo> {
+    let socket_path = socket_path.to_path_buf();
+    timeout(Duration::from_secs(5), async move {
+        loop {
+            let status = read_status(&socket_path).await?;
+            if predicate(&status) {
+                return Ok(status);
+            }
+
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .context("timed out waiting for status condition")?
 }
 
 struct RegistrationHarness {
@@ -332,6 +425,22 @@ impl ControlRegistrationHarness {
         control.add_node(make_whitelist_node(endpoint_id.to_owned(), node_name));
     }
 
+    async fn seed_services(
+        &self,
+        endpoint_id: &str,
+        node_name: &str,
+        services: &[ServiceRegistration],
+        now_epoch: u64,
+    ) -> Result<()> {
+        let mut control = self.control_node.write().await;
+        control.add_node(make_whitelist_node(endpoint_id.to_owned(), node_name));
+        control
+            .register_services(endpoint_id, node_name, services, now_epoch)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("failed to seed control routes for {node_name}"))?;
+        Ok(())
+    }
+
     async fn wait_for_control_route(&self, service_name: &str, minimum_version: u64) {
         loop {
             let ready = {
@@ -361,6 +470,97 @@ impl ControlRegistrationHarness {
             .context("accept loop panicked")?;
 
         Ok(())
+    }
+}
+
+struct EdgeDaemonHarness {
+    _tempdir: tempfile::TempDir,
+    config_path: std::path::PathBuf,
+    data_dir: std::path::PathBuf,
+    socket_path: std::path::PathBuf,
+    shutdown_tx: broadcast::Sender<()>,
+    handle: JoinHandle<Result<()>>,
+}
+
+impl EdgeDaemonHarness {
+    async fn start(
+        node_name: &str,
+        control_addr: String,
+        services: Vec<ServiceEntry>,
+    ) -> Result<Self> {
+        let tempdir = writable_tempdir("mesh-core-phase6-daemon-edge-");
+        let config_path = tempdir.path().join("config.toml");
+        let config = make_named_edge_config(
+            node_name,
+            control_addr,
+            tempdir.path().join("data"),
+            services,
+        );
+        config.save(&config_path)?;
+
+        let socket_path = config.data_dir.join("daemon.sock");
+        let data_dir = config.data_dir.clone();
+        let mut daemon = Daemon::new_without_startup_signal(config, config_path.clone());
+        let shutdown_tx = daemon.shutdown_tx().clone();
+        let handle = tokio::spawn(async move { daemon.run().await });
+
+        Ok(Self {
+            _tempdir: tempdir,
+            config_path,
+            data_dir,
+            socket_path,
+            shutdown_tx,
+            handle,
+        })
+    }
+
+    async fn wait_for_join_ticket(&self) -> Result<JoinTicket> {
+        wait_for_join_ticket(&self.data_dir).await
+    }
+
+    async fn send_request(&self, request: &IpcRequest) -> Result<IpcResponse> {
+        send_ipc_request(&self.socket_path, request).await
+    }
+
+    async fn wait_for_service_status(
+        &self,
+        service_name: &str,
+        node_name: &str,
+        minimum_version: u64,
+    ) -> Result<ServiceStatus> {
+        let status = wait_for_status(&self.socket_path, |status| {
+            status.route_table_version >= minimum_version
+                && status
+                    .services
+                    .iter()
+                    .any(|service| service.name == service_name && service.node_name == node_name)
+        })
+        .await?;
+
+        status
+            .services
+            .into_iter()
+            .find(|service| service.name == service_name && service.node_name == node_name)
+            .context("status should contain the requested service")
+    }
+
+    async fn update_control_addr_and_reload(&self, control_addr: String) -> Result<()> {
+        let mut config = MeshConfig::load(&self.config_path)?;
+        config.control_addr = Some(control_addr);
+        config.save(&self.config_path)?;
+
+        match self.send_request(&IpcRequest::Reload).await? {
+            IpcResponse::Reloaded => Ok(()),
+            other => anyhow::bail!("expected reload response, got {other:?}"),
+        }
+    }
+
+    async fn shutdown(self) -> Result<()> {
+        let _ = self.shutdown_tx.send(());
+        timeout(Duration::from_secs(10), self.handle)
+            .await
+            .context("daemon task did not exit in time")?
+            .context("daemon task panicked")?
     }
 }
 
@@ -773,6 +973,124 @@ async fn test_ipc_expose_returns_assigned_port_after_reregistration() -> Result<
 }
 
 #[tokio::test]
+async fn test_ipc_expose_propagates_routes_end_to_end() -> Result<()> {
+    timeout(Duration::from_secs(30), async {
+        let control = ControlRegistrationHarness::start().await?;
+        let control_addr = control.control_addr()?;
+        let mut edge_one = Some(
+            EdgeDaemonHarness::start(
+                "edge-one",
+                control_addr.clone(),
+                vec![make_service_entry("edge-one-api", "127.0.0.1:18080")],
+            )
+            .await?,
+        );
+        let mut edge_two = Some(
+            EdgeDaemonHarness::start(
+                "edge-two",
+                control_addr,
+                vec![make_service_entry("edge-two-api", "127.0.0.1:28080")],
+            )
+            .await?,
+        );
+
+        let test_result: Result<()> = async {
+            let edge_one_daemon = edge_one.as_ref().context("edge-one daemon missing")?;
+            let edge_two_daemon = edge_two.as_ref().context("edge-two daemon missing")?;
+
+            let edge_one_ticket = edge_one_daemon.wait_for_join_ticket().await?;
+            control
+                .allow_edge(&edge_one_ticket.endpoint_id, "edge-one")
+                .await;
+            control.wait_for_control_route("edge-one-api", 1).await;
+            edge_one_daemon
+                .wait_for_service_status("edge-one-api", "edge-one", 1)
+                .await?;
+
+            let edge_two_ticket = edge_two_daemon.wait_for_join_ticket().await?;
+            control
+                .allow_edge(&edge_two_ticket.endpoint_id, "edge-two")
+                .await;
+            control.wait_for_control_route("edge-two-api", 2).await;
+            edge_two_daemon
+                .wait_for_service_status("edge-one-api", "edge-one", 2)
+                .await?;
+
+            let initial_route_version = control.control_node.read().await.route_version();
+
+            let response = edge_one_daemon
+                .send_request(&IpcRequest::ExposeService {
+                    name: "edge-one-admin".to_string(),
+                    local_addr: "127.0.0.1:19090".to_string(),
+                    protocol: Protocol::Tcp,
+                    health_check: None,
+                })
+                .await?;
+            let IpcResponse::ServiceExposed {
+                name,
+                assigned_port,
+            } = response
+            else {
+                anyhow::bail!("expected service exposed response");
+            };
+            assert_eq!(name, "edge-one-admin");
+
+            control
+                .wait_for_control_route("edge-one-admin", initial_route_version + 1)
+                .await;
+
+            let propagated_service = edge_two_daemon
+                .wait_for_service_status("edge-one-admin", "edge-one", initial_route_version + 1)
+                .await?;
+            assert_eq!(propagated_service.assigned_port, Some(assigned_port));
+
+            let control_assigned_port = {
+                let control_node = control.control_node.read().await;
+                control_node
+                    .routes()
+                    .iter()
+                    .find_map(|(port, route)| {
+                        (route.service_name == "edge-one-admin").then_some(*port)
+                    })
+                    .context("control should publish the newly exposed service")?
+            };
+            assert_eq!(assigned_port, control_assigned_port);
+
+            let (cached_port, cached_route) = wait_for_route_cache_service(
+                &edge_one_daemon.data_dir,
+                "edge-one-admin",
+                initial_route_version + 1,
+            )
+            .await?;
+            assert_eq!(cached_port, assigned_port);
+            assert_eq!(cached_route.endpoint_id, edge_one_ticket.endpoint_id);
+            assert_eq!(cached_route.node_name, "edge-one");
+            assert_eq!(cached_route.target_local_addr, "127.0.0.1:19090");
+
+            Ok(())
+        }
+        .await;
+
+        let edge_one_shutdown = match edge_one.take() {
+            Some(edge_one_daemon) => edge_one_daemon.shutdown().await,
+            None => Ok(()),
+        };
+        let edge_two_shutdown = match edge_two.take() {
+            Some(edge_two_daemon) => edge_two_daemon.shutdown().await,
+            None => Ok(()),
+        };
+        let control_shutdown = control.shutdown().await;
+
+        edge_one_shutdown?;
+        edge_two_shutdown?;
+        control_shutdown?;
+        test_result
+    })
+    .await
+    .context("IPC expose propagation end-to-end integration test timed out")?
+}
+
+#[tokio::test]
 async fn test_edge_registration_reconnects_after_control_addr_change() -> Result<()> {
     timeout(Duration::from_secs(20), async {
         let control_a = ControlRegistrationHarness::start().await?;
@@ -838,4 +1156,165 @@ async fn test_edge_registration_reconnects_after_control_addr_change() -> Result
     })
     .await
     .context("control target reload integration test timed out")?
+}
+
+#[tokio::test]
+async fn test_runtime_control_identity_rotation_reconnects_edges() -> Result<()> {
+    timeout(Duration::from_secs(30), async {
+        let mut control_a = Some(ControlRegistrationHarness::start().await?);
+        let initial_control_addr = control_a
+            .as_ref()
+            .context("initial control harness missing")?
+            .control_addr()?;
+        let mut control_b = None;
+        let mut edge = Some(
+            EdgeDaemonHarness::start(
+                "edge-rotating",
+                initial_control_addr,
+                vec![make_service_entry("echo", "127.0.0.1:18080")],
+            )
+            .await?,
+        );
+
+        let test_result: Result<()> = async {
+            let edge_daemon = edge.as_ref().context("edge daemon missing")?;
+            let initial_control = control_a
+                .as_ref()
+                .context("initial control harness missing")?;
+            initial_control
+                .seed_services(
+                    "seed-control-a",
+                    "seed-a",
+                    &[make_service_registration("legacy-api", "127.0.0.1:28080")],
+                    1_700_000_001,
+                )
+                .await?;
+
+            let edge_ticket = edge_daemon.wait_for_join_ticket().await?;
+            initial_control
+                .allow_edge(&edge_ticket.endpoint_id, "edge-rotating")
+                .await;
+            initial_control.wait_for_control_route("echo", 2).await;
+            edge_daemon
+                .wait_for_service_status("legacy-api", "seed-a", 2)
+                .await?;
+
+            let control_a_endpoint_id = initial_control.control_endpoint.id().to_string();
+            wait_for_route_cache_control_identity(&edge_daemon.data_dir, &control_a_endpoint_id)
+                .await?;
+
+            control_a
+                .take()
+                .context("initial control harness missing during shutdown")?
+                .shutdown()
+                .await?;
+
+            let replacement_control = ControlRegistrationHarness::start().await?;
+            let control_b_endpoint_id = replacement_control.control_endpoint.id().to_string();
+            replacement_control
+                .seed_services(
+                    "seed-control-b",
+                    "seed-b",
+                    &[make_service_registration("fresh-api", "127.0.0.1:38080")],
+                    1_700_000_002,
+                )
+                .await?;
+            replacement_control
+                .allow_edge(&edge_ticket.endpoint_id, "edge-rotating")
+                .await;
+            let replacement_control_addr = replacement_control.control_addr()?;
+            control_b = Some(replacement_control);
+
+            edge_daemon
+                .update_control_addr_and_reload(replacement_control_addr)
+                .await?;
+
+            let replacement_control = control_b
+                .as_ref()
+                .context("replacement control harness missing")?;
+            replacement_control.wait_for_control_route("echo", 2).await;
+
+            let refreshed_status = wait_for_status(&edge_daemon.socket_path, |status| {
+                status.route_table_version >= 2
+                    && status
+                        .services
+                        .iter()
+                        .any(|service| service.name == "fresh-api" && service.node_name == "seed-b")
+                    && status.services.iter().any(|service| {
+                        service.name == "echo" && service.node_name == "edge-rotating"
+                    })
+                    && status
+                        .services
+                        .iter()
+                        .all(|service| service.name != "legacy-api")
+            })
+            .await?;
+            assert!(
+                refreshed_status
+                    .services
+                    .iter()
+                    .all(|service| service.name != "legacy-api"),
+                "edge should purge legacy routes from the old control"
+            );
+
+            let refreshed_cache = wait_for_route_cache(&edge_daemon.data_dir, |route_cache| {
+                route_cache.control_endpoint_id.as_deref() == Some(control_b_endpoint_id.as_str())
+                    && route_cache.routes.values().any(|route| {
+                        route.service_name == "fresh-api" && route.node_name == "seed-b"
+                    })
+                    && route_cache.routes.values().any(|route| {
+                        route.service_name == "echo" && route.endpoint_id == edge_ticket.endpoint_id
+                    })
+                    && route_cache
+                        .routes
+                        .values()
+                        .all(|route| route.service_name != "legacy-api")
+            })
+            .await?;
+            assert_eq!(
+                refreshed_cache.control_endpoint_id.as_deref(),
+                Some(control_b_endpoint_id.as_str())
+            );
+            wait_for_route_cache_control_identity(&edge_daemon.data_dir, &control_b_endpoint_id)
+                .await?;
+
+            let replacement_control = replacement_control.control_node.read().await;
+            assert!(
+                replacement_control.routes().values().any(|route| {
+                    route.service_name == "echo" && route.endpoint_id == edge_ticket.endpoint_id
+                }),
+                "replacement control should publish the reconnected edge route"
+            );
+            assert!(
+                replacement_control
+                    .routes()
+                    .values()
+                    .any(|route| route.service_name == "fresh-api" && route.node_name == "seed-b"),
+                "replacement control should keep its own fresh routes"
+            );
+
+            Ok(())
+        }
+        .await;
+
+        let edge_shutdown = match edge.take() {
+            Some(edge_daemon) => edge_daemon.shutdown().await,
+            None => Ok(()),
+        };
+        let control_a_shutdown = match control_a.take() {
+            Some(initial_control) => initial_control.shutdown().await,
+            None => Ok(()),
+        };
+        let control_b_shutdown = match control_b.take() {
+            Some(replacement_control) => replacement_control.shutdown().await,
+            None => Ok(()),
+        };
+
+        edge_shutdown?;
+        control_a_shutdown?;
+        control_b_shutdown?;
+        test_result
+    })
+    .await
+    .context("runtime control identity rotation integration test timed out")?
 }
