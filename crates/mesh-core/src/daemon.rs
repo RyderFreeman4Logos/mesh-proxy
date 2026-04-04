@@ -226,6 +226,9 @@ impl Daemon {
         let pid_path = self.pid_path();
         let (config_tx, mut config_rx) = mpsc::channel(8);
         let port_assignment_notifier = PortAssignmentNotifier::default();
+        let shared_runtime_config = Arc::new(tokio::sync::RwLock::new(self.config.clone()));
+        let ipc_service_refresh_tx =
+            (self.config.role == NodeRole::Edge).then(|| watch::channel(()).0);
 
         // Start IPC server
         let ipc_server = crate::ipc_server::IpcServer::bind_with_port_assignment_notifier(
@@ -233,8 +236,12 @@ impl Daemon {
             self.shutdown_tx.clone(),
             self.config.clone(),
             self.config_path.clone(),
-            config_tx.clone(),
-            port_assignment_notifier.clone(),
+            crate::ipc_server::IpcServerRuntimeDeps {
+                runtime_config: Arc::clone(&shared_runtime_config),
+                reload_tx: config_tx.clone(),
+                service_refresh_tx: ipc_service_refresh_tx.clone(),
+                port_assignment_notifier: port_assignment_notifier.clone(),
+            },
         )
         .await?;
         let ipc_status = ipc_server.status_handle();
@@ -281,7 +288,7 @@ impl Daemon {
             registration_handle,
         ) = match self.config.role {
             NodeRole::Control => {
-                let runtime_config = Arc::new(tokio::sync::RwLock::new(self.config.clone()));
+                let runtime_config = Arc::clone(&shared_runtime_config);
                 let cn = Arc::new(tokio::sync::RwLock::new(ControlNode::load_from_disk(
                     &self.config.data_dir,
                 )));
@@ -316,7 +323,7 @@ impl Daemon {
                 )
             }
             NodeRole::Edge => {
-                let runtime_config = Arc::new(tokio::sync::RwLock::new(self.config.clone()));
+                let runtime_config = Arc::clone(&shared_runtime_config);
                 let shared_runtime_config = Arc::clone(&runtime_config);
                 let en = Arc::new(tokio::sync::RwLock::new(EdgeNode::with_endpoint(
                     mesh_node.endpoint().clone(),
@@ -343,7 +350,10 @@ impl Daemon {
                 let config_watcher =
                     ConfigWatcher::new(self.config_path.clone(), config_tx.clone())?;
                 info!(path = %self.config_path.display(), "config watcher started");
-                let (svc_tx, svc_rx) = watch::channel(());
+                let svc_tx = ipc_service_refresh_tx.clone().context(
+                    "edge service change channel should be initialized before IPC startup",
+                )?;
+                let svc_rx = svc_tx.subscribe();
                 let (control_target_tx, control_target_rx) =
                     watch::channel(self.config.control_addr.clone());
                 let edge_registration_runtime = EdgeRegistrationRuntime {
@@ -1383,8 +1393,12 @@ mod tests {
                 ipc_shutdown_tx.clone(),
                 initial_config.clone(),
                 config_path.clone(),
-                reload_tx,
-                port_assignment_notifier,
+                crate::ipc_server::IpcServerRuntimeDeps {
+                    runtime_config: Arc::clone(&runtime_config),
+                    reload_tx,
+                    service_refresh_tx: Some(service_change_tx.clone()),
+                    port_assignment_notifier,
+                },
             )
             .await?;
             ipc_server.attach_edge_node(Arc::clone(&edge_node)).await;

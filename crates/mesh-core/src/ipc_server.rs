@@ -12,7 +12,7 @@ use mesh_proto::{
     StatusInfo,
 };
 use tokio::net::{TcpStream, UnixListener, UnixStream};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task;
 use tokio::time::timeout;
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
@@ -75,12 +75,22 @@ pub(crate) enum NodeState {
 struct SharedState {
     shutdown_tx: ShutdownTx,
     config: MeshConfig,
+    runtime_config: Arc<tokio::sync::RwLock<MeshConfig>>,
     config_path: PathBuf,
     reload_tx: mpsc::Sender<()>,
+    service_refresh_tx: Option<watch::Sender<()>>,
     port_assignment_notifier: PortAssignmentNotifier,
     expose_assignment_timeout: Duration,
     runtime: Arc<RwLock<MeshRuntimeState>>,
     node_state: Arc<tokio::sync::RwLock<NodeState>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct IpcServerRuntimeDeps {
+    pub(crate) runtime_config: Arc<tokio::sync::RwLock<MeshConfig>>,
+    pub(crate) reload_tx: mpsc::Sender<()>,
+    pub(crate) service_refresh_tx: Option<watch::Sender<()>>,
+    pub(crate) port_assignment_notifier: PortAssignmentNotifier,
 }
 
 /// Unix domain socket IPC server for CLI-daemon communication.
@@ -98,13 +108,18 @@ impl IpcServer {
         config_path: PathBuf,
         reload_tx: mpsc::Sender<()>,
     ) -> Result<Self> {
+        let runtime = IpcServerRuntimeDeps {
+            runtime_config: Arc::new(tokio::sync::RwLock::new(config.clone())),
+            reload_tx,
+            service_refresh_tx: None,
+            port_assignment_notifier: PortAssignmentNotifier::default(),
+        };
         Self::bind_with_port_assignment_notifier(
             socket_path,
             shutdown_tx,
             config,
             config_path,
-            reload_tx,
-            PortAssignmentNotifier::default(),
+            runtime,
         )
         .await
     }
@@ -114,8 +129,7 @@ impl IpcServer {
         shutdown_tx: ShutdownTx,
         config: MeshConfig,
         config_path: PathBuf,
-        reload_tx: mpsc::Sender<()>,
-        port_assignment_notifier: PortAssignmentNotifier,
+        runtime: IpcServerRuntimeDeps,
     ) -> Result<Self> {
         if socket_path.exists() {
             std::fs::remove_file(socket_path)?;
@@ -131,9 +145,11 @@ impl IpcServer {
         let state = Arc::new(SharedState {
             shutdown_tx,
             config,
+            runtime_config: runtime.runtime_config,
             config_path,
-            reload_tx,
-            port_assignment_notifier,
+            reload_tx: runtime.reload_tx,
+            service_refresh_tx: runtime.service_refresh_tx,
+            port_assignment_notifier: runtime.port_assignment_notifier,
             expose_assignment_timeout: EXPOSE_ASSIGNMENT_TIMEOUT,
             runtime: Arc::new(RwLock::new(MeshRuntimeState::default())),
             node_state: Arc::new(tokio::sync::RwLock::new(NodeState::Uninit)),
@@ -602,11 +618,24 @@ async fn handle_expose_service(
         .iter()
         .any(|service| service == &requested_service)
     {
+        // Only bypass reload when the daemon has already loaded the same
+        // service set into its live runtime config.
+        let runtime_config_matches = {
+            let runtime_config = state.runtime_config.read().await;
+            runtime_config
+                .services
+                .iter()
+                .any(|service| service == &requested_service)
+        };
+
         return match current_assigned_port(state, &requested_service).await {
             Some(assigned_port) => IpcResponse::ServiceExposed {
                 name: name.to_owned(),
                 assigned_port,
             },
+            None if runtime_config_matches => {
+                trigger_service_refresh_and_wait_for_port_assignment(state, name).await
+            }
             None => trigger_reload_and_wait_for_port_assignment(state, name).await,
         };
     }
@@ -933,12 +962,33 @@ async fn trigger_reload_and_wait_for_port_assignment(
         };
     }
 
-    match wait_for_port_assignment(
-        service_name,
-        &mut assignment_rx,
-        state.expose_assignment_timeout,
-    )
-    .await
+    wait_for_port_assignment_response(state, service_name, &mut assignment_rx).await
+}
+
+async fn trigger_service_refresh_and_wait_for_port_assignment(
+    state: &SharedState,
+    service_name: &str,
+) -> IpcResponse {
+    let mut assignment_rx = state.port_assignment_notifier.subscribe(service_name);
+    let Some(service_refresh_tx) = state.service_refresh_tx.as_ref() else {
+        return IpcResponse::Error {
+            message: format!(
+                "failed to trigger service refresh after expose request for '{service_name}'"
+            ),
+        };
+    };
+
+    service_refresh_tx.send_replace(());
+    wait_for_port_assignment_response(state, service_name, &mut assignment_rx).await
+}
+
+async fn wait_for_port_assignment_response(
+    state: &SharedState,
+    service_name: &str,
+    assignment_rx: &mut broadcast::Receiver<u16>,
+) -> IpcResponse {
+    match wait_for_port_assignment(service_name, assignment_rx, state.expose_assignment_timeout)
+        .await
     {
         Ok(assigned_port) => IpcResponse::ServiceExposed {
             name: service_name.to_owned(),
@@ -1040,10 +1090,22 @@ mod tests {
         ServiceDisplayStatus, ServiceEntry, ServiceRegistration,
     };
     use tempfile::Builder;
-    use tokio::sync::{broadcast, mpsc};
+    use tokio::sync::{broadcast, mpsc, watch};
     use tokio::time::timeout;
 
     fn shared_state(role: NodeRole) -> (SharedState, tempfile::TempDir, mpsc::Receiver<()>) {
+        let (state, dir, reload_rx, _service_refresh_rx) = shared_state_with_channels(role);
+        (state, dir, reload_rx)
+    }
+
+    fn shared_state_with_channels(
+        role: NodeRole,
+    ) -> (
+        SharedState,
+        tempfile::TempDir,
+        mpsc::Receiver<()>,
+        Option<watch::Receiver<()>>,
+    ) {
         let dir = Builder::new()
             .prefix("mesh-core-ipc-")
             .tempdir_in("/tmp")
@@ -1058,18 +1120,27 @@ mod tests {
 
         let (shutdown_tx, _) = broadcast::channel(1);
         let (reload_tx, reload_rx) = mpsc::channel(4);
+        let (service_refresh_tx, service_refresh_rx) = if role == NodeRole::Edge {
+            let (tx, rx) = watch::channel(());
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        let runtime_config = Arc::new(tokio::sync::RwLock::new(config.clone()));
         let state = SharedState {
             shutdown_tx,
             config,
+            runtime_config,
             config_path,
             reload_tx,
+            service_refresh_tx,
             port_assignment_notifier: PortAssignmentNotifier::default(),
             expose_assignment_timeout: Duration::from_millis(200),
             runtime: Arc::new(RwLock::new(MeshRuntimeState::default())),
             node_state: Arc::new(tokio::sync::RwLock::new(NodeState::Uninit)),
         };
 
-        (state, dir, reload_rx)
+        (state, dir, reload_rx, service_refresh_rx)
     }
 
     #[tokio::test]
@@ -1508,7 +1579,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_expose_service_retries_unchanged_config_until_port_assignment_arrives() {
-        let (state, _dir, mut reload_rx) = shared_state(NodeRole::Edge);
+        let (state, _dir, mut reload_rx, service_refresh_rx) =
+            shared_state_with_channels(NodeRole::Edge);
+        let mut service_refresh_rx =
+            service_refresh_rx.expect("edge state should expose a service refresh receiver");
         let service = ServiceEntry {
             name: "web".to_string(),
             local_addr: "127.0.0.1:8080".to_string(),
@@ -1521,6 +1595,10 @@ mod tests {
         }
         .save(&state.config_path)
         .unwrap();
+        *state.runtime_config.write().await = MeshConfig {
+            services: vec![service.clone()],
+            ..state.config.clone()
+        };
 
         let notifier = state.port_assignment_notifier.clone();
         let response_request = IpcRequest::ExposeService {
@@ -1530,7 +1608,16 @@ mod tests {
             health_check: service.health_check.clone(),
         };
         let notify_assignment = async {
-            assert_eq!(reload_rx.recv().await, Some(()));
+            service_refresh_rx
+                .changed()
+                .await
+                .expect("service refresh watcher should remain open");
+            assert!(
+                timeout(Duration::from_millis(50), reload_rx.recv())
+                    .await
+                    .is_err(),
+                "unchanged expose retry should bypass config reload"
+            );
             notifier.notify_assignments(&[mesh_proto::PortAssignment {
                 service_name: service.name.clone(),
                 assigned_port: 41003,
@@ -1550,6 +1637,111 @@ mod tests {
 
         let updated = MeshConfig::load(&state.config_path).unwrap();
         assert_eq!(updated.services, vec![service]);
+    }
+
+    #[tokio::test]
+    async fn test_ipc_expose_retry_with_unchanged_config_uses_service_refresh() -> Result<()> {
+        timeout(Duration::from_secs(2), async {
+            let dir = Builder::new()
+                .prefix("mesh-core-ipc-retry-")
+                .tempdir_in("/tmp")
+                .context("failed to create IPC retry tempdir")?;
+            let config_path = dir.path().join("config.toml");
+            let socket_path = dir.path().join("daemon.sock");
+            let service = ServiceEntry {
+                name: "web".to_string(),
+                local_addr: "127.0.0.1:8080".to_string(),
+                protocol: Protocol::Tcp,
+                health_check: None,
+            };
+            let config = MeshConfig {
+                role: NodeRole::Edge,
+                data_dir: dir.path().join("data"),
+                services: vec![service.clone()],
+                ..MeshConfig::default()
+            };
+            config.save(&config_path)?;
+
+            let (shutdown_tx, _) = broadcast::channel(4);
+            let (reload_tx, mut reload_rx) = mpsc::channel(4);
+            let (service_refresh_tx, mut service_refresh_rx) = watch::channel(());
+            let notifier = PortAssignmentNotifier::default();
+            let runtime_config = Arc::new(tokio::sync::RwLock::new(config.clone()));
+            let server = IpcServer::bind_with_port_assignment_notifier(
+                &socket_path,
+                shutdown_tx.clone(),
+                config,
+                config_path,
+                IpcServerRuntimeDeps {
+                    runtime_config,
+                    reload_tx,
+                    service_refresh_tx: Some(service_refresh_tx),
+                    port_assignment_notifier: notifier.clone(),
+                },
+            )
+            .await?;
+            server
+                .attach_edge_node(Arc::new(tokio::sync::RwLock::new(EdgeNode::new())))
+                .await;
+
+            let shutdown_rx = shutdown_tx.subscribe();
+            let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
+
+            let request = IpcRequest::ExposeService {
+                name: service.name.clone(),
+                local_addr: service.local_addr.clone(),
+                protocol: service.protocol,
+                health_check: service.health_check.clone(),
+            };
+            let notify_assignment = async {
+                service_refresh_rx
+                    .changed()
+                    .await
+                    .context("service refresh watcher closed unexpectedly")?;
+                assert!(
+                    timeout(Duration::from_millis(50), reload_rx.recv())
+                        .await
+                        .is_err(),
+                    "unchanged expose retry should bypass daemon reload"
+                );
+                notifier.notify_assignments(&[mesh_proto::PortAssignment {
+                    service_name: service.name.clone(),
+                    assigned_port: 41004,
+                }]);
+                Ok::<(), anyhow::Error>(())
+            };
+            let send_request = async {
+                let mut stream = UnixStream::connect(&socket_path)
+                    .await
+                    .context("failed to connect to IPC socket")?;
+                frame::write_json(&mut stream, &request).await?;
+                let response: IpcResponse = frame::read_json(&mut stream).await?;
+                Ok::<IpcResponse, anyhow::Error>(response)
+            };
+            let (response, notify_result) = tokio::join!(send_request, notify_assignment);
+            let response = response?;
+            notify_result?;
+
+            let IpcResponse::ServiceExposed {
+                name,
+                assigned_port,
+            } = response
+            else {
+                anyhow::bail!("expected service exposed response");
+            };
+            assert_eq!(name, "web");
+            assert_eq!(assigned_port, 41004);
+
+            let _ = shutdown_tx.send(());
+            timeout(Duration::from_secs(1), server_handle)
+                .await
+                .context("IPC server task did not exit in time")?
+                .context("IPC server task panicked")??;
+
+            Ok(())
+        })
+        .await
+        .context("timed out waiting for unchanged IPC expose retry test")?
     }
 
     #[tokio::test]
