@@ -41,11 +41,11 @@ pub enum TicketError {
 }
 
 /// A pending invite token awaiting edge node registration.
-#[derive(Debug, Clone)]
-pub(crate) struct PendingInvite {
-    pub(crate) node_name: Option<String>,
-    pub(crate) created_at: u64,
-    pub(crate) ttl_seconds: u64,
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PendingInvite {
+    pub node_name: Option<String>,
+    pub created_at: u64,
+    pub ttl_seconds: u64,
 }
 
 /// Default invite TTL: 5 minutes.
@@ -61,6 +61,10 @@ pub struct ControlNodeSnapshot {
     pub services: HashMap<ServiceId, ServiceRecord>,
     pub routes: HashMap<u16, RouteEntry>,
     pub route_version: u64,
+    /// Pending invite tokens keyed by hex-encoded nonce.
+    /// Uses hex strings because `[u8; 16]` does not implement serde map key.
+    #[serde(default)]
+    pub pending_invites: HashMap<String, PendingInvite>,
 }
 
 /// Central state container for the control node.
@@ -114,6 +118,12 @@ const fn default_persisted_quota_limit() -> u32 {
 struct PersistedRoutes {
     routes: HashMap<u16, RouteEntry>,
     version: u64,
+}
+
+/// On-disk representation of pending invites, keyed by bs58-encoded nonce.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct PersistedPendingInvites {
+    invites: HashMap<String, PendingInvite>,
 }
 
 #[derive(Debug, Default)]
@@ -232,17 +242,48 @@ impl ControlNode {
         node.routes = persisted_routes.routes;
         node.rebuild_runtime_state_from_routes();
         let _ = node.route_change_tx.send(node.route_version);
+
+        node.pending_invites = node.load_pending_invites();
+
         node
     }
 
     /// Take a read-only snapshot of the core state (whitelist, services,
-    /// routes, version). Useful for persistence or status queries.
+    /// routes, version, pending invites). Useful for persistence or status queries.
     pub fn snapshot(&self) -> ControlNodeSnapshot {
+        let pending_invites = self
+            .pending_invites
+            .iter()
+            .map(|(nonce, invite)| (bs58::encode(nonce).into_string(), invite.clone()))
+            .collect();
         ControlNodeSnapshot {
             whitelist: self.whitelist.clone(),
             services: self.services.clone(),
             routes: self.routes.clone(),
             route_version: self.route_version,
+            pending_invites,
+        }
+    }
+
+    /// Restore pending invites from a snapshot (e.g. after daemon restart).
+    ///
+    /// Keys are bs58-encoded `[u8; 16]` nonces. Invalid keys are logged and
+    /// skipped. Already-expired invites are filtered out.
+    pub fn restore_pending_invites(&mut self, snapshot: &HashMap<String, PendingInvite>) {
+        let now = now_epoch();
+        for (key, invite) in snapshot {
+            let Ok(bytes) = bs58::decode(key).into_vec() else {
+                warn!(key = %key, "skipping pending invite with invalid bs58 nonce");
+                continue;
+            };
+            let Ok(nonce): Result<[u8; 16], _> = bytes.try_into() else {
+                warn!(key = %key, "skipping pending invite with wrong nonce length");
+                continue;
+            };
+            if now.saturating_sub(invite.created_at) > invite.ttl_seconds {
+                continue;
+            }
+            self.pending_invites.insert(nonce, invite.clone());
         }
     }
 
@@ -278,6 +319,12 @@ impl ControlNode {
 
     fn routes_path(&self) -> Option<PathBuf> {
         self.data_dir.as_ref().map(|dir| dir.join("routes.json"))
+    }
+
+    fn pending_invites_path(&self) -> Option<PathBuf> {
+        self.data_dir
+            .as_ref()
+            .map(|dir| dir.join("pending_invites.json"))
     }
 
     fn load_whitelist_entries(&self) -> Vec<PersistedWhitelistEntry> {
@@ -355,6 +402,58 @@ impl ControlNode {
                 version: self.route_version,
             },
         )
+    }
+
+    fn load_pending_invites(&self) -> HashMap<[u8; 16], PendingInvite> {
+        let Some(path) = self.pending_invites_path() else {
+            return HashMap::new();
+        };
+
+        let persisted = match persistence::load_state::<PersistedPendingInvites>(&path) {
+            Ok(Some(data)) => data,
+            Ok(None) => return HashMap::new(),
+            Err(error) => {
+                warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "failed to load pending invites, starting fresh"
+                );
+                return HashMap::new();
+            }
+        };
+
+        let now = now_epoch();
+        let mut result = HashMap::with_capacity(persisted.invites.len());
+        for (key, invite) in persisted.invites {
+            let Ok(bytes) = bs58::decode(&key).into_vec() else {
+                warn!(key = %key, "skipping persisted invite with invalid bs58 nonce");
+                continue;
+            };
+            let Ok(nonce): Result<[u8; 16], _> = bytes.try_into() else {
+                warn!(key = %key, "skipping persisted invite with wrong nonce length");
+                continue;
+            };
+            // Filter out expired invites on load.
+            if now.saturating_sub(invite.created_at) > invite.ttl_seconds {
+                continue;
+            }
+            result.insert(nonce, invite);
+        }
+        result
+    }
+
+    fn persist_pending_invites(&self) -> Result<(), PersistenceError> {
+        let Some(path) = self.pending_invites_path() else {
+            return Ok(());
+        };
+
+        let invites = self
+            .pending_invites
+            .iter()
+            .map(|(nonce, invite)| (bs58::encode(nonce).into_string(), invite.clone()))
+            .collect();
+
+        persistence::save_atomic_sync(&path, &PersistedPendingInvites { invites })
     }
 
     fn rebuild_runtime_state_from_routes(&mut self) {
@@ -614,6 +713,9 @@ impl ControlNode {
                 ttl_seconds: ttl,
             },
         );
+        if let Err(error) = self.persist_pending_invites() {
+            warn!(error = %error, "failed to persist pending invites after generate");
+        }
 
         InviteToken {
             control_addr: control_addr.to_owned(),
@@ -635,17 +737,29 @@ impl ControlNode {
         let now = now_epoch();
         if now.saturating_sub(invite.created_at) > invite.ttl_seconds {
             // Expired — do not put it back.
+            if let Err(error) = self.persist_pending_invites() {
+                warn!(error = %error, "failed to persist pending invites after expired removal");
+            }
             return None;
         }
 
+        if let Err(error) = self.persist_pending_invites() {
+            warn!(error = %error, "failed to persist pending invites after consumption");
+        }
         Some(invite)
     }
 
     /// Remove all expired pending invites.
     pub fn cleanup_expired_invites(&mut self) {
+        let before = self.pending_invites.len();
         let now = now_epoch();
         self.pending_invites
             .retain(|_, inv| now.saturating_sub(inv.created_at) <= inv.ttl_seconds);
+        if self.pending_invites.len() != before
+            && let Err(error) = self.persist_pending_invites()
+        {
+            warn!(error = %error, "failed to persist pending invites after cleanup");
+        }
     }
 
     /// Returns the current route version counter.
@@ -1978,5 +2092,82 @@ mod tests {
         // Without whitelist entry, register_services should fail.
         let result = cn.register_services("ep-unknown", "some-node", &[], 10000);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_pending_invites_survive_disk_persistence_roundtrip() {
+        let dir = writable_tempdir("control-invites-");
+        let mut cn = ControlNode::load_from_disk(dir.path());
+
+        // Generate two invites with long TTL so they survive reload.
+        let token_a = cn.generate_invite(Some("edge-a".into()), Some(3600), "addr-a");
+        let token_b = cn.generate_invite(Some("edge-b".into()), Some(3600), "addr-b");
+        assert_eq!(cn.pending_invites.len(), 2);
+
+        // Reload from disk — pending invites should survive.
+        let mut restored = ControlNode::load_from_disk(dir.path());
+        assert_eq!(restored.pending_invites.len(), 2);
+
+        // Verify we can consume the restored invites.
+        let nonce_a_bs58 = bs58::encode(token_a.nonce).into_string();
+        let invite_a = restored.check_and_consume_invite(&nonce_a_bs58);
+        assert!(invite_a.is_some());
+        assert_eq!(invite_a.unwrap().node_name, Some("edge-a".to_owned()));
+
+        let nonce_b_bs58 = bs58::encode(token_b.nonce).into_string();
+        let invite_b = restored.check_and_consume_invite(&nonce_b_bs58);
+        assert!(invite_b.is_some());
+        assert_eq!(invite_b.unwrap().node_name, Some("edge-b".to_owned()));
+
+        // After consuming both, map should be empty.
+        assert!(restored.pending_invites.is_empty());
+    }
+
+    #[test]
+    fn test_pending_invites_snapshot_contains_invites() {
+        let mut cn = ControlNode::new();
+        let token = cn.generate_invite(Some("snap-edge".into()), Some(300), "addr");
+        let nonce_bs58 = bs58::encode(token.nonce).into_string();
+
+        let snap = cn.snapshot();
+        assert_eq!(snap.pending_invites.len(), 1);
+        assert!(snap.pending_invites.contains_key(&nonce_bs58));
+        assert_eq!(
+            snap.pending_invites[&nonce_bs58].node_name,
+            Some("snap-edge".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_restore_pending_invites_filters_expired() {
+        let mut cn = ControlNode::new();
+        let mut invites = HashMap::new();
+        // Expired invite.
+        invites.insert(
+            bs58::encode([99u8; 16]).into_string(),
+            PendingInvite {
+                node_name: None,
+                created_at: 1000,
+                ttl_seconds: 0,
+            },
+        );
+        // Valid invite (created_at = near current time with long TTL).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        invites.insert(
+            bs58::encode([88u8; 16]).into_string(),
+            PendingInvite {
+                node_name: Some("valid".into()),
+                created_at: now,
+                ttl_seconds: 3600,
+            },
+        );
+
+        cn.restore_pending_invites(&invites);
+
+        assert_eq!(cn.pending_invites.len(), 1);
+        assert!(cn.pending_invites.contains_key(&[88u8; 16]));
     }
 }
