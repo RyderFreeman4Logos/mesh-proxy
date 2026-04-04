@@ -24,6 +24,7 @@ use crate::process::StartupReadyWriter;
 
 type SharedRuntimeConfig = Arc<tokio::sync::RwLock<MeshConfig>>;
 type SharedControlNode = Arc<tokio::sync::RwLock<ControlNode>>;
+type SharedEdgeNode = Arc<tokio::sync::RwLock<EdgeNode>>;
 type SharedLocalProxy = Arc<tokio::sync::Mutex<EdgeNode>>;
 
 /// Shutdown signal type.
@@ -128,6 +129,15 @@ fn write_join_ticket_file(data_dir: &Path, ticket_bs58: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone)]
+struct EdgeRegistrationRuntime {
+    endpoint: iroh::Endpoint,
+    node_name: String,
+    config: SharedRuntimeConfig,
+    edge_node: SharedEdgeNode,
+    port_assignment_notifier: PortAssignmentNotifier,
+}
+
 /// The mesh-proxy daemon engine.
 pub struct Daemon {
     config: MeshConfig,
@@ -136,6 +146,8 @@ pub struct Daemon {
     startup_ready: Option<StartupReadyWriter>,
     control_target_tx: Option<watch::Sender<Option<String>>>,
     service_change_tx: Option<watch::Sender<()>>,
+    edge_registration_runtime: Option<EdgeRegistrationRuntime>,
+    registration_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Daemon {
@@ -153,6 +165,8 @@ impl Daemon {
             startup_ready: Some(startup_ready),
             control_target_tx: None,
             service_change_tx: None,
+            edge_registration_runtime: None,
+            registration_handle: None,
         }
     }
 
@@ -169,6 +183,8 @@ impl Daemon {
             startup_ready: None,
             control_target_tx: None,
             service_change_tx: None,
+            edge_registration_runtime: None,
+            registration_handle: None,
         }
     }
 
@@ -254,7 +270,6 @@ impl Daemon {
         // Branch by role: create node state and start role-specific tasks.
         let (
             accept_handle,
-            registration_handle,
             _config_watcher,
             shared_config,
             control_target_tx,
@@ -262,6 +277,8 @@ impl Daemon {
             health_state,
             active_connections,
             control_local_proxy_handle,
+            edge_registration_runtime,
+            registration_handle,
         ) = match self.config.role {
             NodeRole::Control => {
                 let runtime_config = Arc::new(tokio::sync::RwLock::new(self.config.clone()));
@@ -288,13 +305,14 @@ impl Daemon {
                         crate::control_node::run_accept_loop(cn_clone, endpoint, shutdown_rx).await;
                     })),
                     None,
-                    None,
                     Some(runtime_config),
                     None,
                     None,
                     Some(HealthServerState::from(Arc::clone(&cn))),
                     None,
                     control_local_proxy.map(|(_, handle)| handle),
+                    None,
+                    None,
                 )
             }
             NodeRole::Edge => {
@@ -328,28 +346,20 @@ impl Daemon {
                 let (svc_tx, svc_rx) = watch::channel(());
                 let (control_target_tx, control_target_rx) =
                     watch::channel(self.config.control_addr.clone());
+                let edge_registration_runtime = EdgeRegistrationRuntime {
+                    endpoint: mesh_node.endpoint().clone(),
+                    node_name: self.config.node_name.clone(),
+                    config: Arc::clone(&runtime_config),
+                    edge_node: Arc::clone(&en),
+                    port_assignment_notifier: port_assignment_notifier.clone(),
+                };
                 let reg_handle = if self.config.control_addr.is_some() {
-                    let endpoint = mesh_node.endpoint().clone();
-                    let node_name = self.config.node_name.clone();
-                    let config = Arc::clone(&runtime_config);
-                    let en = Arc::clone(&en);
-                    let shutdown_rx = self.shutdown_rx();
-                    let port_assignment_notifier = port_assignment_notifier.clone();
-                    Some(tokio::spawn(async move {
-                        crate::edge_registration::run_registration_loop_with_port_assignment_notifier(
-                            endpoint,
-                            node_name,
-                            config,
-                            en,
-                            crate::edge_registration::RegistrationLoopChannels {
-                                port_assignment_notifier,
-                                control_target_rx,
-                                service_change_rx: svc_rx,
-                                shutdown: shutdown_rx,
-                            },
-                        )
-                        .await;
-                    }))
+                    Some(Self::spawn_edge_registration_loop(
+                        &edge_registration_runtime,
+                        control_target_rx,
+                        svc_rx,
+                        self.shutdown_rx(),
+                    ))
                 } else {
                     None
                 };
@@ -369,7 +379,6 @@ impl Daemon {
                 });
                 (
                     Some(accept_handle),
-                    reg_handle,
                     Some(config_watcher),
                     Some(shared_runtime_config),
                     Some(control_target_tx),
@@ -377,11 +386,15 @@ impl Daemon {
                     Some(health_state),
                     Some(shutdown_active_connections),
                     None,
+                    Some(edge_registration_runtime),
+                    reg_handle,
                 )
             }
         };
         self.control_target_tx = control_target_tx;
         self.service_change_tx = service_change_tx;
+        self.edge_registration_runtime = edge_registration_runtime;
+        self.registration_handle = registration_handle;
 
         let health_handle = if let Some(health_bind) = self.config.health_bind.as_deref() {
             let bind_addr: SocketAddr = health_bind
@@ -442,7 +455,7 @@ impl Daemon {
             warn!(error = %error, "accept loop task join failed");
         }
 
-        if let Some(handle) = registration_handle
+        if let Some(handle) = self.registration_handle.take()
             && let Err(error) = handle.await
         {
             warn!(error = %error, "registration loop task join failed");
@@ -538,6 +551,59 @@ impl Daemon {
             .await;
         });
         Some((local_proxy, handle))
+    }
+
+    fn spawn_edge_registration_loop(
+        runtime: &EdgeRegistrationRuntime,
+        control_target_rx: watch::Receiver<Option<String>>,
+        service_change_rx: watch::Receiver<()>,
+        shutdown: ShutdownRx,
+    ) -> tokio::task::JoinHandle<()> {
+        let endpoint = runtime.endpoint.clone();
+        let node_name = runtime.node_name.clone();
+        let config = Arc::clone(&runtime.config);
+        let edge_node = Arc::clone(&runtime.edge_node);
+        let port_assignment_notifier = runtime.port_assignment_notifier.clone();
+
+        tokio::spawn(async move {
+            crate::edge_registration::run_registration_loop_with_port_assignment_notifier(
+                endpoint,
+                node_name,
+                config,
+                edge_node,
+                crate::edge_registration::RegistrationLoopChannels {
+                    port_assignment_notifier,
+                    control_target_rx,
+                    service_change_rx,
+                    shutdown,
+                },
+            )
+            .await;
+        })
+    }
+
+    fn spawn_edge_registration_loop_from_runtime(&self) -> Result<tokio::task::JoinHandle<()>> {
+        let runtime = self
+            .edge_registration_runtime
+            .as_ref()
+            .context("edge registration runtime not initialized")?;
+        let control_target_rx = self
+            .control_target_tx
+            .as_ref()
+            .context("edge control target channel not initialized")?
+            .subscribe();
+        let service_change_rx = self
+            .service_change_tx
+            .as_ref()
+            .context("edge service change channel not initialized")?
+            .subscribe();
+
+        Ok(Self::spawn_edge_registration_loop(
+            runtime,
+            control_target_rx,
+            service_change_rx,
+            self.shutdown_rx(),
+        ))
     }
 
     async fn run_control_local_proxy(
@@ -656,7 +722,11 @@ impl Daemon {
             let diff = ServiceDiff::between(&self.config.services, &new_config.services);
             diff.log(&self.config_path, new_config.services.len());
             let services_changed = !diff.is_empty();
-            let control_target_changed = self.config.control_addr != new_config.control_addr;
+            let previous_control_addr = self.config.control_addr.clone();
+            let control_target_changed = previous_control_addr != new_config.control_addr;
+            let should_start_registration_loop = previous_control_addr.is_none()
+                && new_config.control_addr.is_some()
+                && self.registration_handle.is_none();
 
             if let Some(shared_config) = shared_config {
                 *shared_config.write().await = new_config.clone();
@@ -667,11 +737,19 @@ impl Daemon {
             if control_target_changed
                 && let Some(control_target_tx) = self.control_target_tx.as_ref()
             {
-                let _ = control_target_tx.send(self.config.control_addr.clone());
+                control_target_tx.send_replace(self.config.control_addr.clone());
             }
 
             if services_changed && let Some(service_change_tx) = self.service_change_tx.as_ref() {
                 let _ = service_change_tx.send(());
+            }
+
+            if should_start_registration_loop {
+                self.registration_handle = Some(self.spawn_edge_registration_loop_from_runtime()?);
+                info!(
+                    control_addr = self.config.control_addr.as_deref(),
+                    "started edge registration loop after control target became available"
+                );
             }
 
             return Ok(());
@@ -1127,6 +1205,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_reload_spawns_registration_loop_when_control_target_appears() -> Result<()> {
+        timeout(Duration::from_secs(15), async {
+            let control_endpoint = build_control_endpoint().await?;
+            let edge_endpoint = build_control_endpoint().await?;
+            let edge_endpoint_id = edge_endpoint.id().to_string();
+            let control_node = Arc::new(tokio::sync::RwLock::new(ControlNode::new()));
+            {
+                let mut control = control_node.write().await;
+                control.add_node(make_node(&edge_endpoint_id));
+            }
+
+            let (accept_shutdown_tx, accept_shutdown_rx) = broadcast::channel(4);
+            let accept_handle = tokio::spawn(crate::control_node::run_accept_loop(
+                Arc::clone(&control_node),
+                control_endpoint.clone(),
+                accept_shutdown_rx,
+            ));
+
+            let dir = Builder::new()
+                .prefix("mesh-daemon-lazy-registration-")
+                .tempdir_in("/tmp")
+                .context("failed to create daemon test tempdir")?;
+            let config_path = dir.path().join("config.toml");
+            let data_dir = dir.path().join("data");
+            let initial_config = MeshConfig {
+                node_name: "edge-alpha".to_string(),
+                role: NodeRole::Edge,
+                control_addr: None,
+                enable_local_proxy: false,
+                health_bind: None,
+                services: vec![make_service_entry("echo", "127.0.0.1:18080")],
+                data_dir,
+            };
+            initial_config.save(&config_path)?;
+
+            let runtime_config = Arc::new(tokio::sync::RwLock::new(initial_config.clone()));
+            let edge_node = Arc::new(tokio::sync::RwLock::new(EdgeNode::with_endpoint(
+                edge_endpoint.clone(),
+            )));
+            let (control_target_tx, _) = watch::channel(None);
+            let (service_change_tx, _) = watch::channel(());
+            let mut daemon = Daemon {
+                config: initial_config.clone(),
+                config_path: config_path.clone(),
+                shutdown_tx: broadcast::channel(1).0,
+                startup_ready: None,
+                control_target_tx: Some(control_target_tx),
+                service_change_tx: Some(service_change_tx),
+                edge_registration_runtime: Some(EdgeRegistrationRuntime {
+                    endpoint: edge_endpoint.clone(),
+                    node_name: initial_config.node_name.clone(),
+                    config: Arc::clone(&runtime_config),
+                    edge_node: Arc::clone(&edge_node),
+                    port_assignment_notifier: PortAssignmentNotifier::default(),
+                }),
+                registration_handle: None,
+            };
+
+            let control_addr = serde_json::to_string(&control_endpoint.addr())
+                .context("failed to serialize control address")?;
+            MeshConfig {
+                control_addr: Some(control_addr),
+                ..initial_config
+            }
+            .save(&config_path)?;
+
+            let test_result: Result<()> = async {
+                daemon.reload_config(Some(&runtime_config)).await?;
+
+                assert!(
+                    daemon.registration_handle.is_some(),
+                    "config reload should start the registration loop once control_addr appears"
+                );
+
+                wait_for_control_service(&control_node, &edge_endpoint_id, "echo", 1).await?;
+
+                let control = control_node.read().await;
+                let node = control
+                    .whitelist()
+                    .get(&edge_endpoint_id)
+                    .context("edge node missing from control whitelist")?;
+                assert!(
+                    node.is_online,
+                    "edge should be online after lazy registration"
+                );
+
+                Ok(())
+            }
+            .await;
+
+            let _ = daemon.shutdown_tx.send(());
+            let _ = accept_shutdown_tx.send(());
+            edge_endpoint.close().await;
+            control_endpoint.close().await;
+
+            if let Some(handle) = daemon.registration_handle.take() {
+                timeout(Duration::from_secs(2), handle)
+                    .await
+                    .context("registration loop did not exit in time")?
+                    .context("registration loop panicked")?;
+            }
+            timeout(Duration::from_secs(2), accept_handle)
+                .await
+                .context("accept loop did not exit in time")?
+                .context("accept loop panicked")?;
+
+            test_result
+        })
+        .await
+        .context("timed out waiting for lazy registration reload test")?
+    }
+
+    #[tokio::test]
     async fn test_ipc_expose_triggers_runtime_reregistration() -> Result<()> {
         timeout(Duration::from_secs(15), async {
             let control_endpoint = build_control_endpoint().await?;
@@ -1206,6 +1397,8 @@ mod tests {
                 startup_ready: None,
                 control_target_tx: Some(control_target_tx),
                 service_change_tx: Some(service_change_tx),
+                edge_registration_runtime: None,
+                registration_handle: None,
             };
 
             let test_result: Result<()> = async {
