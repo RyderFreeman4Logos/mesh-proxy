@@ -34,6 +34,13 @@ pub enum IpcRequest {
         /// Optional friendly name assigned by the admin.
         node_name: Option<String>,
     },
+    /// Generate an invite token for a new edge node (control node only).
+    Invite {
+        /// Optional friendly name pre-assigned to the joining node.
+        name: Option<String>,
+        /// Token validity in seconds (defaults to 3600 if not set).
+        ttl_seconds: Option<u64>,
+    },
 }
 
 /// Response from daemon to CLI client.
@@ -62,6 +69,8 @@ pub enum IpcResponse {
     ServiceUnexposed { name: String },
     /// Runtime status for a specific managed listener.
     ListenerStatus { port: u16, state: ListenerState },
+    /// A generated invite token (bs58-encoded).
+    InviteResult { token: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

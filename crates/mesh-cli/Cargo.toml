@@ -21,3 +21,14 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 libc.workspace = true
 toml_edit.workspace = true
+bs58.workspace = true
+hostname.workspace = true
+dirs-next.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }"

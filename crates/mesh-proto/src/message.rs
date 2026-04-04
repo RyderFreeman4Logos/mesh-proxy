@@ -13,6 +13,9 @@ pub enum ControlMessage {
         node_name: String,
         auth_ticket: String,
         services: Vec<ServiceRegistration>,
+        /// When joining via invite token, the bs58-encoded nonce for single-use verification.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        invite_nonce: Option<String>,
     },
     /// Control -> Edge: registration accepted, here are your port assignments.
     RegisterAck {

@@ -1,6 +1,7 @@
 mod config;
 pub mod frame;
 pub mod health;
+mod invite;
 mod ipc;
 pub mod listener;
 mod message;
@@ -11,6 +12,7 @@ mod validate;
 
 pub use config::{MeshConfig, NodeRole, Protocol, ServiceEntry};
 pub use health::{HealthCheckConfig, HealthCheckMode, HealthState};
+pub use invite::{InviteError, InviteToken};
 pub use ipc::{
     ConnectedNode, IpcRequest, IpcResponse, ServiceDisplayStatus, ServiceStatus, StatusInfo,
 };

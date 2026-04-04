@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use mesh_proto::{
-    HealthCheckConfig, HealthCheckMode, IpcRequest, IpcResponse, MeshConfig, NodeRole, Protocol,
-    validate_local_addr, validate_service_name,
+    HealthCheckConfig, HealthCheckMode, InviteToken, IpcRequest, IpcResponse, MeshConfig, NodeRole,
+    Protocol, validate_local_addr, validate_service_name,
 };
 use toml_edit::{DocumentMut, value};
 use tracing_subscriber::EnvFilter;
@@ -94,10 +94,35 @@ enum Command {
         name: Option<String>,
     },
 
+    /// Join a mesh network using an invite token from the control node.
+    Join {
+        /// The invite token from `mesh-proxy invite`.
+        token: String,
+    },
+
+    /// Generate an invite token for a new edge node (control node only).
+    Invite {
+        /// Friendly name for the joining node.
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Token validity duration in seconds (default: 300, max: 3600).
+        #[arg(long, default_value = "300")]
+        ttl: u64,
+    },
+
     /// Manage per-node service quotas (control node only).
     Quota {
         #[command(subcommand)]
         command: QuotaCommand,
+    },
+
+    /// Install a system service to start mesh-proxy on boot.
+    InstallService {
+        /// Install as user service instead of system-wide
+        /// (Linux: systemd --user, macOS: ~/Library/LaunchAgents).
+        #[arg(long)]
+        user: bool,
     },
 }
 
@@ -193,6 +218,8 @@ fn main() -> Result<()> {
     match command {
         Command::Start { role, control_addr } => cmd_start(&config, Some(role), control_addr),
         Command::Restart => cmd_restart(&config),
+        Command::Join { token } => cmd_join(&config, token),
+        Command::InstallService { user } => cmd_install_service(&config, user),
         other => {
             // Non-start commands: create runtime normally.
             tokio::runtime::Builder::new_multi_thread()
@@ -225,8 +252,14 @@ fn main() -> Result<()> {
                         }
                         Command::Unexpose { name } => cmd_unexpose(&config, name).await,
                         Command::Accept { ticket, name } => cmd_accept(&config, ticket, name).await,
+                        Command::Invite { name, ttl } => cmd_invite(&config, name, ttl).await,
                         Command::Quota { command } => cmd_quota(&config, command).await,
-                        Command::Start { .. } | Command::Restart => unreachable!(),
+                        Command::Start { .. }
+                        | Command::Restart
+                        | Command::Join { .. }
+                        | Command::InstallService { .. } => {
+                            unreachable!()
+                        }
                     }
                 })
         }
@@ -355,6 +388,72 @@ fn cmd_restart(config_path: &Path) -> Result<()> {
     }
 
     cmd_start(config_path, None, None)
+}
+
+fn cmd_join(config_path: &Path, token_str: String) -> Result<()> {
+    let token = InviteToken::from_bs58(&token_str)
+        .context("failed to decode invite token (is it copy-pasted correctly?)")?;
+    token.validate().context("invite token validation failed")?;
+
+    let node_name = token.node_name.clone().unwrap_or_else(|| {
+        hostname::get()
+            .map(|h| h.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "unnamed".to_string())
+    });
+
+    // Write config: role=edge, control_addr, node_name
+    let content = if config_path.exists() {
+        std::fs::read_to_string(config_path)
+            .with_context(|| format!("failed to read config at {}", config_path.display()))?
+    } else {
+        // Bootstrap a minimal config so toml_edit has something to work with.
+        String::new()
+    };
+    let mut document = DocumentMut::from_str(&content)
+        .with_context(|| format!("failed to parse config at {}", config_path.display()))?;
+    document["role"] = value("edge");
+    document["control_addr"] = value(&token.control_addr);
+    document["node_name"] = value(&node_name);
+    write_config_document_atomic(config_path, &document)?;
+
+    // Save invite nonce for the daemon's first registration (single-use).
+    let config = MeshConfig::load(config_path)?;
+    let nonce_path = config.data_dir.join("invite_nonce.txt");
+    write_nonce_file(&nonce_path, &token.nonce)?;
+
+    println!("Joining mesh as '{node_name}'...");
+    cmd_start(config_path, Some(Role::Edge), None)?;
+    println!("Use `mesh-proxy status` to verify connection.");
+    Ok(())
+}
+
+/// Write the invite nonce to a file with restricted permissions (0o600).
+fn write_nonce_file(path: &Path, nonce: &[u8; 16]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create data dir {}", parent.display()))?;
+    }
+
+    let encoded = bs58::encode(nonce).into_string();
+
+    let mut open_options = std::fs::OpenOptions::new();
+    open_options.create(true).truncate(true).write(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open_options.mode(0o600);
+    }
+
+    let mut file = open_options
+        .open(path)
+        .with_context(|| format!("failed to create nonce file at {}", path.display()))?;
+    std::io::Write::write_all(&mut file, encoded.as_bytes())
+        .with_context(|| format!("failed to write nonce file at {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to fsync nonce file at {}", path.display()))?;
+
+    Ok(())
 }
 
 fn read_pid_file(pid_path: &Path) -> Result<libc::pid_t> {
@@ -646,6 +745,35 @@ async fn cmd_accept(config_path: &Path, ticket: String, name: Option<String>) ->
     Ok(())
 }
 
+/// Generate an invite token via IPC (control node only).
+async fn cmd_invite(config_path: &Path, name: Option<String>, ttl: u64) -> Result<()> {
+    let request = IpcRequest::Invite {
+        name,
+        ttl_seconds: Some(ttl),
+    };
+
+    let socket_path = daemon_socket_path(config_path)?;
+    let response = send_ipc_request(&socket_path, &request, "invite").await?;
+
+    match response {
+        IpcResponse::InviteResult { token } => {
+            println!("Invite token (expires in {ttl}s):");
+            println!("{token}");
+            println!();
+            println!("On the new node, run:");
+            println!("  mesh-proxy join {token}");
+        }
+        IpcResponse::Error { message } => {
+            anyhow::bail!("invite failed: {message}");
+        }
+        other => {
+            anyhow::bail!("unexpected response: {other:?}");
+        }
+    }
+
+    Ok(())
+}
+
 async fn cmd_quota(config_path: &Path, command: QuotaCommand) -> Result<()> {
     match command {
         QuotaCommand::Show => cmd_quota_show(config_path).await,
@@ -857,6 +985,118 @@ fn render_quota_table(quotas: &[(String, usize, usize)]) -> String {
     }
 
     output.trim_end().to_string()
+}
+
+/// Generate a systemd unit file for mesh-proxy.
+fn generate_systemd_unit(binary_path: &Path, role: NodeRole, data_dir: &Path) -> String {
+    let role_str = match role {
+        NodeRole::Control => "control",
+        NodeRole::Edge => "edge",
+    };
+    format!(
+        "[Unit]\n\
+         Description=mesh-proxy daemon\n\
+         After=network-online.target\n\
+         Wants=network-online.target\n\
+         \n\
+         [Service]\n\
+         Type=forking\n\
+         ExecStart={binary} start --role {role}\n\
+         ExecStop={binary} stop\n\
+         PIDFile={pid}\n\
+         Restart=on-failure\n\
+         RestartSec=5\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n",
+        binary = binary_path.display(),
+        role = role_str,
+        pid = data_dir.join("daemon.pid").display(),
+    )
+}
+
+/// Generate a launchd plist for mesh-proxy.
+fn generate_launchd_plist(binary_path: &Path, role: NodeRole) -> String {
+    let role_str = match role {
+        NodeRole::Control => "control",
+        NodeRole::Edge => "edge",
+    };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
+         \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\">\n\
+         <dict>\n\
+         \t<key>Label</key>\n\
+         \t<string>com.mesh-proxy.daemon</string>\n\
+         \t<key>ProgramArguments</key>\n\
+         \t<array>\n\
+         \t\t<string>{binary}</string>\n\
+         \t\t<string>start</string>\n\
+         \t\t<string>--role</string>\n\
+         \t\t<string>{role}</string>\n\
+         \t</array>\n\
+         \t<key>RunAtLoad</key>\n\
+         \t<true/>\n\
+         \t<key>KeepAlive</key>\n\
+         \t<true/>\n\
+         \t<key>StandardOutPath</key>\n\
+         \t<string>/tmp/mesh-proxy.log</string>\n\
+         \t<key>StandardErrorPath</key>\n\
+         \t<string>/tmp/mesh-proxy.err</string>\n\
+         </dict>\n\
+         </plist>\n",
+        binary = binary_path.display(),
+        role = role_str,
+    )
+}
+
+fn cmd_install_service(config_path: &Path, user: bool) -> Result<()> {
+    let config = MeshConfig::load(config_path)?;
+    let binary_path =
+        std::env::current_exe().context("failed to determine mesh-proxy binary path")?;
+
+    if cfg!(target_os = "linux") {
+        let content = generate_systemd_unit(&binary_path, config.role, &config.data_dir);
+        let dest = if user {
+            let dir = dirs_next::home_dir()
+                .context("cannot determine home directory")?
+                .join(".config/systemd/user");
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("failed to create {}", dir.display()))?;
+            dir.join("mesh-proxy.service")
+        } else {
+            PathBuf::from("/etc/systemd/system/mesh-proxy.service")
+        };
+
+        std::fs::write(&dest, content)
+            .with_context(|| format!("failed to write {}", dest.display()))?;
+
+        println!("Service installed at {}", dest.display());
+        if user {
+            println!("Enable with:\n  systemctl --user enable --now mesh-proxy");
+        } else {
+            println!("Enable with:\n  sudo systemctl enable --now mesh-proxy");
+        }
+    } else if cfg!(target_os = "macos") {
+        let content = generate_launchd_plist(&binary_path, config.role);
+        let dir = dirs_next::home_dir()
+            .context("cannot determine home directory")?
+            .join("Library/LaunchAgents");
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+        let dest = dir.join("com.mesh-proxy.daemon.plist");
+
+        std::fs::write(&dest, &content)
+            .with_context(|| format!("failed to write {}", dest.display()))?;
+
+        println!("Service installed at {}", dest.display());
+        println!("Load with:\n  launchctl load ~/Library/LaunchAgents/com.mesh-proxy.daemon.plist");
+    } else {
+        anyhow::bail!("install-service is not supported on this platform");
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1136,5 +1376,253 @@ mod tests {
             }
             other => panic!("expected Accept, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_cli_invite_defaults() {
+        let cli = Cli::try_parse_from(["mesh-proxy", "invite"]).unwrap();
+
+        match cli.command {
+            Command::Invite { name, ttl } => {
+                assert!(name.is_none());
+                assert_eq!(ttl, 300);
+            }
+            other => panic!("expected Invite, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cli_invite_with_name_and_ttl() {
+        let cli =
+            Cli::try_parse_from(["mesh-proxy", "invite", "--name", "worker-1", "--ttl", "600"])
+                .unwrap();
+
+        match cli.command {
+            Command::Invite { name, ttl } => {
+                assert_eq!(name.as_deref(), Some("worker-1"));
+                assert_eq!(ttl, 600);
+            }
+            other => panic!("expected Invite, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cli_invite_name_only() {
+        let cli = Cli::try_parse_from(["mesh-proxy", "invite", "--name", "edge-node"]).unwrap();
+
+        match cli.command {
+            Command::Invite { name, ttl } => {
+                assert_eq!(name.as_deref(), Some("edge-node"));
+                assert_eq!(ttl, 300);
+            }
+            other => panic!("expected Invite, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cli_join_token_is_positional() {
+        let cli = Cli::try_parse_from(["mesh-proxy", "join", "some-token-string"]).unwrap();
+
+        match cli.command {
+            Command::Join { token } => {
+                assert_eq!(token, "some-token-string");
+            }
+            other => panic!("expected Join, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cli_join_missing_token_fails() {
+        let result = Cli::try_parse_from(["mesh-proxy", "join"]);
+        assert!(result.is_err(), "join without token should fail");
+    }
+
+    #[test]
+    fn test_cmd_join_writes_config_and_nonce() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let dir = tempfile::Builder::new()
+            .prefix("mesh-join-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let config_path = dir.path().join("config.toml");
+        let data_dir = dir.path().join("data");
+
+        // Pre-create a minimal config so MeshConfig::load points data_dir to our temp.
+        let initial_config = format!(
+            "node_name = \"old-name\"\nrole = \"control\"\ndata_dir = \"{}\"\n",
+            data_dir.display()
+        );
+        std::fs::write(&config_path, &initial_config).unwrap();
+
+        let token = InviteToken {
+            control_addr: r#"{"node_id":"ep-ctrl-abc"}"#.to_string(),
+            nonce: [
+                10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160,
+            ],
+            ttl_seconds: 3600,
+            created_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            node_name: Some("invited-edge".to_string()),
+        };
+        let encoded = token.to_bs58().unwrap();
+
+        // Decode + validate + write config + write nonce (skip daemon start).
+        let decoded = InviteToken::from_bs58(&encoded).unwrap();
+        decoded.validate().unwrap();
+
+        let node_name = decoded
+            .node_name
+            .clone()
+            .unwrap_or_else(|| "fallback".to_string());
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let mut document = DocumentMut::from_str(&content).unwrap();
+        document["role"] = value("edge");
+        document["control_addr"] = value(&decoded.control_addr);
+        document["node_name"] = value(&node_name);
+        write_config_document_atomic(&config_path, &document).unwrap();
+
+        let config = MeshConfig::load(&config_path).unwrap();
+        assert_eq!(config.role, NodeRole::Edge);
+        assert_eq!(
+            config.control_addr.as_deref(),
+            Some(r#"{"node_id":"ep-ctrl-abc"}"#)
+        );
+        assert_eq!(config.node_name, "invited-edge");
+
+        let nonce_path = config.data_dir.join("invite_nonce.txt");
+        write_nonce_file(&nonce_path, &decoded.nonce).unwrap();
+        assert!(nonce_path.exists());
+
+        let nonce_content = std::fs::read_to_string(&nonce_path).unwrap();
+        assert!(!nonce_content.is_empty());
+
+        // Verify nonce roundtrips through bs58.
+        let nonce_bytes = bs58::decode(&nonce_content).into_vec().unwrap();
+        assert_eq!(nonce_bytes, decoded.nonce);
+    }
+
+    #[test]
+    fn test_cmd_join_uses_hostname_when_no_node_name() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let token = InviteToken {
+            control_addr: "addr-123".to_string(),
+            nonce: [1; 16],
+            ttl_seconds: 300,
+            created_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            node_name: None,
+        };
+
+        let node_name = token.node_name.clone().unwrap_or_else(|| {
+            hostname::get()
+                .map(|h| h.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "unnamed".to_string())
+        });
+
+        // Should fall back to system hostname, not be empty.
+        assert!(!node_name.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_nonce_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::Builder::new()
+            .prefix("mesh-nonce-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let nonce_path = dir.path().join("invite_nonce.txt");
+        let nonce = [42u8; 16];
+
+        write_nonce_file(&nonce_path, &nonce).unwrap();
+
+        let mode = std::fs::metadata(&nonce_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "nonce file should be owner-only rw");
+    }
+
+    // ── install-service tests ──
+
+    #[test]
+    fn test_cli_install_service_defaults() {
+        let cli = Cli::try_parse_from(["mesh-proxy", "install-service"]).unwrap();
+        match cli.command {
+            Command::InstallService { user } => {
+                assert!(!user, "default should be system-wide");
+            }
+            other => panic!("expected InstallService, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cli_install_service_user_flag() {
+        let cli = Cli::try_parse_from(["mesh-proxy", "install-service", "--user"]).unwrap();
+        match cli.command {
+            Command::InstallService { user } => {
+                assert!(user);
+            }
+            other => panic!("expected InstallService, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_generate_systemd_unit_control() {
+        let binary = PathBuf::from("/usr/local/bin/mesh-proxy");
+        let data_dir = PathBuf::from("/var/lib/mesh-proxy");
+        let content = generate_systemd_unit(&binary, NodeRole::Control, &data_dir);
+
+        assert!(content.contains("Description=mesh-proxy daemon"));
+        assert!(content.contains("After=network-online.target"));
+        assert!(content.contains("Type=forking"));
+        assert!(content.contains("ExecStart=/usr/local/bin/mesh-proxy start --role control"));
+        assert!(content.contains("ExecStop=/usr/local/bin/mesh-proxy stop"));
+        assert!(content.contains("PIDFile=/var/lib/mesh-proxy/daemon.pid"));
+        assert!(content.contains("Restart=on-failure"));
+        assert!(content.contains("WantedBy=multi-user.target"));
+    }
+
+    #[test]
+    fn test_generate_systemd_unit_edge() {
+        let binary = PathBuf::from("/opt/mesh-proxy");
+        let data_dir = PathBuf::from("/home/user/.local/share/mesh-proxy");
+        let content = generate_systemd_unit(&binary, NodeRole::Edge, &data_dir);
+
+        assert!(content.contains("ExecStart=/opt/mesh-proxy start --role edge"));
+        assert!(content.contains("PIDFile=/home/user/.local/share/mesh-proxy/daemon.pid"));
+    }
+
+    #[test]
+    fn test_generate_launchd_plist_control() {
+        let binary = PathBuf::from("/usr/local/bin/mesh-proxy");
+        let content = generate_launchd_plist(&binary, NodeRole::Control);
+
+        assert!(content.contains("<?xml version=\"1.0\""));
+        assert!(content.contains("<string>com.mesh-proxy.daemon</string>"));
+        assert!(content.contains("<string>/usr/local/bin/mesh-proxy</string>"));
+        assert!(content.contains("<string>start</string>"));
+        assert!(content.contains("<string>--role</string>"));
+        assert!(content.contains("<string>control</string>"));
+        assert!(content.contains("<key>RunAtLoad</key>"));
+        assert!(content.contains("<true/>"));
+        assert!(content.contains("<key>KeepAlive</key>"));
+        assert!(content.contains("<string>/tmp/mesh-proxy.log</string>"));
+        assert!(content.contains("<string>/tmp/mesh-proxy.err</string>"));
+        assert!(content.contains("</plist>"));
+    }
+
+    #[test]
+    fn test_generate_launchd_plist_edge() {
+        let binary = PathBuf::from("/opt/mesh-proxy");
+        let content = generate_launchd_plist(&binary, NodeRole::Edge);
+
+        assert!(content.contains("<string>/opt/mesh-proxy</string>"));
+        assert!(content.contains("<string>edge</string>"));
     }
 }

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -54,6 +54,41 @@ fn now_epoch() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Read the single-use invite nonce file if it exists.
+///
+/// Written by `mesh-proxy join`. The file is NOT deleted here — it is only
+/// removed after a successful RegisterAck so that a network failure does not
+/// permanently lose the nonce.
+async fn read_invite_nonce(data_dir: &Path) -> Option<String> {
+    let nonce_path = data_dir.join("invite_nonce.txt");
+    let content = match tokio::fs::read_to_string(&nonce_path).await {
+        Ok(content) => content,
+        Err(error) if error.kind() == ErrorKind::NotFound => return None,
+        Err(error) => {
+            warn!(error = %error, "failed to read invite nonce file");
+            return None;
+        }
+    };
+    let trimmed = content.trim().to_owned();
+    if trimmed.is_empty() {
+        return None;
+    }
+    info!("using invite nonce for registration (single-use)");
+    Some(trimmed)
+}
+
+/// Delete the invite nonce file after a successful registration.
+async fn delete_invite_nonce(data_dir: &Path) {
+    let nonce_path = data_dir.join("invite_nonce.txt");
+    match tokio::fs::remove_file(&nonce_path).await {
+        Ok(()) => info!("deleted invite nonce file after successful registration"),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            warn!(error = %error, "failed to delete invite nonce file after registration");
+        }
+    }
 }
 
 fn parse_control_endpoint_addr(control_addr: &str) -> Result<EndpointAddr> {
@@ -328,10 +363,14 @@ async fn send_register(
         .to_bs58()
         .context("failed to encode join ticket for registration")?;
 
+    let invite_nonce = read_invite_nonce(&snapshot.data_dir).await;
+    let had_invite_nonce = invite_nonce.is_some();
+
     let message = ControlMessage::Register {
         node_name: registration.node_name.clone(),
         auth_ticket,
         services: snapshot.services.clone(),
+        invite_nonce,
     };
 
     let (mut send, mut recv) = connection
@@ -398,6 +437,11 @@ async fn send_register(
             }
 
             log_register_ack_assignments(&assignments);
+            // Only delete the nonce file after a successful RegisterAck so
+            // that a failed attempt can be retried with the same nonce.
+            if had_invite_nonce {
+                delete_invite_nonce(&snapshot.data_dir).await;
+            }
             port_assignment_notifier.notify_assignments(&assignments);
             if matches!(mode, RegistrationMode::Initial) {
                 transition_edge_state(edge_node, ConnectionState::Authenticated).await;
@@ -896,5 +940,91 @@ mod tests {
         assert!(cache.routes.is_empty());
         assert_eq!(cache.version, 0);
         assert_eq!(cache.control_endpoint_id.as_deref(), Some(ENDPOINT_ID_B));
+    }
+
+    #[tokio::test]
+    async fn test_read_invite_nonce_reads_without_deleting() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let nonce_path = dir.path().join("invite_nonce.txt");
+        tokio::fs::write(&nonce_path, "3vQB7f5KmR").await.unwrap();
+
+        let result = read_invite_nonce(dir.path()).await;
+        assert_eq!(result, Some("3vQB7f5KmR".to_string()));
+        assert!(
+            nonce_path.exists(),
+            "nonce file should still exist after reading"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_invite_nonce_returns_none_when_missing() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let result = read_invite_nonce(dir.path()).await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn test_read_invite_nonce_returns_none_for_empty_file() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let nonce_path = dir.path().join("invite_nonce.txt");
+        tokio::fs::write(&nonce_path, "").await.unwrap();
+
+        let result = read_invite_nonce(dir.path()).await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn test_read_invite_nonce_trims_whitespace() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let nonce_path = dir.path().join("invite_nonce.txt");
+        tokio::fs::write(&nonce_path, "  abc123  \n").await.unwrap();
+
+        let result = read_invite_nonce(dir.path()).await;
+        assert_eq!(result, Some("abc123".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_delete_invite_nonce_removes_file() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let nonce_path = dir.path().join("invite_nonce.txt");
+        tokio::fs::write(&nonce_path, "abc123").await.unwrap();
+
+        delete_invite_nonce(dir.path()).await;
+        assert!(
+            !nonce_path.exists(),
+            "nonce file should be deleted after explicit deletion"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_invite_nonce_noop_when_missing() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        // Should not panic or error when file doesn't exist.
+        delete_invite_nonce(dir.path()).await;
+    }
+
+    #[tokio::test]
+    async fn test_nonce_file_survives_failed_registration_attempt() {
+        // Simulates the scenario where read_invite_nonce is called but
+        // the registration fails before RegisterAck. The nonce file must
+        // still exist so the next attempt can retry.
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let nonce_path = dir.path().join("invite_nonce.txt");
+        tokio::fs::write(&nonce_path, "retry-nonce").await.unwrap();
+
+        // Step 1: read the nonce (as send_register would)
+        let nonce = read_invite_nonce(dir.path()).await;
+        assert_eq!(nonce, Some("retry-nonce".to_string()));
+
+        // Step 2: simulate a network failure — do NOT call delete_invite_nonce
+        // (this is what happens when RegisterAck is never received)
+
+        // Step 3: verify nonce file is still available for retry
+        let retry_nonce = read_invite_nonce(dir.path()).await;
+        assert_eq!(retry_nonce, Some("retry-nonce".to_string()));
+        assert!(
+            nonce_path.exists(),
+            "nonce file must survive failed attempts"
+        );
     }
 }
