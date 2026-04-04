@@ -332,6 +332,7 @@ async fn send_register(
         node_name: registration.node_name.clone(),
         auth_ticket,
         services: snapshot.services.clone(),
+        invite_nonce: None,
     };
 
     let (mut send, mut recv) = connection

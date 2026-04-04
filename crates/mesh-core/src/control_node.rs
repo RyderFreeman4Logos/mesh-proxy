@@ -967,6 +967,7 @@ async fn handle_connection(
                     node_name,
                     auth_ticket,
                     services,
+                    ..
                 } => {
                     if let Err(e) = handle_register(
                         &node,

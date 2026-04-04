@@ -136,6 +136,7 @@ async fn test_control_edge_registration_via_network() {
                 protocol: Protocol::Tcp,
                 health_check: None,
             }],
+            invite_nonce: None,
         };
 
         mesh_proto::frame::write_json(&mut send, &register_msg).await?;

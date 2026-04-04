@@ -21,3 +21,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 libc.workspace = true
 toml_edit.workspace = true
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }"

@@ -294,6 +294,9 @@ async fn dispatch(request: &IpcRequest, state: &SharedState) -> IpcResponse {
         IpcRequest::AcceptNode { ticket, node_name } => {
             handle_accept_node(state, ticket, node_name.as_deref()).await
         }
+        IpcRequest::Invite { .. } => IpcResponse::Error {
+            message: "invite token generation not yet implemented".to_string(),
+        },
     }
 }
 
