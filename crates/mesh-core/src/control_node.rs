@@ -5,8 +5,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use mesh_proto::{
-    ALPN_CONTROL, ControlMessage, DEFAULT_SERVICE_QUOTA, JoinTicket, NodeInfo, PortAssignment,
-    RouteEntry, ServiceId, ServiceRecord,
+    ALPN_CONTROL, ControlMessage, DEFAULT_SERVICE_QUOTA, InviteToken, JoinTicket, NodeInfo,
+    PortAssignment, RouteEntry, ServiceId, ServiceRecord,
 };
 use tokio::sync::{RwLock, watch};
 use tokio::task::JoinSet;
@@ -40,6 +40,19 @@ pub enum TicketError {
     EndpointMismatch,
 }
 
+/// A pending invite token awaiting edge node registration.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingInvite {
+    pub(crate) node_name: Option<String>,
+    pub(crate) created_at: u64,
+    pub(crate) ttl_seconds: u64,
+}
+
+/// Default invite TTL: 5 minutes.
+const DEFAULT_INVITE_TTL_SECONDS: u64 = 300;
+/// Maximum invite TTL: 1 hour.
+const MAX_INVITE_TTL_SECONDS: u64 = 3600;
+
 /// Read-only snapshot of the control node's core state for serialization
 /// or inspection without holding a mutable reference.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -69,6 +82,8 @@ pub struct ControlNode {
     used_tickets: HashMap<[u8; 16], u64>,
     /// Epoch timestamp of the most recent pong received from each endpoint.
     last_pong: HashMap<String, u64>,
+    /// Pending invite tokens: nonce → PendingInvite. Consumed on first valid registration.
+    pending_invites: HashMap<[u8; 16], PendingInvite>,
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +180,7 @@ impl ControlNode {
             data_dir: None,
             used_tickets: HashMap::new(),
             last_pong: HashMap::new(),
+            pending_invites: HashMap::new(),
         }
     }
 
@@ -572,6 +588,66 @@ impl ControlNode {
         self.used_tickets.retain(|_, expiry| *expiry > now_epoch);
     }
 
+    // -- Invite token management --
+
+    /// Generate an invite token and store it as pending.
+    ///
+    /// `ttl_seconds` is clamped to [`MAX_INVITE_TTL_SECONDS`] and defaults to
+    /// [`DEFAULT_INVITE_TTL_SECONDS`] when `None`.
+    pub fn generate_invite(
+        &mut self,
+        name: Option<String>,
+        ttl_seconds: Option<u64>,
+        control_addr: &str,
+    ) -> InviteToken {
+        let ttl = ttl_seconds
+            .unwrap_or(DEFAULT_INVITE_TTL_SECONDS)
+            .min(MAX_INVITE_TTL_SECONDS);
+        let nonce: [u8; 16] = rand::random();
+        let created_at = now_epoch();
+
+        self.pending_invites.insert(
+            nonce,
+            PendingInvite {
+                node_name: name.clone(),
+                created_at,
+                ttl_seconds: ttl,
+            },
+        );
+
+        InviteToken {
+            control_addr: control_addr.to_owned(),
+            nonce,
+            ttl_seconds: ttl,
+            created_at,
+            node_name: name,
+        }
+    }
+
+    /// Look up and consume a pending invite by its bs58-encoded nonce.
+    ///
+    /// Returns `None` if the nonce is unknown, already consumed, or expired.
+    pub(crate) fn check_and_consume_invite(&mut self, nonce_bs58: &str) -> Option<PendingInvite> {
+        let bytes = bs58::decode(nonce_bs58).into_vec().ok()?;
+        let nonce: [u8; 16] = bytes.try_into().ok()?;
+        let invite = self.pending_invites.remove(&nonce)?;
+
+        let now = now_epoch();
+        if now.saturating_sub(invite.created_at) > invite.ttl_seconds {
+            // Expired — do not put it back.
+            return None;
+        }
+
+        Some(invite)
+    }
+
+    /// Remove all expired pending invites.
+    pub fn cleanup_expired_invites(&mut self) {
+        let now = now_epoch();
+        self.pending_invites
+            .retain(|_, inv| now.saturating_sub(inv.created_at) <= inv.ttl_seconds);
+    }
+
     /// Returns the current route version counter.
     pub fn route_version(&self) -> u64 {
         self.route_version
@@ -967,15 +1043,19 @@ async fn handle_connection(
                     node_name,
                     auth_ticket,
                     services,
-                    ..
+                    invite_nonce,
                 } => {
+                    let ctx = RegisterContext {
+                        node: &node,
+                        active_connections: &active_connections,
+                        endpoint_id: &remote_id_string,
+                        node_name: &node_name,
+                    };
                     if let Err(e) = handle_register(
-                        &node,
-                        &active_connections,
-                        &remote_id_string,
+                        &ctx,
                         &auth_ticket,
-                        &node_name,
                         services,
+                        invite_nonce.as_deref(),
                         &mut send,
                     )
                     .await
@@ -1040,17 +1120,58 @@ async fn write_full_route_table(
         .context("failed to send full route table")
 }
 
+/// Shared references passed to both `handle_register` and `finish_register`.
+struct RegisterContext<'a> {
+    node: &'a Arc<RwLock<ControlNode>>,
+    active_connections: &'a Arc<ActiveControlConnections>,
+    endpoint_id: &'a str,
+    node_name: &'a str,
+}
+
 /// Process a Register message: validate ticket, allocate ports, respond with Ack/Nack.
 async fn handle_register(
-    node: &Arc<RwLock<ControlNode>>,
-    active_connections: &Arc<ActiveControlConnections>,
-    endpoint_id: &str,
+    ctx: &RegisterContext<'_>,
     auth_ticket_str: &str,
-    node_name: &str,
     services: Vec<mesh_proto::ServiceRegistration>,
+    invite_nonce: Option<&str>,
     send: &mut iroh::endpoint::SendStream,
 ) -> anyhow::Result<()> {
     let now = now_epoch();
+
+    // Try invite-based auto-accept before the normal ticket flow.
+    if let Some(nonce_str) = invite_nonce {
+        let mut n = ctx.node.write().await;
+        if let Some(invite) = n.check_and_consume_invite(nonce_str) {
+            // Valid invite — auto-add to whitelist, skip ticket validation.
+            let effective_name = invite.node_name.as_deref().unwrap_or(ctx.node_name);
+            let info = NodeInfo {
+                endpoint_id: ctx.endpoint_id.to_owned(),
+                node_name: effective_name.to_owned(),
+                quota_limit: DEFAULT_SERVICE_QUOTA as u16,
+                quota_used: 0,
+                is_online: false,
+                last_heartbeat: None,
+                addr: None,
+            };
+            if let Err(e) = n.accept_node(info, now) {
+                warn!(error = %e, "failed to persist invite-accepted node");
+            }
+            info!(
+                endpoint_id = ctx.endpoint_id,
+                name = effective_name,
+                "node auto-accepted via invite"
+            );
+            drop(n);
+
+            // Register services directly (node is now whitelisted).
+            let result = {
+                let mut n = ctx.node.write().await;
+                n.register_services(ctx.endpoint_id, ctx.node_name, &services, now)
+            };
+            return finish_register(ctx, result, send).await;
+        }
+        // Invalid/expired invite — fall through to normal ticket flow.
+    }
 
     // Decode ticket.
     let ticket = match JoinTicket::from_bs58(auth_ticket_str) {
@@ -1067,8 +1188,8 @@ async fn handle_register(
 
     // Validate ticket (expiry, replay, endpoint match).
     {
-        let mut n = node.write().await;
-        if let Err(e) = n.validate_ticket(&ticket, endpoint_id, now) {
+        let mut n = ctx.node.write().await;
+        if let Err(e) = n.validate_ticket(&ticket, ctx.endpoint_id, now) {
             let reason = format!("ticket validation failed: {e}");
             warn!(%reason, "register rejected");
             mesh_proto::frame::write_json(send, &ControlMessage::RegisterNack { reason })
@@ -1080,15 +1201,25 @@ async fn handle_register(
 
     // Register services (quota check + port allocation, atomic).
     let result = {
-        let mut n = node.write().await;
-        n.register_services(endpoint_id, node_name, &services, now)
+        let mut n = ctx.node.write().await;
+        n.register_services(ctx.endpoint_id, ctx.node_name, &services, now)
     };
 
+    finish_register(ctx, result, send).await
+}
+
+/// Send RegisterAck/Nack based on the service registration result and broadcast
+/// routes on success.
+async fn finish_register(
+    ctx: &RegisterContext<'_>,
+    result: Result<Vec<PortAssignment>, String>,
+    send: &mut iroh::endpoint::SendStream,
+) -> anyhow::Result<()> {
     match result {
         Ok(assignments) => {
             info!(
-                endpoint_id,
-                node_name,
+                endpoint_id = ctx.endpoint_id,
+                node_name = ctx.node_name,
                 count = assignments.len(),
                 "node registered successfully"
             );
@@ -1096,7 +1227,7 @@ async fn handle_register(
                 .await
                 .context("failed to send RegisterAck")?;
 
-            if let Err(error) = write_full_route_table(node, send).await {
+            if let Err(error) = write_full_route_table(ctx.node, send).await {
                 warn!(
                     error = %error,
                     "failed to send initial route table after registration"
@@ -1105,7 +1236,7 @@ async fn handle_register(
 
             // TODO: Debounce this fan-out when many edges re-register at once to avoid O(N^2)
             // route broadcasts during control-plane churn.
-            broadcast_routes(node, active_connections, Some(endpoint_id)).await;
+            broadcast_routes(ctx.node, ctx.active_connections, Some(ctx.endpoint_id)).await;
         }
         Err(reason) => {
             warn!(%reason, "register rejected");
@@ -1704,5 +1835,148 @@ mod tests {
 
         assert!(cn.services.is_empty());
         assert_eq!(cn.whitelist.get("ep-unknown"), None);
+    }
+
+    // -- Invite token tests --
+
+    #[test]
+    fn test_generate_invite_creates_token() {
+        let mut cn = ControlNode::new();
+        let token = cn.generate_invite(Some("my-edge".into()), Some(120), "addr-abc");
+
+        assert_eq!(token.control_addr, "addr-abc");
+        assert_eq!(token.ttl_seconds, 120);
+        assert_eq!(token.node_name, Some("my-edge".to_owned()));
+        assert_ne!(token.nonce, [0u8; 16]);
+        assert_eq!(cn.pending_invites.len(), 1);
+    }
+
+    #[test]
+    fn test_generate_invite_clamps_ttl() {
+        let mut cn = ControlNode::new();
+        // TTL above max should be clamped.
+        let token = cn.generate_invite(None, Some(99999), "addr");
+        assert_eq!(token.ttl_seconds, MAX_INVITE_TTL_SECONDS);
+    }
+
+    #[test]
+    fn test_generate_invite_default_ttl() {
+        let mut cn = ControlNode::new();
+        let token = cn.generate_invite(None, None, "addr");
+        assert_eq!(token.ttl_seconds, DEFAULT_INVITE_TTL_SECONDS);
+    }
+
+    #[test]
+    fn test_check_and_consume_invite_valid() {
+        let mut cn = ControlNode::new();
+        let token = cn.generate_invite(Some("edge-1".into()), Some(300), "addr");
+        let nonce_bs58 = bs58::encode(token.nonce).into_string();
+
+        let invite = cn.check_and_consume_invite(&nonce_bs58);
+        assert!(invite.is_some());
+        let invite = invite.unwrap();
+        assert_eq!(invite.node_name, Some("edge-1".to_owned()));
+    }
+
+    #[test]
+    fn test_invite_consumed_only_once() {
+        let mut cn = ControlNode::new();
+        let token = cn.generate_invite(None, Some(300), "addr");
+        let nonce_bs58 = bs58::encode(token.nonce).into_string();
+
+        assert!(cn.check_and_consume_invite(&nonce_bs58).is_some());
+        assert!(cn.check_and_consume_invite(&nonce_bs58).is_none());
+    }
+
+    #[test]
+    fn test_expired_invite_rejected() {
+        let mut cn = ControlNode::new();
+        // Insert a pending invite that's already expired (created_at in the past, ttl=0).
+        let nonce: [u8; 16] = [42u8; 16];
+        cn.pending_invites.insert(
+            nonce,
+            PendingInvite {
+                node_name: None,
+                created_at: 1000,
+                ttl_seconds: 0,
+            },
+        );
+        let nonce_bs58 = bs58::encode(nonce).into_string();
+
+        assert!(cn.check_and_consume_invite(&nonce_bs58).is_none());
+        // Expired invite should also be removed from the map.
+        assert!(cn.pending_invites.is_empty());
+    }
+
+    #[test]
+    fn test_invalid_nonce_returns_none() {
+        let mut cn = ControlNode::new();
+        cn.generate_invite(None, Some(300), "addr");
+
+        // Wrong nonce
+        assert!(cn.check_and_consume_invite("bogus-nonce").is_none());
+        // Map should still have the real invite.
+        assert_eq!(cn.pending_invites.len(), 1);
+    }
+
+    #[test]
+    fn test_cleanup_expired_invites() {
+        let mut cn = ControlNode::new();
+        // Insert one expired and one valid invite.
+        cn.pending_invites.insert(
+            [1u8; 16],
+            PendingInvite {
+                node_name: None,
+                created_at: 1000,
+                ttl_seconds: 10,
+            },
+        );
+        // This one is fresh (created_at = current time).
+        let token = cn.generate_invite(None, Some(300), "addr");
+        assert_eq!(cn.pending_invites.len(), 2);
+
+        cn.cleanup_expired_invites();
+
+        // The expired one should be gone, the fresh one should remain.
+        assert_eq!(cn.pending_invites.len(), 1);
+        assert!(cn.pending_invites.contains_key(&token.nonce));
+    }
+
+    #[test]
+    fn test_invite_auto_accept_registration() {
+        let mut cn = ControlNode::new();
+        let token = cn.generate_invite(Some("invited-edge".into()), Some(300), "addr");
+        let nonce_bs58 = bs58::encode(token.nonce).into_string();
+
+        // Simulate invite check + auto-accept.
+        let invite = cn.check_and_consume_invite(&nonce_bs58).unwrap();
+        let name = invite.node_name.as_deref().unwrap_or("fallback");
+        let info = NodeInfo {
+            endpoint_id: "ep-invited".to_owned(),
+            node_name: name.to_owned(),
+            quota_limit: DEFAULT_SERVICE_QUOTA as u16,
+            quota_used: 0,
+            is_online: false,
+            last_heartbeat: None,
+            addr: None,
+        };
+        cn.accept_node(info, 9999).unwrap();
+
+        // Now register_services should succeed (node is whitelisted).
+        let result = cn.register_services("ep-invited", "invited-edge", &[], 10000);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_invalid_invite_falls_through_to_whitelist() {
+        let mut cn = ControlNode::new();
+
+        // No invite exists for this nonce — should fall through.
+        let result = cn.check_and_consume_invite("nonexistent");
+        assert!(result.is_none());
+
+        // Without whitelist entry, register_services should fail.
+        let result = cn.register_services("ep-unknown", "some-node", &[], 10000);
+        assert!(result.is_err());
     }
 }

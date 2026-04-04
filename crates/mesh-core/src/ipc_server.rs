@@ -294,9 +294,9 @@ async fn dispatch(request: &IpcRequest, state: &SharedState) -> IpcResponse {
         IpcRequest::AcceptNode { ticket, node_name } => {
             handle_accept_node(state, ticket, node_name.as_deref()).await
         }
-        IpcRequest::Invite { .. } => IpcResponse::Error {
-            message: "invite token generation not yet implemented".to_string(),
-        },
+        IpcRequest::Invite { name, ttl_seconds } => {
+            handle_invite(state, name.clone(), *ttl_seconds).await
+        }
     }
 }
 
@@ -568,6 +568,51 @@ async fn handle_accept_node(
 
     IpcResponse::Ok {
         message: format!("node {name} ({}) accepted", ticket.endpoint_id),
+    }
+}
+
+/// Handle Invite: generate an invite token (control only).
+async fn handle_invite(
+    state: &SharedState,
+    name: Option<String>,
+    ttl_seconds: Option<u64>,
+) -> IpcResponse {
+    if state.config.role != NodeRole::Control {
+        return IpcResponse::Error {
+            message: "invite is only available on control nodes".to_string(),
+        };
+    }
+
+    // Obtain the control node's endpoint address from runtime state.
+    let control_addr = {
+        let runtime = match state.runtime.read() {
+            Ok(r) => r,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        runtime.endpoint_addr.clone()
+    };
+
+    let Some(control_addr) = control_addr else {
+        return IpcResponse::Error {
+            message: "control node endpoint address not yet available".to_string(),
+        };
+    };
+
+    let node_state = state.node_state.read().await;
+    let NodeState::Control(cn) = &*node_state else {
+        return IpcResponse::Error {
+            message: "control node not initialized".to_string(),
+        };
+    };
+
+    let mut cn = cn.write().await;
+    let token = cn.generate_invite(name, ttl_seconds, &control_addr);
+
+    match token.to_bs58() {
+        Ok(encoded) => IpcResponse::InviteResult { token: encoded },
+        Err(e) => IpcResponse::Error {
+            message: format!("failed to encode invite token: {e}"),
+        },
     }
 }
 

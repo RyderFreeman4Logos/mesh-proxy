@@ -439,6 +439,8 @@ impl Daemon {
 
         // Wait for shutdown signal (from signal handler or IPC stop command)
         let mut shutdown_rx = self.shutdown_rx();
+        let mut cleanup_interval = tokio::time::interval(Duration::from_secs(60));
+        cleanup_interval.tick().await; // consume the immediate first tick
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => {
@@ -452,6 +454,19 @@ impl Daemon {
 
                     if let Err(error) = self.reload_config(shared_config.as_ref()).await {
                         error!(error = %error, path = %self.config_path.display(), "failed to reload config");
+                    }
+                }
+                _ = cleanup_interval.tick() => {
+                    // Periodic cleanup: prune expired invites and tickets on control nodes.
+                    let ns = node_state_handle.read().await;
+                    if let crate::ipc_server::NodeState::Control(cn) = &*ns {
+                        let mut cn = cn.write().await;
+                        cn.cleanup_expired_invites();
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        cn.prune_expired_tickets(now);
                     }
                 }
             }
