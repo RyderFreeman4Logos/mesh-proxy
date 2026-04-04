@@ -4,12 +4,13 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use iroh::endpoint::presets;
 use mesh_core::edge_registration::run_registration_loop;
-use mesh_core::{ControlNode, EdgeNode, run_accept_loop};
+use mesh_core::{ControlNode, Daemon, EdgeNode, run_accept_loop};
 use mesh_proto::{
-    ALPN_CONTROL, DEFAULT_SERVICE_QUOTA, MeshConfig, NodeInfo, NodeRole, Protocol, ServiceEntry,
-    ServiceRegistration,
+    ALPN_CONTROL, DEFAULT_SERVICE_QUOTA, IpcRequest, IpcResponse, JoinTicket, MeshConfig, NodeInfo,
+    NodeRole, Protocol, ServiceEntry, ServiceRegistration, frame,
 };
 use tempfile::Builder;
+use tokio::net::UnixStream;
 use tokio::sync::{RwLock, broadcast, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
@@ -76,6 +77,45 @@ fn make_edge_config(
         services,
         data_dir,
     }
+}
+
+async fn send_ipc_request(
+    socket_path: &std::path::Path,
+    request: &IpcRequest,
+) -> Result<IpcResponse> {
+    let mut stream = UnixStream::connect(socket_path).await.with_context(|| {
+        format!(
+            "failed to connect to IPC server at {}",
+            socket_path.display()
+        )
+    })?;
+    frame::write_json(&mut stream, request).await?;
+    let response = frame::read_json(&mut stream).await?;
+    Ok(response)
+}
+
+async fn wait_for_join_ticket(data_dir: &std::path::Path) -> Result<JoinTicket> {
+    let ticket_path = data_dir.join("join_ticket.txt");
+    timeout(Duration::from_secs(5), async {
+        loop {
+            match std::fs::read_to_string(&ticket_path) {
+                Ok(ticket_bs58) => {
+                    return JoinTicket::from_bs58(ticket_bs58.trim())
+                        .context("failed to decode join ticket");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to read join ticket at {}", ticket_path.display())
+                    });
+                }
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for daemon join ticket")?
 }
 
 struct RegistrationHarness {
@@ -605,4 +645,78 @@ async fn test_reregistration_broadcasts_route_updates_to_other_edges() -> Result
     })
     .await
     .context("edge re-registration broadcast integration test timed out")?
+}
+
+#[tokio::test]
+async fn test_ipc_expose_triggers_runtime_reregistration() -> Result<()> {
+    timeout(Duration::from_secs(20), async {
+        let control = ControlRegistrationHarness::start().await?;
+        let tempdir = writable_tempdir("mesh-core-phase6-ipc-expose-");
+        let config_path = tempdir.path().join("config.toml");
+        let initial_config = make_edge_config(
+            control.control_addr()?,
+            tempdir.path().join("data"),
+            vec![make_service_entry("echo", "127.0.0.1:18080")],
+        );
+        initial_config.save(&config_path)?;
+
+        let socket_path = initial_config.data_dir.join("daemon.sock");
+        let data_dir = initial_config.data_dir.clone();
+        let mut daemon = Daemon::new_without_startup_signal(initial_config, config_path);
+        let daemon_shutdown_tx = daemon.shutdown_tx().clone();
+        let daemon_handle = tokio::spawn(async move { daemon.run().await });
+
+        let test_result: Result<()> = async {
+            let ticket = wait_for_join_ticket(&data_dir).await?;
+            control.allow_edge(&ticket.endpoint_id, "edge-alpha").await;
+
+            control.wait_for_control_route("echo", 1).await;
+            let initial_route_version = control.control_node.read().await.route_version();
+
+            let response = send_ipc_request(
+                &socket_path,
+                &IpcRequest::ExposeService {
+                    name: "admin".to_string(),
+                    local_addr: "127.0.0.1:19090".to_string(),
+                    protocol: Protocol::Tcp,
+                    health_check: None,
+                },
+            )
+            .await?;
+            assert!(matches!(response, IpcResponse::ServiceExposed { .. }));
+
+            timeout(
+                Duration::from_millis(400),
+                control.wait_for_control_route("admin", initial_route_version + 1),
+            )
+            .await
+            .context("runtime re-registration should complete before config watcher debounce")?;
+
+            sleep(Duration::from_millis(800)).await;
+            let control_node = control.control_node.read().await;
+            assert_eq!(control_node.route_version(), initial_route_version + 1);
+            assert!(
+                control_node
+                    .routes()
+                    .values()
+                    .any(|route| route.service_name == "admin"),
+                "control should retain exactly one route-table update for the exposed service"
+            );
+            Ok(())
+        }
+        .await;
+
+        let _ = daemon_shutdown_tx.send(());
+        let daemon_result = timeout(Duration::from_secs(10), daemon_handle)
+            .await
+            .context("daemon task did not exit in time")?
+            .context("daemon task panicked")?;
+        let control_shutdown = control.shutdown().await;
+
+        daemon_result?;
+        control_shutdown?;
+        test_result
+    })
+    .await
+    .context("IPC expose runtime re-registration integration test timed out")?
 }

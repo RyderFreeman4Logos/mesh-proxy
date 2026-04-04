@@ -121,6 +121,21 @@ impl Daemon {
         }
     }
 
+    /// Create a daemon without a startup-notification pipe.
+    ///
+    /// This is intended for in-process integration tests and embedders that do
+    /// not fork before starting the runtime.
+    pub fn new_without_startup_signal(config: MeshConfig, config_path: PathBuf) -> Self {
+        let (shutdown_tx, _) = broadcast::channel(1);
+        Self {
+            config,
+            config_path,
+            shutdown_tx,
+            startup_ready: None,
+            service_change_tx: None,
+        }
+    }
+
     /// Returns a new shutdown receiver.
     pub fn shutdown_rx(&self) -> ShutdownRx {
         self.shutdown_tx.subscribe()
@@ -584,6 +599,12 @@ impl Daemon {
             .await
             .map_err(anyhow::Error::from)??;
 
+        // Avoid duplicate runtime work when IPC and the config watcher report
+        // the same on-disk config update back-to-back.
+        if new_config == self.config {
+            return Ok(());
+        }
+
         if self.config.role == NodeRole::Edge {
             let diff = ServiceDiff::between(&self.config.services, &new_config.services);
             diff.log(&self.config_path, new_config.services.len());
@@ -730,11 +751,15 @@ fn services_by_name(services: &[ServiceEntry]) -> BTreeMap<String, ServiceEntry>
 mod tests {
     use super::*;
     use iroh::endpoint::presets;
-    use mesh_proto::{ALPN_PROXY, DEFAULT_SERVICE_QUOTA, NodeInfo, Protocol, ServiceRegistration};
+    use mesh_proto::{
+        ALPN_CONTROL, ALPN_PROXY, DEFAULT_SERVICE_QUOTA, IpcRequest, IpcResponse, NodeInfo,
+        Protocol, ServiceRegistration, frame,
+    };
     use tempfile::Builder;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpStream;
-    use tokio::time::timeout;
+    use tokio::net::UnixStream;
+    use tokio::time::{sleep, timeout};
 
     fn make_node(endpoint_id: &str) -> NodeInfo {
         NodeInfo {
@@ -755,6 +780,78 @@ mod tests {
             protocol: Protocol::Tcp,
             health_check: None,
         }
+    }
+
+    fn make_service_entry(name: &str, local_addr: &str) -> ServiceEntry {
+        ServiceEntry {
+            name: name.to_string(),
+            local_addr: local_addr.to_string(),
+            protocol: Protocol::Tcp,
+            health_check: None,
+        }
+    }
+
+    async fn build_control_endpoint() -> Result<iroh::Endpoint> {
+        iroh::Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN_CONTROL.to_vec()])
+            .bind()
+            .await
+            .context("failed to bind control endpoint")
+    }
+
+    fn make_edge_config(
+        control_addr: String,
+        data_dir: PathBuf,
+        services: Vec<ServiceEntry>,
+    ) -> MeshConfig {
+        MeshConfig {
+            node_name: "edge-alpha".to_string(),
+            role: NodeRole::Edge,
+            control_addr: Some(control_addr),
+            enable_local_proxy: false,
+            health_bind: None,
+            services,
+            data_dir,
+        }
+    }
+
+    async fn send_ipc_request(socket_path: &Path, request: &IpcRequest) -> Result<IpcResponse> {
+        let mut stream = UnixStream::connect(socket_path).await.with_context(|| {
+            format!(
+                "failed to connect to IPC server at {}",
+                socket_path.display()
+            )
+        })?;
+        frame::write_json(&mut stream, request).await?;
+        let response = frame::read_json(&mut stream).await?;
+        Ok(response)
+    }
+
+    async fn wait_for_control_service(
+        control_node: &Arc<tokio::sync::RwLock<ControlNode>>,
+        endpoint_id: &str,
+        service_name: &str,
+        minimum_version: u64,
+    ) -> Result<()> {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let ready = {
+                    let control = control_node.read().await;
+                    control.route_version() >= minimum_version
+                        && control.routes().values().any(|route| {
+                            route.endpoint_id == endpoint_id && route.service_name == service_name
+                        })
+                };
+
+                if ready {
+                    return;
+                }
+
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .context("timed out waiting for control service registration")
     }
 
     fn available_tcp_port() -> u16 {
@@ -973,5 +1070,155 @@ mod tests {
         let _ = shutdown_tx.send(());
         handle.await.unwrap();
         endpoint.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_ipc_expose_triggers_runtime_reregistration() -> Result<()> {
+        timeout(Duration::from_secs(15), async {
+            let control_endpoint = build_control_endpoint().await?;
+            let edge_endpoint = build_control_endpoint().await?;
+            let edge_endpoint_id = edge_endpoint.id().to_string();
+            let control_node = Arc::new(tokio::sync::RwLock::new(ControlNode::new()));
+            {
+                let mut control = control_node.write().await;
+                control.add_node(make_node(&edge_endpoint_id));
+            }
+
+            let (accept_shutdown_tx, accept_shutdown_rx) = broadcast::channel(4);
+            let accept_handle = tokio::spawn(crate::control_node::run_accept_loop(
+                Arc::clone(&control_node),
+                control_endpoint.clone(),
+                accept_shutdown_rx,
+            ));
+
+            let dir = Builder::new()
+                .prefix("mesh-daemon-expose-reregister-")
+                .tempdir_in("/tmp")
+                .context("failed to create daemon test tempdir")?;
+            let config_path = dir.path().join("config.toml");
+            let socket_path = dir.path().join("daemon.sock");
+            let control_addr = serde_json::to_string(&control_endpoint.addr())
+                .context("failed to serialize control address")?;
+            let initial_config = make_edge_config(
+                control_addr.clone(),
+                dir.path().join("data"),
+                vec![make_service_entry("echo", "127.0.0.1:18080")],
+            );
+            initial_config.save(&config_path)?;
+
+            let runtime_config = Arc::new(tokio::sync::RwLock::new(initial_config.clone()));
+            let edge_node = Arc::new(tokio::sync::RwLock::new(EdgeNode::with_endpoint(
+                edge_endpoint.clone(),
+            )));
+            let (service_change_tx, service_change_rx) = watch::channel(());
+            let (registration_shutdown_tx, registration_shutdown_rx) = broadcast::channel(4);
+            let registration_handle =
+                tokio::spawn(crate::edge_registration::run_registration_loop(
+                    edge_endpoint.clone(),
+                    control_addr,
+                    "edge-alpha".to_string(),
+                    Arc::clone(&runtime_config),
+                    Arc::clone(&edge_node),
+                    service_change_rx,
+                    registration_shutdown_rx,
+                ));
+
+            let (reload_tx, mut reload_rx) = mpsc::channel(8);
+            let _watcher = ConfigWatcher::new(config_path.clone(), reload_tx.clone())?;
+            let ipc_shutdown_tx = broadcast::channel(4).0;
+            let ipc_shutdown_rx = ipc_shutdown_tx.subscribe();
+            let ipc_server = crate::ipc_server::IpcServer::bind(
+                &socket_path,
+                ipc_shutdown_tx.clone(),
+                initial_config.clone(),
+                config_path.clone(),
+                reload_tx,
+            )
+            .await?;
+            ipc_server.attach_edge_node(Arc::clone(&edge_node)).await;
+            let ipc_handle = tokio::spawn(async move { ipc_server.run(ipc_shutdown_rx).await });
+
+            let mut daemon = Daemon {
+                config: initial_config,
+                config_path: config_path.clone(),
+                shutdown_tx: broadcast::channel(1).0,
+                startup_ready: None,
+                service_change_tx: Some(service_change_tx),
+            };
+
+            let test_result: Result<()> = async {
+                wait_for_control_service(&control_node, &edge_endpoint_id, "echo", 1).await?;
+                let initial_route_version = control_node.read().await.route_version();
+
+                let response = send_ipc_request(
+                    &socket_path,
+                    &IpcRequest::ExposeService {
+                        name: "admin".to_string(),
+                        local_addr: "127.0.0.1:19090".to_string(),
+                        protocol: Protocol::Tcp,
+                        health_check: None,
+                    },
+                )
+                .await?;
+                assert!(matches!(response, IpcResponse::ServiceExposed { .. }));
+
+                let explicit_reload = timeout(Duration::from_millis(250), reload_rx.recv())
+                    .await
+                    .context("timed out waiting for explicit reload signal")?;
+                assert_eq!(explicit_reload, Some(()));
+
+                daemon.reload_config(Some(&runtime_config)).await?;
+                wait_for_control_service(
+                    &control_node,
+                    &edge_endpoint_id,
+                    "admin",
+                    initial_route_version + 1,
+                )
+                .await?;
+
+                let watcher_reload = timeout(Duration::from_secs(5), reload_rx.recv())
+                    .await
+                    .context("timed out waiting for config watcher reload signal")?;
+                assert_eq!(watcher_reload, Some(()));
+
+                daemon.reload_config(Some(&runtime_config)).await?;
+                sleep(Duration::from_millis(200)).await;
+
+                let control = control_node.read().await;
+                assert_eq!(control.route_version(), initial_route_version + 1);
+                assert!(
+                    control
+                        .routes()
+                        .values()
+                        .any(|route| route.service_name == "admin"),
+                    "control route table should contain the newly exposed service"
+                );
+                Ok(())
+            }
+            .await;
+
+            let _ = ipc_shutdown_tx.send(());
+            let _ = registration_shutdown_tx.send(());
+            let _ = accept_shutdown_tx.send(());
+            edge_endpoint.close().await;
+            control_endpoint.close().await;
+
+            timeout(Duration::from_secs(2), ipc_handle)
+                .await
+                .context("IPC server task did not exit in time")?
+                .context("IPC server task panicked")??;
+            timeout(Duration::from_secs(2), registration_handle)
+                .await
+                .context("registration loop did not exit in time")?
+                .context("registration loop panicked")?;
+            timeout(Duration::from_secs(2), accept_handle)
+                .await
+                .context("accept loop did not exit in time")?
+                .context("accept loop panicked")?;
+
+            test_result
+        })
+        .await
+        .context("timed out waiting for IPC expose re-registration test")?
     }
 }

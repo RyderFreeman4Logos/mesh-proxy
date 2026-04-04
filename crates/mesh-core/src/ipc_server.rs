@@ -583,6 +583,12 @@ async fn handle_expose_service(
         };
     }
 
+    if let Err(error) = state.reload_tx.send(()).await {
+        return IpcResponse::Error {
+            message: format!("service saved to config but failed to trigger reload: {error}"),
+        };
+    }
+
     IpcResponse::ServiceExposed {
         name: name.to_owned(),
         assigned_port: Some(0),
@@ -1194,7 +1200,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_expose_service_writes_service_to_config() {
-        let (state, _dir, _reload_rx) = shared_state(NodeRole::Edge);
+        let (state, _dir, mut reload_rx) = shared_state(NodeRole::Edge);
         let health_check = Some(HealthCheckConfig {
             mode: HealthCheckMode::HttpGet,
             target: Some("http://127.0.0.1:8080/health".to_string()),
@@ -1221,6 +1227,7 @@ mod tests {
         };
         assert_eq!(name, "web");
         assert_eq!(assigned_port, Some(0));
+        assert_eq!(reload_rx.recv().await, Some(()));
 
         let updated = MeshConfig::load(&state.config_path).unwrap();
         assert_eq!(
