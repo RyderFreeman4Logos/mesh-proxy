@@ -179,8 +179,7 @@ impl Daemon {
         });
 
         // Initialize iroh endpoint
-        let mesh_node =
-            crate::mesh_node::MeshNode::new(&mut self.config, &self.config_path).await?;
+        let mesh_node = crate::mesh_node::MeshNode::new(&self.config.data_dir).await?;
         let endpoint_id = mesh_node.id().to_string();
         let endpoint_addr = serde_json::to_string(&mesh_node.endpoint().addr())
             .context("failed to serialize endpoint address")?;

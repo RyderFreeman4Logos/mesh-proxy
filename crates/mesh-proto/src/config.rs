@@ -19,8 +19,6 @@ pub enum Protocol {
 pub struct MeshConfig {
     pub node_name: String,
     pub role: NodeRole,
-    /// Secret key bytes (base58-encoded Ed25519 seed), persisted across restarts.
-    pub secret_key: Option<String>,
     /// For edge nodes: the control node's endpoint address (serialized).
     pub control_addr: Option<String>,
     /// Optional bind address for the local health query HTTP endpoint.
@@ -70,7 +68,6 @@ impl Default for MeshConfig {
                 .map(|h| h.to_string_lossy().into_owned())
                 .unwrap_or_else(|_| "unnamed".to_string()),
             role: NodeRole::Edge,
-            secret_key: None,
             control_addr: None,
             health_bind: None,
             services: Vec::new(),
@@ -138,7 +135,7 @@ impl MeshConfig {
         std::fs::write(&tmp_path, content.as_bytes())
             .with_context(|| format!("failed to write temp config at {}", tmp_path.display()))?;
 
-        // Set restrictive permissions (config may contain secret_key).
+        // Keep config private to the current user.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -174,7 +171,6 @@ mod tests {
         MeshConfig {
             node_name: "test-node".to_string(),
             role: NodeRole::Control,
-            secret_key: Some("5HueCGU8rMjxEXxiPuD5BDku4MkFqeZyd4dZ1jvhTVqvbTLvyTJ".to_string()),
             control_addr: None,
             health_bind: None,
             services: vec![ServiceEntry {
@@ -208,7 +204,6 @@ mod tests {
         let config = MeshConfig::load(&path).unwrap();
         assert!(path.exists());
         assert_eq!(config.role, NodeRole::Edge);
-        assert!(config.secret_key.is_none());
     }
 
     #[test]

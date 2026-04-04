@@ -70,7 +70,6 @@ fn make_edge_config(
     MeshConfig {
         node_name: "edge-alpha".to_string(),
         role: NodeRole::Edge,
-        secret_key: None,
         control_addr: Some(control_addr),
         health_bind: None,
         services,
