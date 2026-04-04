@@ -94,6 +94,17 @@ enum Command {
         name: Option<String>,
     },
 
+    /// Generate an invite token for a new edge node (control node only).
+    Invite {
+        /// Friendly name for the joining node.
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Token validity duration in seconds (default: 300, max: 3600).
+        #[arg(long, default_value = "300")]
+        ttl: u64,
+    },
+
     /// Manage per-node service quotas (control node only).
     Quota {
         #[command(subcommand)]
@@ -225,6 +236,7 @@ fn main() -> Result<()> {
                         }
                         Command::Unexpose { name } => cmd_unexpose(&config, name).await,
                         Command::Accept { ticket, name } => cmd_accept(&config, ticket, name).await,
+                        Command::Invite { name, ttl } => cmd_invite(&config, name, ttl).await,
                         Command::Quota { command } => cmd_quota(&config, command).await,
                         Command::Start { .. } | Command::Restart => unreachable!(),
                     }
@@ -637,6 +649,35 @@ async fn cmd_accept(config_path: &Path, ticket: String, name: Option<String>) ->
         }
         IpcResponse::Error { message } => {
             anyhow::bail!("accept failed: {message}");
+        }
+        other => {
+            anyhow::bail!("unexpected response: {other:?}");
+        }
+    }
+
+    Ok(())
+}
+
+/// Generate an invite token via IPC (control node only).
+async fn cmd_invite(config_path: &Path, name: Option<String>, ttl: u64) -> Result<()> {
+    let request = IpcRequest::Invite {
+        name,
+        ttl_seconds: Some(ttl),
+    };
+
+    let socket_path = daemon_socket_path(config_path)?;
+    let response = send_ipc_request(&socket_path, &request, "invite").await?;
+
+    match response {
+        IpcResponse::InviteResult { token } => {
+            println!("Invite token (expires in {ttl}s):");
+            println!("{token}");
+            println!();
+            println!("On the new node, run:");
+            println!("  mesh-proxy join {token}");
+        }
+        IpcResponse::Error { message } => {
+            anyhow::bail!("invite failed: {message}");
         }
         other => {
             anyhow::bail!("unexpected response: {other:?}");
@@ -1135,6 +1176,47 @@ mod tests {
                 assert_eq!(name.as_deref(), Some("node-alpha"));
             }
             other => panic!("expected Accept, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cli_invite_defaults() {
+        let cli = Cli::try_parse_from(["mesh-proxy", "invite"]).unwrap();
+
+        match cli.command {
+            Command::Invite { name, ttl } => {
+                assert!(name.is_none());
+                assert_eq!(ttl, 300);
+            }
+            other => panic!("expected Invite, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cli_invite_with_name_and_ttl() {
+        let cli =
+            Cli::try_parse_from(["mesh-proxy", "invite", "--name", "worker-1", "--ttl", "600"])
+                .unwrap();
+
+        match cli.command {
+            Command::Invite { name, ttl } => {
+                assert_eq!(name.as_deref(), Some("worker-1"));
+                assert_eq!(ttl, 600);
+            }
+            other => panic!("expected Invite, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cli_invite_name_only() {
+        let cli = Cli::try_parse_from(["mesh-proxy", "invite", "--name", "edge-node"]).unwrap();
+
+        match cli.command {
+            Command::Invite { name, ttl } => {
+                assert_eq!(name.as_deref(), Some("edge-node"));
+                assert_eq!(ttl, 300);
+            }
+            other => panic!("expected Invite, got {other:?}"),
         }
     }
 }
