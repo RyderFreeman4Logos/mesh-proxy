@@ -94,6 +94,7 @@ async fn wait_before_retry(shutdown: &mut broadcast::Receiver<()>) -> bool {
 async fn apply_register_ack(
     edge_node: &Arc<RwLock<EdgeNode>>,
     config: &Arc<RwLock<MeshConfig>>,
+    control_endpoint_id: &str,
     endpoint_id: &str,
     node_name: &str,
     snapshot: &RegistrationSnapshot,
@@ -138,6 +139,7 @@ async fn apply_register_ack(
     // RegisterAck does not carry a route-table version, so advance a local
     // synthetic version to apply listener changes until a fresher snapshot arrives.
     let next_version = edge.route_version().saturating_add(1);
+    edge.set_control_endpoint_id(Some(control_endpoint_id.to_owned()));
     let applied = edge
         .apply_route_update(merged_routes, next_version, Arc::clone(config))
         .await;
@@ -194,9 +196,65 @@ async fn read_registration_follow_up(
     }
 }
 
+async fn request_full_route_table(
+    connection: &iroh::endpoint::Connection,
+) -> Result<(HashMap<u16, RouteEntry>, u64)> {
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .context("failed to open full route sync stream")?;
+    write_json(&mut send, &ControlMessage::RouteTableRequest)
+        .await
+        .context("failed to request full route table")?;
+    send.finish()
+        .map_err(|error| anyhow!("failed to finish full route sync stream: {error}"))?;
+
+    match read_json(&mut recv)
+        .await
+        .context("failed to read full route sync response")?
+    {
+        ControlMessage::RouteTableUpdate { routes, version } => Ok((routes, version)),
+        other => Err(anyhow!(
+            "unexpected response to full route sync request: {other:?}"
+        )),
+    }
+}
+
+async fn purge_routes_if_control_identity_changed(
+    edge_node: &Arc<RwLock<EdgeNode>>,
+    config: &Arc<RwLock<MeshConfig>>,
+    control_endpoint_id: &str,
+) -> Result<()> {
+    let data_dir = {
+        let config = config.read().await;
+        config.data_dir.clone()
+    };
+
+    let mut edge = edge_node.write().await;
+    let Some(cached_control_endpoint_id) = edge.control_endpoint_id().map(str::to_owned) else {
+        return Ok(());
+    };
+    if cached_control_endpoint_id == control_endpoint_id {
+        return Ok(());
+    }
+
+    info!(
+        %cached_control_endpoint_id,
+        %control_endpoint_id,
+        "control identity changed, purging cached route table"
+    );
+    edge.purge_route_cache().await;
+    edge.set_control_endpoint_id(Some(control_endpoint_id.to_owned()));
+    edge.save_route_cache(&data_dir)
+        .await
+        .context("failed to persist purged route cache after control identity change")?;
+    Ok(())
+}
+
 async fn apply_route_table_update(
     edge_node: &Arc<RwLock<EdgeNode>>,
     config: &Arc<RwLock<MeshConfig>>,
+    control_endpoint_id: &str,
     routes: HashMap<u16, RouteEntry>,
     version: u64,
     force: bool,
@@ -207,6 +265,7 @@ async fn apply_route_table_update(
     };
 
     let mut edge = edge_node.write().await;
+    edge.set_control_endpoint_id(Some(control_endpoint_id.to_owned()));
     if force {
         // After fresh registration, always apply the route table from control
         // regardless of cached version (the control is authoritative).
@@ -232,6 +291,7 @@ async fn apply_route_table_update(
 async fn send_register(
     connection: &iroh::endpoint::Connection,
     endpoint_id: &str,
+    control_endpoint_id: &str,
     node_name: &str,
     config: &Arc<RwLock<MeshConfig>>,
     edge_node: &Arc<RwLock<EdgeNode>>,
@@ -281,20 +341,37 @@ async fn send_register(
                         error = %error,
                         "failed to read route table follow-up after register ack"
                     );
-                    None
+                    match request_full_route_table(connection).await {
+                        Ok(route_update) => Some(route_update),
+                        Err(request_error) => {
+                            warn!(
+                                error = %request_error,
+                                "failed to request full route table after register follow-up error"
+                            );
+                            None
+                        }
+                    }
                 }
             };
 
             if let Some((routes, version)) = initial_route_update {
-                apply_route_table_update(edge_node, config, routes, version, true)
-                    .await
-                    .context("failed to apply initial route table after register ack")?;
+                apply_route_table_update(
+                    edge_node,
+                    config,
+                    control_endpoint_id,
+                    routes,
+                    version,
+                    true,
+                )
+                .await
+                .context("failed to apply initial route table after register ack")?;
             } else {
                 // Older control nodes may only return RegisterAck, so keep the
                 // synthetic merge path as a compatibility fallback.
                 apply_register_ack(
                     edge_node,
                     config,
+                    control_endpoint_id,
                     endpoint_id,
                     node_name,
                     &snapshot,
@@ -318,12 +395,21 @@ async fn send_register(
 async fn handle_control_message(
     edge_node: &Arc<RwLock<EdgeNode>>,
     config: &Arc<RwLock<MeshConfig>>,
+    control_endpoint_id: &str,
     send: &mut iroh::endpoint::SendStream,
     message: ControlMessage,
 ) -> Result<()> {
     match message {
         ControlMessage::RouteTableUpdate { routes, version } => {
-            apply_route_table_update(edge_node, config, routes, version, false).await?;
+            apply_route_table_update(
+                edge_node,
+                config,
+                control_endpoint_id,
+                routes,
+                version,
+                false,
+            )
+            .await?;
         }
         ControlMessage::Ping => {
             write_json(send, &ControlMessage::Pong)
@@ -365,6 +451,17 @@ pub async fn run_registration_loop(
             return;
         }
     };
+    let control_endpoint_id = control_endpoint.id.to_string();
+
+    if let Err(error) =
+        purge_routes_if_control_identity_changed(&edge_node, &config, &control_endpoint_id).await
+    {
+        warn!(
+            error = %error,
+            %control_endpoint_id,
+            "failed to purge stale route cache after control identity change"
+        );
+    }
 
     let endpoint_id = endpoint.id().to_string();
     let mut watch_open = true;
@@ -394,6 +491,7 @@ pub async fn run_registration_loop(
         match send_register(
             &connection,
             &endpoint_id,
+            &control_endpoint_id,
             &node_name,
             &config,
             &edge_node,
@@ -444,7 +542,13 @@ pub async fn run_registration_loop(
                         }
                     };
 
-                    if let Err(error) = handle_control_message(&edge_node, &config, &mut send, message).await {
+                    if let Err(error) = handle_control_message(
+                        &edge_node,
+                        &config,
+                        &control_endpoint_id,
+                        &mut send,
+                        message,
+                    ).await {
                         warn!(error = %error, "failed to handle control message");
                         break;
                     }
@@ -455,6 +559,7 @@ pub async fn run_registration_loop(
                             match send_register(
                                 &connection,
                                 &endpoint_id,
+                                &control_endpoint_id,
                                 &node_name,
                                 &config,
                                 &edge_node,
@@ -533,6 +638,7 @@ mod tests {
             data_dir: tempfile::tempdir_in("/tmp").unwrap().keep(),
             services: vec![test_service("local-api", "127.0.0.1:8080")],
         };
+        let control_endpoint_id = ENDPOINT_ID_B.to_owned();
         let endpoint_id = ENDPOINT_ID_A.to_owned();
         let remote_endpoint_id = ENDPOINT_ID_B.to_owned();
 
@@ -576,6 +682,7 @@ mod tests {
         apply_register_ack(
             &edge,
             &config,
+            &control_endpoint_id,
             &endpoint_id,
             "edge-a",
             &snapshot,
@@ -591,6 +698,10 @@ mod tests {
         assert!(edge.cached_routes().contains_key(&42000));
         assert!(!edge.cached_routes().contains_key(&41000));
         assert_eq!(
+            edge.control_endpoint_id(),
+            Some(control_endpoint_id.as_str())
+        );
+        assert_eq!(
             edge.cached_routes().get(&43000).unwrap(),
             &RouteEntry {
                 service_name: "local-api".to_string(),
@@ -600,5 +711,95 @@ mod tests {
                 protocol: Protocol::Tcp,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn test_force_route_table_update_bypasses_stale_cached_version() {
+        let tempdir = tempfile::tempdir_in("/tmp").unwrap();
+        let config = Arc::new(RwLock::new(MeshConfig {
+            data_dir: tempdir.path().to_path_buf(),
+            ..MeshConfig::default()
+        }));
+        let mut edge = EdgeNode::new();
+        edge.update_routes(
+            HashMap::from([(
+                41000,
+                RouteEntry {
+                    service_name: "stale".to_string(),
+                    node_name: "edge-old".to_string(),
+                    endpoint_id: ENDPOINT_ID_A.to_string(),
+                    target_local_addr: "127.0.0.1:7000".to_string(),
+                    protocol: Protocol::Tcp,
+                },
+            )]),
+            99,
+        );
+        let edge = Arc::new(RwLock::new(edge));
+
+        apply_route_table_update(
+            &edge,
+            &config,
+            ENDPOINT_ID_B,
+            HashMap::from([(
+                42000,
+                RouteEntry {
+                    service_name: "fresh".to_string(),
+                    node_name: "edge-new".to_string(),
+                    endpoint_id: ENDPOINT_ID_B.to_string(),
+                    target_local_addr: "127.0.0.1:8000".to_string(),
+                    protocol: Protocol::Tcp,
+                },
+            )]),
+            1,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let edge = edge.read().await;
+        assert_eq!(edge.route_version(), 1);
+        assert_eq!(edge.control_endpoint_id(), Some(ENDPOINT_ID_B));
+        assert!(!edge.cached_routes().contains_key(&41000));
+        assert!(edge.cached_routes().contains_key(&42000));
+    }
+
+    #[tokio::test]
+    async fn test_purge_routes_if_control_identity_changed_clears_stale_cache() {
+        let tempdir = tempfile::tempdir_in("/tmp").unwrap();
+        let config = Arc::new(RwLock::new(MeshConfig {
+            data_dir: tempdir.path().to_path_buf(),
+            ..MeshConfig::default()
+        }));
+        let mut edge = EdgeNode::new();
+        edge.update_routes(
+            HashMap::from([(
+                41000,
+                RouteEntry {
+                    service_name: "stale".to_string(),
+                    node_name: "edge-old".to_string(),
+                    endpoint_id: ENDPOINT_ID_A.to_string(),
+                    target_local_addr: "127.0.0.1:7000".to_string(),
+                    protocol: Protocol::Tcp,
+                },
+            )]),
+            7,
+        );
+        edge.set_control_endpoint_id(Some(ENDPOINT_ID_A.to_string()));
+        let edge = Arc::new(RwLock::new(edge));
+
+        purge_routes_if_control_identity_changed(&edge, &config, ENDPOINT_ID_B)
+            .await
+            .unwrap();
+
+        let edge = edge.read().await;
+        assert!(edge.cached_routes().is_empty());
+        assert_eq!(edge.route_version(), 0);
+        assert_eq!(edge.control_endpoint_id(), Some(ENDPOINT_ID_B));
+
+        let cache =
+            EdgeNode::load_route_cache(tempdir.path()).expect("purged route cache should persist");
+        assert!(cache.routes.is_empty());
+        assert_eq!(cache.version, 0);
+        assert_eq!(cache.control_endpoint_id.as_deref(), Some(ENDPOINT_ID_B));
     }
 }

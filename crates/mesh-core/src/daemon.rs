@@ -237,10 +237,16 @@ impl Daemon {
                 let edge_active_connections = Arc::new(AtomicUsize::new(0));
                 let shutdown_active_connections = Arc::clone(&edge_active_connections);
                 // Load persisted route cache if available.
-                if let Some((routes, version)) = EdgeNode::load_route_cache(&self.config.data_dir) {
+                if let Some(cache) = EdgeNode::load_route_cache(&self.config.data_dir) {
                     let mut edge = en.write().await;
-                    edge.update_routes(routes, version);
-                    info!(version, "loaded persisted route cache");
+                    let version = cache.version;
+                    let control_endpoint_id = cache.control_endpoint_id.clone();
+                    edge.restore_route_cache(cache);
+                    info!(
+                        version,
+                        ?control_endpoint_id,
+                        "loaded persisted route cache"
+                    );
                 }
                 {
                     let mut ns = node_state_handle.write().await;

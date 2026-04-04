@@ -448,6 +448,7 @@ async fn handle_control_inbound(
     data_dir: &Path,
 ) -> Result<()> {
     let remote_id = connection.remote_id();
+    let remote_id_string = remote_id.to_string();
     tracing::info!(%remote_id, "edge control connection established");
 
     loop {
@@ -470,6 +471,7 @@ async fn handle_control_inbound(
         match message {
             ControlMessage::RouteTableUpdate { routes, version } => {
                 let mut edge = node.write().await;
+                edge.set_control_endpoint_id(Some(remote_id_string.clone()));
                 let applied = edge
                     .apply_route_update(routes, version, Arc::clone(&config))
                     .await;
@@ -866,6 +868,7 @@ pub struct EdgeNode {
     shutdown_tx: broadcast::Sender<()>,
     /// Epoch timestamp of the last ping received from the control node.
     last_ping_from_control: Option<u64>,
+    control_endpoint_id: Option<String>,
 }
 
 impl Default for EdgeNode {
@@ -896,6 +899,7 @@ impl EdgeNode {
             connection_pool,
             shutdown_tx,
             last_ping_from_control: None,
+            control_endpoint_id: None,
         }
     }
 
@@ -961,9 +965,32 @@ impl EdgeNode {
         self.route_version = version;
     }
 
+    /// Restore a persisted route cache snapshot, including control metadata.
+    pub(crate) fn restore_route_cache(&mut self, cache: PersistedRouteCache) {
+        let PersistedRouteCache {
+            routes,
+            version,
+            control_endpoint_id,
+        } = cache;
+        replace_shared_routes(&self.shared_routes, &routes);
+        self.cached_routes = routes;
+        self.route_version = version;
+        self.control_endpoint_id = control_endpoint_id;
+    }
+
     /// Returns the route table version.
     pub fn route_version(&self) -> u64 {
         self.route_version
+    }
+
+    /// Returns the cached control endpoint identity, if known.
+    pub fn control_endpoint_id(&self) -> Option<&str> {
+        self.control_endpoint_id.as_deref()
+    }
+
+    /// Update the cached control endpoint identity.
+    pub fn set_control_endpoint_id(&mut self, control_endpoint_id: Option<String>) {
+        self.control_endpoint_id = control_endpoint_id;
     }
 
     /// Returns the number of active dynamic listeners currently tracked.
@@ -996,6 +1023,22 @@ impl EdgeNode {
         }
         self.apply_route_update_inner(routes, version, config).await;
         true
+    }
+
+    /// Drop all cached routes and dynamic listeners.
+    pub async fn purge_route_cache(&mut self) {
+        replace_shared_routes(&self.shared_routes, &HashMap::new());
+        self.cached_routes.clear();
+        self.route_version = 0;
+
+        let listener_handles = self
+            .listener_pool
+            .drain()
+            .map(|(_, handle)| handle)
+            .collect::<Vec<_>>();
+        for handle in listener_handles {
+            abort_listener(handle).await;
+        }
     }
 
     async fn apply_route_update_inner(
@@ -1056,9 +1099,10 @@ impl EdgeNode {
 
     /// Persist the cached route table and version to disk atomically.
     pub async fn save_route_cache(&self, data_dir: &Path) -> Result<(), PersistenceError> {
-        let cache = RouteCache {
+        let cache = PersistedRouteCache {
             routes: self.cached_routes.clone(),
             version: self.route_version,
+            control_endpoint_id: self.control_endpoint_id.clone(),
         };
         let path = data_dir.join("route_cache.json");
         persistence::save_atomic(&path, &cache).await
@@ -1067,10 +1111,10 @@ impl EdgeNode {
     /// Load a previously persisted route cache from disk.
     ///
     /// Returns `None` if the file does not exist.
-    pub fn load_route_cache(data_dir: &Path) -> Option<(HashMap<u16, RouteEntry>, u64)> {
+    pub(crate) fn load_route_cache(data_dir: &Path) -> Option<PersistedRouteCache> {
         let path = data_dir.join("route_cache.json");
-        match persistence::load_state::<RouteCache>(&path) {
-            Ok(Some(cache)) => Some((cache.routes, cache.version)),
+        match persistence::load_state::<PersistedRouteCache>(&path) {
+            Ok(Some(cache)) => Some(cache),
             Ok(None) => None,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to load route cache, starting fresh");
@@ -1082,15 +1126,17 @@ impl EdgeNode {
 
 /// Serializable wrapper for the route cache on disk.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct RouteCache {
-    routes: HashMap<u16, RouteEntry>,
-    version: u64,
+pub(crate) struct PersistedRouteCache {
+    pub routes: HashMap<u16, RouteEntry>,
+    pub version: u64,
+    pub control_endpoint_id: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::fs;
 
     use anyhow::{Context, Result};
     use iroh::address_lookup::memory::MemoryLookup;
@@ -1527,6 +1573,85 @@ mod tests {
         for (_, handle) in edge.listener_pool.drain() {
             handle.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn test_purge_route_cache_clears_routes_and_resets_version() {
+        let port = available_tcp_port();
+        let mut edge = EdgeNode::new();
+        let config = test_config(Vec::new());
+
+        edge.set_control_endpoint_id(Some("control-a".to_string()));
+        assert!(
+            edge.apply_route_update(
+                HashMap::from([(port, test_route("alpha", "endpoint-a"))]),
+                7,
+                Arc::clone(&config),
+            )
+            .await
+        );
+        assert_eq!(edge.listener_count(), 1);
+
+        edge.purge_route_cache().await;
+
+        assert!(edge.cached_routes().is_empty());
+        assert_eq!(edge.route_version(), 0);
+        assert_eq!(edge.control_endpoint_id(), Some("control-a"));
+        assert_eq!(edge.listener_count(), 0);
+        assert_tcp_listener_stopped(port).await;
+    }
+
+    #[tokio::test]
+    async fn test_route_cache_roundtrip_preserves_control_endpoint_id() -> Result<()> {
+        let tempdir = tempfile::tempdir_in("/tmp")?;
+        let mut edge = EdgeNode::new();
+
+        edge.update_routes(
+            HashMap::from([(41000, test_route("alpha", "endpoint-a"))]),
+            11,
+        );
+        edge.set_control_endpoint_id(Some("control-a".to_string()));
+        edge.save_route_cache(tempdir.path()).await?;
+
+        let cache = EdgeNode::load_route_cache(tempdir.path())
+            .context("route cache should be present after save")?;
+        assert_eq!(cache.version, 11);
+        assert_eq!(cache.control_endpoint_id.as_deref(), Some("control-a"));
+        assert_eq!(
+            cache.routes.get(&41000),
+            Some(&test_route("alpha", "endpoint-a"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_route_cache_accepts_legacy_format_without_control_identity() {
+        let tempdir = tempfile::tempdir_in("/tmp").unwrap();
+        let path = tempdir.path().join("route_cache.json");
+        let legacy_cache = serde_json::json!({
+            "routes": {
+                "41000": {
+                    "service_name": "alpha",
+                    "node_name": "edge-a",
+                "endpoint_id": "endpoint-a",
+                "target_local_addr": "127.0.0.1:8080",
+                    "protocol": "tcp"
+                }
+            },
+            "version": 3
+        });
+
+        fs::create_dir_all(tempdir.path()).unwrap();
+        fs::write(&path, serde_json::to_vec(&legacy_cache).unwrap()).unwrap();
+
+        let cache = EdgeNode::load_route_cache(tempdir.path())
+            .expect("legacy route cache should deserialize");
+        assert_eq!(cache.version, 3);
+        assert_eq!(cache.control_endpoint_id, None);
+        assert_eq!(
+            cache.routes.get(&41000),
+            Some(&test_route("alpha", "endpoint-a"))
+        );
     }
 
     #[tokio::test]

@@ -929,6 +929,11 @@ async fn handle_connection(
                         warn!(error = %e, "register handler failed");
                     }
                 }
+                ControlMessage::RouteTableRequest => {
+                    if let Err(error) = write_full_route_table(&node, &mut send).await {
+                        warn!(error = %error, "failed to respond to route table request");
+                    }
+                }
                 ControlMessage::HealthReport {
                     endpoint_id,
                     services,
@@ -965,6 +970,20 @@ async fn handle_connection(
         .remove_if_stale(&remote_id_string, &connection)
         .await;
     result
+}
+
+async fn write_full_route_table(
+    node: &Arc<RwLock<ControlNode>>,
+    send: &mut iroh::endpoint::SendStream,
+) -> anyhow::Result<()> {
+    let (routes, version) = {
+        let node = node.read().await;
+        (node.routes().clone(), node.route_version())
+    };
+    let route_update = ControlMessage::RouteTableUpdate { routes, version };
+    mesh_proto::frame::write_json(send, &route_update)
+        .await
+        .context("failed to send full route table")
 }
 
 /// Process a Register message: validate ticket, allocate ports, respond with Ack/Nack.
@@ -1023,15 +1042,7 @@ async fn handle_register(
                 .await
                 .context("failed to send RegisterAck")?;
 
-            let routes_and_version = {
-                let n = node.read().await;
-                (n.routes().clone(), n.route_version())
-            };
-            let route_update = ControlMessage::RouteTableUpdate {
-                routes: routes_and_version.0,
-                version: routes_and_version.1,
-            };
-            if let Err(error) = mesh_proto::frame::write_json(send, &route_update).await {
+            if let Err(error) = write_full_route_table(node, send).await {
                 warn!(
                     error = %error,
                     "failed to send initial route table after registration"
