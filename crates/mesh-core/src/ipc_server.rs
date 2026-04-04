@@ -8,22 +8,24 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use mesh_proto::{
     ConnectedNode, DEFAULT_SERVICE_QUOTA, HealthState, IpcRequest, IpcResponse, MeshConfig,
-    NodeInfo, NodeRole, Protocol, RouteEntry, ServiceDisplayStatus, ServiceStatus, StatusInfo,
+    NodeInfo, NodeRole, Protocol, RouteEntry, ServiceDisplayStatus, ServiceEntry, ServiceStatus,
+    StatusInfo,
 };
 use tokio::net::{TcpStream, UnixListener, UnixStream};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task;
 use tokio::time::timeout;
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 use tracing::{info, warn};
 
 use crate::control_node::ControlNode;
-use crate::daemon::{ShutdownRx, ShutdownTx};
+use crate::daemon::{PortAssignmentNotifier, ShutdownRx, ShutdownTx};
 use crate::edge_node::EdgeNode;
 use mesh_proto::frame;
 
 const INITIALIZING_ENDPOINT_ID: &str = "(initializing)";
 const STATUS_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+const EXPOSE_ASSIGNMENT_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Default)]
 struct MeshRuntimeState {
@@ -75,6 +77,8 @@ struct SharedState {
     config: MeshConfig,
     config_path: PathBuf,
     reload_tx: mpsc::Sender<()>,
+    port_assignment_notifier: PortAssignmentNotifier,
+    expose_assignment_timeout: Duration,
     runtime: Arc<RwLock<MeshRuntimeState>>,
     node_state: Arc<tokio::sync::RwLock<NodeState>>,
 }
@@ -94,6 +98,25 @@ impl IpcServer {
         config_path: PathBuf,
         reload_tx: mpsc::Sender<()>,
     ) -> Result<Self> {
+        Self::bind_with_port_assignment_notifier(
+            socket_path,
+            shutdown_tx,
+            config,
+            config_path,
+            reload_tx,
+            PortAssignmentNotifier::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn bind_with_port_assignment_notifier(
+        socket_path: &Path,
+        shutdown_tx: ShutdownTx,
+        config: MeshConfig,
+        config_path: PathBuf,
+        reload_tx: mpsc::Sender<()>,
+        port_assignment_notifier: PortAssignmentNotifier,
+    ) -> Result<Self> {
         if socket_path.exists() {
             std::fs::remove_file(socket_path)?;
         }
@@ -110,6 +133,8 @@ impl IpcServer {
             config,
             config_path,
             reload_tx,
+            port_assignment_notifier,
+            expose_assignment_timeout: EXPOSE_ASSIGNMENT_TIMEOUT,
             runtime: Arc::new(RwLock::new(MeshRuntimeState::default())),
             node_state: Arc::new(tokio::sync::RwLock::new(NodeState::Uninit)),
         });
@@ -556,6 +581,40 @@ async fn handle_expose_service(
         };
     }
 
+    let requested_service = ServiceEntry {
+        name: name.to_owned(),
+        local_addr: local_addr.to_owned(),
+        protocol,
+        health_check: health_check.clone(),
+    };
+
+    let current_config = match load_mesh_config(&state.config_path).await {
+        Ok(config) => config,
+        Err(error) => {
+            return IpcResponse::Error {
+                message: format!("failed to update config.toml: {error}"),
+            };
+        }
+    };
+
+    if current_config
+        .services
+        .iter()
+        .any(|service| service == &requested_service)
+    {
+        return match current_assigned_port(state, &requested_service).await {
+            Some(assigned_port) => IpcResponse::ServiceExposed {
+                name: name.to_owned(),
+                assigned_port,
+            },
+            None => IpcResponse::Error {
+                message: format!(
+                    "service '{name}' already matches config but has no current port assignment"
+                ),
+            },
+        };
+    }
+
     let mut document = match load_config_document(&state.config_path).await {
         Ok(document) => document,
         Err(error) => {
@@ -583,15 +642,33 @@ async fn handle_expose_service(
         };
     }
 
+    // Subscribe after the config write so stale registrations for the previous
+    // definition do not satisfy this request.
+    let mut assignment_rx = state.port_assignment_notifier.subscribe(name);
+
     if let Err(error) = state.reload_tx.send(()).await {
         return IpcResponse::Error {
             message: format!("service saved to config but failed to trigger reload: {error}"),
         };
     }
 
-    IpcResponse::ServiceExposed {
-        name: name.to_owned(),
-        assigned_port: Some(0),
+    match wait_for_port_assignment(name, &mut assignment_rx, state.expose_assignment_timeout).await
+    {
+        Ok(assigned_port) => IpcResponse::ServiceExposed {
+            name: name.to_owned(),
+            assigned_port,
+        },
+        Err(ExposeAssignmentWaitError::TimedOut { timeout_seconds }) => {
+            IpcResponse::ServiceExposeTimedOut {
+                name: name.to_owned(),
+                timeout_seconds,
+            }
+        }
+        Err(ExposeAssignmentWaitError::ChannelClosed) => IpcResponse::Error {
+            message: format!(
+                "service saved to config but port assignment channel closed for '{name}'"
+            ),
+        },
     }
 }
 
@@ -845,6 +922,74 @@ async fn write_config_document_atomic(path: &Path, document: &DocumentMut) -> Re
         .context("config write task panicked")?
 }
 
+async fn load_mesh_config(path: &Path) -> Result<MeshConfig> {
+    let path = path.to_path_buf();
+    task::spawn_blocking(move || MeshConfig::load(&path))
+        .await
+        .context("mesh config load task panicked")?
+}
+
+async fn current_assigned_port(
+    state: &SharedState,
+    requested_service: &ServiceEntry,
+) -> Option<u16> {
+    let node_state = state.node_state.read().await;
+    let NodeState::Edge(edge_node) = &*node_state else {
+        return None;
+    };
+    let edge_node = Arc::clone(edge_node);
+    drop(node_state);
+
+    let edge = edge_node.read().await;
+    edge.cached_routes().iter().find_map(|(port, route)| {
+        (route.service_name == requested_service.name
+            && route.node_name == state.config.node_name
+            && route.target_local_addr == requested_service.local_addr
+            && route.protocol == requested_service.protocol)
+            .then_some(*port)
+    })
+}
+
+enum ExposeAssignmentWaitError {
+    TimedOut { timeout_seconds: u64 },
+    ChannelClosed,
+}
+
+async fn wait_for_port_assignment(
+    service_name: &str,
+    assignment_rx: &mut broadcast::Receiver<u16>,
+    timeout_duration: Duration,
+) -> std::result::Result<u16, ExposeAssignmentWaitError> {
+    let deadline = tokio::time::Instant::now() + timeout_duration;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(ExposeAssignmentWaitError::TimedOut {
+                timeout_seconds: timeout_duration.as_secs().max(1),
+            });
+        }
+
+        match timeout(remaining, assignment_rx.recv()).await {
+            Ok(Ok(assigned_port)) => return Ok(assigned_port),
+            Ok(Err(broadcast::error::RecvError::Closed)) => {
+                return Err(ExposeAssignmentWaitError::ChannelClosed);
+            }
+            Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => {
+                warn!(
+                    service_name,
+                    skipped, "lagged while waiting for assigned port; retrying"
+                );
+            }
+            Err(_) => {
+                return Err(ExposeAssignmentWaitError::TimedOut {
+                    timeout_seconds: timeout_duration.as_secs().max(1),
+                });
+            }
+        }
+    }
+}
+
 fn write_config_document_atomic_blocking(path: &Path, content: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -912,6 +1057,8 @@ mod tests {
             config,
             config_path,
             reload_tx,
+            port_assignment_notifier: PortAssignmentNotifier::default(),
+            expose_assignment_timeout: Duration::from_millis(200),
             runtime: Arc::new(RwLock::new(MeshRuntimeState::default())),
             node_state: Arc::new(tokio::sync::RwLock::new(NodeState::Uninit)),
         };
@@ -1207,16 +1354,21 @@ mod tests {
             interval_seconds: 30,
         });
 
-        let response = dispatch(
-            &IpcRequest::ExposeService {
-                name: "web".to_string(),
-                local_addr: "127.0.0.1:8080".to_string(),
-                protocol: Protocol::Tcp,
-                health_check: health_check.clone(),
-            },
-            &state,
-        )
-        .await;
+        let notifier = state.port_assignment_notifier.clone();
+        let response_request = IpcRequest::ExposeService {
+            name: "web".to_string(),
+            local_addr: "127.0.0.1:8080".to_string(),
+            protocol: Protocol::Tcp,
+            health_check: health_check.clone(),
+        };
+        let notify_assignment = async {
+            assert_eq!(reload_rx.recv().await, Some(()));
+            notifier.notify_assignments(&[mesh_proto::PortAssignment {
+                service_name: "web".to_string(),
+                assigned_port: 41000,
+            }]);
+        };
+        let (response, ()) = tokio::join!(dispatch(&response_request, &state), notify_assignment);
 
         let IpcResponse::ServiceExposed {
             name,
@@ -1226,8 +1378,7 @@ mod tests {
             panic!("expected service exposed response");
         };
         assert_eq!(name, "web");
-        assert_eq!(assigned_port, Some(0));
-        assert_eq!(reload_rx.recv().await, Some(()));
+        assert_eq!(assigned_port, 41000);
 
         let updated = MeshConfig::load(&state.config_path).unwrap();
         assert_eq!(
@@ -1243,7 +1394,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_expose_service_updates_existing_service_entry() {
-        let (state, _dir, _reload_rx) = shared_state(NodeRole::Edge);
+        let (state, _dir, mut reload_rx) = shared_state(NodeRole::Edge);
         let original = MeshConfig {
             services: vec![ServiceEntry {
                 name: "web".to_string(),
@@ -1255,16 +1406,21 @@ mod tests {
         };
         original.save(&state.config_path).unwrap();
 
-        let response = dispatch(
-            &IpcRequest::ExposeService {
-                name: "web".to_string(),
-                local_addr: "/tmp/web.sock".to_string(),
-                protocol: Protocol::Unix,
-                health_check: None,
-            },
-            &state,
-        )
-        .await;
+        let notifier = state.port_assignment_notifier.clone();
+        let response_request = IpcRequest::ExposeService {
+            name: "web".to_string(),
+            local_addr: "/tmp/web.sock".to_string(),
+            protocol: Protocol::Unix,
+            health_check: None,
+        };
+        let notify_assignment = async {
+            assert_eq!(reload_rx.recv().await, Some(()));
+            notifier.notify_assignments(&[mesh_proto::PortAssignment {
+                service_name: "web".to_string(),
+                assigned_port: 41001,
+            }]);
+        };
+        let (response, ()) = tokio::join!(dispatch(&response_request, &state), notify_assignment);
 
         assert!(matches!(response, IpcResponse::ServiceExposed { .. }));
 
@@ -1279,6 +1435,95 @@ mod tests {
                 health_check: None,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn test_expose_service_returns_existing_port_when_service_is_unchanged() {
+        let (state, _dir, mut reload_rx) = shared_state(NodeRole::Edge);
+        let service = ServiceEntry {
+            name: "web".to_string(),
+            local_addr: "127.0.0.1:8080".to_string(),
+            protocol: Protocol::Tcp,
+            health_check: None,
+        };
+        let original = MeshConfig {
+            services: vec![service.clone()],
+            ..state.config.clone()
+        };
+        original.save(&state.config_path).unwrap();
+
+        let edge_node = Arc::new(tokio::sync::RwLock::new(EdgeNode::new()));
+        {
+            let mut edge = edge_node.write().await;
+            edge.update_routes(
+                std::iter::once((
+                    41002,
+                    RouteEntry {
+                        service_name: service.name.clone(),
+                        node_name: state.config.node_name.clone(),
+                        endpoint_id: "edge-1".to_string(),
+                        target_local_addr: service.local_addr.clone(),
+                        protocol: service.protocol,
+                    },
+                ))
+                .collect(),
+                1,
+            );
+        }
+        *state.node_state.write().await = NodeState::Edge(edge_node);
+
+        let response = dispatch(
+            &IpcRequest::ExposeService {
+                name: service.name.clone(),
+                local_addr: service.local_addr.clone(),
+                protocol: service.protocol,
+                health_check: service.health_check.clone(),
+            },
+            &state,
+        )
+        .await;
+
+        let IpcResponse::ServiceExposed {
+            name,
+            assigned_port,
+        } = response
+        else {
+            panic!("expected service exposed response");
+        };
+        assert_eq!(name, "web");
+        assert_eq!(assigned_port, 41002);
+        assert!(
+            timeout(Duration::from_millis(50), reload_rx.recv())
+                .await
+                .is_err(),
+            "unchanged expose should not trigger reload"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_expose_service_returns_timeout_when_assignment_is_missing() {
+        let (state, _dir, mut reload_rx) = shared_state(NodeRole::Edge);
+
+        let response_request = IpcRequest::ExposeService {
+            name: "web".to_string(),
+            local_addr: "127.0.0.1:8080".to_string(),
+            protocol: Protocol::Tcp,
+            health_check: None,
+        };
+        let wait_for_reload = async {
+            assert_eq!(reload_rx.recv().await, Some(()));
+        };
+        let (response, ()) = tokio::join!(dispatch(&response_request, &state), wait_for_reload);
+
+        let IpcResponse::ServiceExposeTimedOut {
+            name,
+            timeout_seconds,
+        } = response
+        else {
+            panic!("expected service expose timed out response");
+        };
+        assert_eq!(name, "web");
+        assert_eq!(timeout_seconds, 1);
     }
 
     #[tokio::test]

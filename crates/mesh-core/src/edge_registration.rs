@@ -15,6 +15,7 @@ use tokio::sync::{RwLock, broadcast, watch};
 use tokio::time::sleep;
 use tracing::{info, warn};
 
+use crate::daemon::PortAssignmentNotifier;
 use crate::edge_node::{ConnectionState, EdgeNode};
 
 const REGISTRATION_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -33,6 +34,18 @@ enum RegistrationMode {
 enum RegistrationResponse {
     Ack { assignments: Vec<PortAssignment> },
     Nack { reason: String },
+}
+
+struct RegistrationIdentity {
+    endpoint_id: String,
+    control_endpoint_id: String,
+    node_name: String,
+}
+
+pub(crate) struct RegistrationLoopChannels {
+    pub(crate) port_assignment_notifier: PortAssignmentNotifier,
+    pub(crate) service_change_rx: watch::Receiver<()>,
+    pub(crate) shutdown: broadcast::Receiver<()>,
 }
 
 fn now_epoch() -> u64 {
@@ -293,11 +306,10 @@ async fn apply_route_table_update(
 
 async fn send_register(
     connection: &iroh::endpoint::Connection,
-    endpoint_id: &str,
-    control_endpoint_id: &str,
-    node_name: &str,
+    registration: &RegistrationIdentity,
     config: &Arc<RwLock<MeshConfig>>,
     edge_node: &Arc<RwLock<EdgeNode>>,
+    port_assignment_notifier: &PortAssignmentNotifier,
     mode: RegistrationMode,
 ) -> Result<RegistrationResponse> {
     if matches!(mode, RegistrationMode::Initial) {
@@ -306,7 +318,7 @@ async fn send_register(
 
     let snapshot = snapshot_registration(config).await;
     let ticket = JoinTicket {
-        endpoint_id: endpoint_id.to_owned(),
+        endpoint_id: registration.endpoint_id.clone(),
         created_at: now_epoch(),
         ttl_seconds: JOIN_TICKET_TTL_SECONDS,
         nonce: rand::random(),
@@ -316,7 +328,7 @@ async fn send_register(
         .context("failed to encode join ticket for registration")?;
 
     let message = ControlMessage::Register {
-        node_name: node_name.to_owned(),
+        node_name: registration.node_name.clone(),
         auth_ticket,
         services: snapshot.services.clone(),
     };
@@ -361,7 +373,7 @@ async fn send_register(
                 apply_route_table_update(
                     edge_node,
                     config,
-                    control_endpoint_id,
+                    &registration.control_endpoint_id,
                     routes,
                     version,
                     true,
@@ -374,9 +386,9 @@ async fn send_register(
                 apply_register_ack(
                     edge_node,
                     config,
-                    control_endpoint_id,
-                    endpoint_id,
-                    node_name,
+                    &registration.control_endpoint_id,
+                    &registration.endpoint_id,
+                    &registration.node_name,
                     &snapshot,
                     &assignments,
                 )
@@ -385,6 +397,7 @@ async fn send_register(
             }
 
             log_register_ack_assignments(&assignments);
+            port_assignment_notifier.notify_assignments(&assignments);
             if matches!(mode, RegistrationMode::Initial) {
                 transition_edge_state(edge_node, ConnectionState::Authenticated).await;
             }
@@ -444,8 +457,31 @@ pub async fn run_registration_loop(
     node_name: String,
     config: Arc<RwLock<MeshConfig>>,
     edge_node: Arc<RwLock<EdgeNode>>,
-    mut service_change_rx: watch::Receiver<()>,
-    mut shutdown: broadcast::Receiver<()>,
+    service_change_rx: watch::Receiver<()>,
+    shutdown: broadcast::Receiver<()>,
+) {
+    run_registration_loop_with_port_assignment_notifier(
+        endpoint,
+        control_addr,
+        node_name,
+        config,
+        edge_node,
+        RegistrationLoopChannels {
+            port_assignment_notifier: PortAssignmentNotifier::default(),
+            service_change_rx,
+            shutdown,
+        },
+    )
+    .await;
+}
+
+pub(crate) async fn run_registration_loop_with_port_assignment_notifier(
+    endpoint: iroh::Endpoint,
+    control_addr: String,
+    node_name: String,
+    config: Arc<RwLock<MeshConfig>>,
+    edge_node: Arc<RwLock<EdgeNode>>,
+    mut channels: RegistrationLoopChannels,
 ) {
     let control_endpoint = match parse_control_endpoint_addr(&control_addr) {
         Ok(endpoint_addr) => endpoint_addr,
@@ -466,7 +502,11 @@ pub async fn run_registration_loop(
         );
     }
 
-    let endpoint_id = endpoint.id().to_string();
+    let registration = RegistrationIdentity {
+        endpoint_id: endpoint.id().to_string(),
+        control_endpoint_id: control_endpoint_id.clone(),
+        node_name,
+    };
     let mut watch_open = true;
 
     loop {
@@ -479,14 +519,14 @@ pub async fn run_registration_loop(
                     Err(error) => {
                         warn!(error = %error, "failed to connect to control node");
                         disconnect_edge(&edge_node, None).await;
-                        if wait_before_retry(&mut shutdown).await {
+                        if wait_before_retry(&mut channels.shutdown).await {
                             return;
                         }
                         continue;
                     }
                 }
             }
-            _ = shutdown.recv() => return,
+            _ = channels.shutdown.recv() => return,
         };
 
         {
@@ -497,11 +537,10 @@ pub async fn run_registration_loop(
 
         match send_register(
             &connection,
-            &endpoint_id,
-            &control_endpoint_id,
-            &node_name,
+            &registration,
             &config,
             &edge_node,
+            &channels.port_assignment_notifier,
             RegistrationMode::Initial,
         )
         .await
@@ -515,7 +554,7 @@ pub async fn run_registration_loop(
             Ok(RegistrationResponse::Nack { reason }) => {
                 warn!(reason = %reason, "edge registration rejected by control node");
                 disconnect_edge(&edge_node, Some(control_endpoint_id.as_str())).await;
-                if wait_before_retry(&mut shutdown).await {
+                if wait_before_retry(&mut channels.shutdown).await {
                     return;
                 }
                 continue;
@@ -523,7 +562,7 @@ pub async fn run_registration_loop(
             Err(error) => {
                 warn!(error = %error, "edge registration attempt failed");
                 disconnect_edge(&edge_node, Some(control_endpoint_id.as_str())).await;
-                if wait_before_retry(&mut shutdown).await {
+                if wait_before_retry(&mut channels.shutdown).await {
                     return;
                 }
                 continue;
@@ -560,16 +599,15 @@ pub async fn run_registration_loop(
                         break;
                     }
                 }
-                changed = service_change_rx.changed(), if watch_open => {
+                changed = channels.service_change_rx.changed(), if watch_open => {
                     match changed {
                         Ok(()) => {
                             match send_register(
                                 &connection,
-                                &endpoint_id,
-                                &control_endpoint_id,
-                                &node_name,
+                                &registration,
                                 &config,
                                 &edge_node,
+                                &channels.port_assignment_notifier,
                                 RegistrationMode::Refresh,
                             ).await {
                                 Ok(RegistrationResponse::Ack { assignments }) => {
@@ -594,7 +632,7 @@ pub async fn run_registration_loop(
                         }
                     }
                 }
-                _ = shutdown.recv() => {
+                _ = channels.shutdown.recv() => {
                     disconnect_edge(&edge_node, Some(control_endpoint_id.as_str())).await;
                     return;
                 }
@@ -602,7 +640,7 @@ pub async fn run_registration_loop(
         }
 
         disconnect_edge(&edge_node, Some(control_endpoint_id.as_str())).await;
-        if wait_before_retry(&mut shutdown).await {
+        if wait_before_retry(&mut channels.shutdown).await {
             return;
         }
     }

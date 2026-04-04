@@ -648,7 +648,7 @@ async fn test_reregistration_broadcasts_route_updates_to_other_edges() -> Result
 }
 
 #[tokio::test]
-async fn test_ipc_expose_triggers_runtime_reregistration() -> Result<()> {
+async fn test_ipc_expose_returns_assigned_port_after_reregistration() -> Result<()> {
     timeout(Duration::from_secs(20), async {
         let control = ControlRegistrationHarness::start().await?;
         let tempdir = writable_tempdir("mesh-core-phase6-ipc-expose-");
@@ -683,7 +683,14 @@ async fn test_ipc_expose_triggers_runtime_reregistration() -> Result<()> {
                 },
             )
             .await?;
-            assert!(matches!(response, IpcResponse::ServiceExposed { .. }));
+            let IpcResponse::ServiceExposed {
+                name,
+                assigned_port,
+            } = response
+            else {
+                anyhow::bail!("expected service exposed response");
+            };
+            assert_eq!(name, "admin");
 
             timeout(
                 Duration::from_millis(400),
@@ -691,6 +698,16 @@ async fn test_ipc_expose_triggers_runtime_reregistration() -> Result<()> {
             )
             .await
             .context("runtime re-registration should complete before config watcher debounce")?;
+
+            let control_assigned_port = {
+                let control_node = control.control_node.read().await;
+                control_node
+                    .routes()
+                    .iter()
+                    .find_map(|(port, route)| (route.service_name == "admin").then_some(*port))
+                    .context("control should publish the newly exposed service")?
+            };
+            assert_eq!(assigned_port, control_assigned_port);
 
             sleep(Duration::from_millis(800)).await;
             let control_node = control.control_node.read().await;

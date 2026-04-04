@@ -1,15 +1,16 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use mesh_proto::{JoinTicket, MeshConfig, NodeRole, ServiceEntry};
+use mesh_proto::{JoinTicket, MeshConfig, NodeRole, PortAssignment, ServiceEntry};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task;
 use tracing::{error, info, warn};
@@ -33,6 +34,38 @@ const PROXY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const PROXY_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const JOIN_TICKET_FILE_NAME: &str = "join_ticket.txt";
 const JOIN_TICKET_TTL_SECONDS: u64 = 3600;
+const PORT_ASSIGNMENT_CHANNEL_CAPACITY: usize = 16;
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PortAssignmentNotifier {
+    channels: Arc<Mutex<HashMap<String, broadcast::Sender<u16>>>>,
+}
+
+impl PortAssignmentNotifier {
+    pub(crate) fn subscribe(&self, service_name: &str) -> broadcast::Receiver<u16> {
+        self.sender_for(service_name).subscribe()
+    }
+
+    pub(crate) fn notify_assignments(&self, assignments: &[PortAssignment]) {
+        for assignment in assignments {
+            let _ = self
+                .sender_for(&assignment.service_name)
+                .send(assignment.assigned_port);
+        }
+    }
+
+    fn sender_for(&self, service_name: &str) -> broadcast::Sender<u16> {
+        let mut channels = match self.channels.lock() {
+            Ok(channels) => channels,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        channels
+            .entry(service_name.to_owned())
+            .or_insert_with(|| broadcast::channel(PORT_ASSIGNMENT_CHANNEL_CAPACITY).0)
+            .clone()
+    }
+}
 
 fn now_epoch() -> u64 {
     SystemTime::now()
@@ -173,14 +206,16 @@ impl Daemon {
         let socket_path = self.socket_path();
         let pid_path = self.pid_path();
         let (config_tx, mut config_rx) = mpsc::channel(8);
+        let port_assignment_notifier = PortAssignmentNotifier::default();
 
         // Start IPC server
-        let ipc_server = crate::ipc_server::IpcServer::bind(
+        let ipc_server = crate::ipc_server::IpcServer::bind_with_port_assignment_notifier(
             &socket_path,
             self.shutdown_tx.clone(),
             self.config.clone(),
             self.config_path.clone(),
             config_tx.clone(),
+            port_assignment_notifier.clone(),
         )
         .await?;
         let ipc_status = ipc_server.status_handle();
@@ -293,15 +328,19 @@ impl Daemon {
                     let config = Arc::clone(&runtime_config);
                     let en = Arc::clone(&en);
                     let shutdown_rx = self.shutdown_rx();
+                    let port_assignment_notifier = port_assignment_notifier.clone();
                     Some(tokio::spawn(async move {
-                        crate::edge_registration::run_registration_loop(
+                        crate::edge_registration::run_registration_loop_with_port_assignment_notifier(
                             endpoint,
                             control_addr,
                             node_name,
                             config,
                             en,
-                            svc_rx,
-                            shutdown_rx,
+                            crate::edge_registration::RegistrationLoopChannels {
+                                port_assignment_notifier,
+                                service_change_rx: svc_rx,
+                                shutdown: shutdown_rx,
+                            },
                         )
                         .await;
                     }))
@@ -1111,28 +1150,34 @@ mod tests {
                 edge_endpoint.clone(),
             )));
             let (service_change_tx, service_change_rx) = watch::channel(());
+            let port_assignment_notifier = PortAssignmentNotifier::default();
             let (registration_shutdown_tx, registration_shutdown_rx) = broadcast::channel(4);
-            let registration_handle =
-                tokio::spawn(crate::edge_registration::run_registration_loop(
+            let registration_handle = tokio::spawn(
+                crate::edge_registration::run_registration_loop_with_port_assignment_notifier(
                     edge_endpoint.clone(),
                     control_addr,
                     "edge-alpha".to_string(),
                     Arc::clone(&runtime_config),
                     Arc::clone(&edge_node),
-                    service_change_rx,
-                    registration_shutdown_rx,
-                ));
+                    crate::edge_registration::RegistrationLoopChannels {
+                        port_assignment_notifier: port_assignment_notifier.clone(),
+                        service_change_rx,
+                        shutdown: registration_shutdown_rx,
+                    },
+                ),
+            );
 
             let (reload_tx, mut reload_rx) = mpsc::channel(8);
             let _watcher = ConfigWatcher::new(config_path.clone(), reload_tx.clone())?;
             let ipc_shutdown_tx = broadcast::channel(4).0;
             let ipc_shutdown_rx = ipc_shutdown_tx.subscribe();
-            let ipc_server = crate::ipc_server::IpcServer::bind(
+            let ipc_server = crate::ipc_server::IpcServer::bind_with_port_assignment_notifier(
                 &socket_path,
                 ipc_shutdown_tx.clone(),
                 initial_config.clone(),
                 config_path.clone(),
                 reload_tx,
+                port_assignment_notifier,
             )
             .await?;
             ipc_server.attach_edge_node(Arc::clone(&edge_node)).await;
@@ -1150,31 +1195,40 @@ mod tests {
                 wait_for_control_service(&control_node, &edge_endpoint_id, "echo", 1).await?;
                 let initial_route_version = control_node.read().await.route_version();
 
-                let response = send_ipc_request(
-                    &socket_path,
-                    &IpcRequest::ExposeService {
-                        name: "admin".to_string(),
-                        local_addr: "127.0.0.1:19090".to_string(),
-                        protocol: Protocol::Tcp,
-                        health_check: None,
-                    },
-                )
-                .await?;
-                assert!(matches!(response, IpcResponse::ServiceExposed { .. }));
+                let request = IpcRequest::ExposeService {
+                    name: "admin".to_string(),
+                    local_addr: "127.0.0.1:19090".to_string(),
+                    protocol: Protocol::Tcp,
+                    health_check: None,
+                };
+                let process_reload = async {
+                    let explicit_reload = timeout(Duration::from_millis(250), reload_rx.recv())
+                        .await
+                        .context("timed out waiting for explicit reload signal")?;
+                    assert_eq!(explicit_reload, Some(()));
 
-                let explicit_reload = timeout(Duration::from_millis(250), reload_rx.recv())
-                    .await
-                    .context("timed out waiting for explicit reload signal")?;
-                assert_eq!(explicit_reload, Some(()));
+                    daemon.reload_config(Some(&runtime_config)).await?;
+                    wait_for_control_service(
+                        &control_node,
+                        &edge_endpoint_id,
+                        "admin",
+                        initial_route_version + 1,
+                    )
+                    .await?;
+                    Ok::<(), anyhow::Error>(())
+                };
+                let (response, reload_result) =
+                    tokio::join!(send_ipc_request(&socket_path, &request), process_reload);
+                let response = response?;
+                reload_result?;
 
-                daemon.reload_config(Some(&runtime_config)).await?;
-                wait_for_control_service(
-                    &control_node,
-                    &edge_endpoint_id,
-                    "admin",
-                    initial_route_version + 1,
-                )
-                .await?;
+                let IpcResponse::ServiceExposed { assigned_port, .. } = response else {
+                    anyhow::bail!("expected service exposed response");
+                };
+                assert!(
+                    (40000..=49999).contains(&assigned_port),
+                    "assigned port should be in the mesh service range"
+                );
 
                 let watcher_reload = timeout(Duration::from_secs(5), reload_rx.recv())
                     .await
