@@ -205,7 +205,9 @@ impl Daemon {
             active_connections,
         ) = match self.config.role {
             NodeRole::Control => {
-                let cn = Arc::new(tokio::sync::RwLock::new(ControlNode::new()));
+                let cn = Arc::new(tokio::sync::RwLock::new(ControlNode::load_from_disk(
+                    &self.config.data_dir,
+                )));
                 {
                     let mut ns = node_state_handle.write().await;
                     *ns = NodeState::Control(Arc::clone(&cn));

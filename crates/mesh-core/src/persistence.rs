@@ -19,6 +19,10 @@ pub enum PersistenceError {
 pub async fn save_atomic<T: Serialize>(path: &Path, data: &T) -> Result<(), PersistenceError> {
     use tokio::io::AsyncWriteExt;
 
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
     let tmp_path = path.with_extension("json.tmp");
     let json = serde_json::to_string_pretty(data)?;
 
@@ -31,6 +35,27 @@ pub async fn save_atomic<T: Serialize>(path: &Path, data: &T) -> Result<(), Pers
     Ok(())
 }
 
+/// Synchronous variant of [`save_atomic`] for mutation paths that are not async.
+pub fn save_atomic_sync<T: Serialize>(path: &Path, data: &T) -> Result<(), PersistenceError> {
+    use std::io::Write;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let tmp_path = path.with_extension("json.tmp");
+    let json = serde_json::to_string_pretty(data)?;
+
+    let mut file = std::fs::File::create(&tmp_path)?;
+    file.write_all(json.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+
+    std::fs::rename(&tmp_path, path)?;
+
+    Ok(())
+}
+
 /// Load a JSON-serialized state file from `path`.
 ///
 /// Returns `Ok(None)` if the file does not exist, `Ok(Some(T))` if it does,
@@ -38,6 +63,9 @@ pub async fn save_atomic<T: Serialize>(path: &Path, data: &T) -> Result<(), Pers
 pub fn load_state<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, PersistenceError> {
     match std::fs::read_to_string(path) {
         Ok(contents) => {
+            if contents.trim().is_empty() {
+                return Ok(None);
+            }
             let value = serde_json::from_str(&contents)?;
             Ok(Some(value))
         }
@@ -97,5 +125,16 @@ mod tests {
         // The temp file should have been renamed away.
         assert!(!tmp_path.exists(), "temp file should not remain");
         assert!(path.exists(), "target file should exist");
+    }
+
+    #[test]
+    fn test_load_empty_file_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.json");
+        std::fs::write(&path, "").unwrap();
+
+        let result: Result<Option<TestData>, PersistenceError> = load_state(&path);
+
+        assert!(result.unwrap().is_none());
     }
 }

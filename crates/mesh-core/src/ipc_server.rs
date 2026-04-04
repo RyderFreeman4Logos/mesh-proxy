@@ -420,7 +420,7 @@ async fn handle_accept_node(
         )
     });
 
-    cn.add_node(NodeInfo {
+    let accepted_node = NodeInfo {
         endpoint_id: ticket.endpoint_id.clone(),
         node_name: name.clone(),
         quota_limit: DEFAULT_SERVICE_QUOTA as u16,
@@ -428,7 +428,13 @@ async fn handle_accept_node(
         is_online: false,
         last_heartbeat: None,
         addr: None,
-    });
+    };
+
+    if let Err(error) = cn.accept_node(accepted_node, now) {
+        return IpcResponse::Error {
+            message: format!("failed to persist accepted node: {error}"),
+        };
+    }
 
     IpcResponse::Ok {
         message: format!("node {name} ({}) accepted", ticket.endpoint_id),

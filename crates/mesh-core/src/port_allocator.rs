@@ -142,6 +142,12 @@ impl PortAllocator {
         }
     }
 
+    /// Restore a previously persisted active assignment.
+    pub fn restore_active(&mut self, port: u16, service_id: ServiceId) {
+        self.history.insert(service_id.clone(), port);
+        self.ports.insert(port, PortState::Active { service_id });
+    }
+
     /// Count the number of ports that are not Free.
     pub fn allocated_count(&self) -> usize {
         self.ports
@@ -253,6 +259,20 @@ mod tests {
             "pool should be exhausted"
         );
         assert_eq!(alloc.allocated_count(), total_ports);
+    }
+
+    #[test]
+    fn test_restore_active_marks_port_and_history() {
+        let mut alloc = PortAllocator::new();
+        let sid = make_service_id("web");
+
+        alloc.restore_active(SERVICE_PORT_START, sid.clone());
+
+        assert!(matches!(
+            alloc.ports.get(&SERVICE_PORT_START),
+            Some(PortState::Active { service_id }) if service_id == &sid
+        ));
+        assert_eq!(alloc.history.get(&sid), Some(&SERVICE_PORT_START));
     }
 }
 
