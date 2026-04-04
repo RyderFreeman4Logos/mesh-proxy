@@ -118,6 +118,37 @@ async fn wait_for_join_ticket(data_dir: &std::path::Path) -> Result<JoinTicket> 
     .context("timed out waiting for daemon join ticket")?
 }
 
+async fn wait_for_route_cache_control_identity(
+    data_dir: &std::path::Path,
+    expected_control_endpoint_id: &str,
+) -> Result<()> {
+    let route_cache_path = data_dir.join("route_cache.json");
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let matches = std::fs::read_to_string(&route_cache_path)
+                .ok()
+                .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+                .and_then(|cache| {
+                    cache
+                        .get("control_endpoint_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .is_some_and(|control_endpoint_id| {
+                    control_endpoint_id == expected_control_endpoint_id
+                });
+
+            if matches {
+                return;
+            }
+
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .context("timed out waiting for persisted control identity change")
+}
+
 struct RegistrationHarness {
     _tempdir: tempfile::TempDir,
     control_node: Arc<RwLock<ControlNode>>,
@@ -181,15 +212,16 @@ impl RegistrationHarness {
         )));
 
         let edge_node = Arc::new(RwLock::new(EdgeNode::with_endpoint(edge_endpoint.clone())));
+        let (_control_target_tx, control_target_rx) = watch::channel(Some(control_addr.clone()));
         let (_service_change_tx, service_change_rx) = watch::channel(());
         let (registration_shutdown_tx, registration_shutdown_rx) = broadcast::channel(4);
 
         let registration_handle = tokio::spawn(run_registration_loop(
             edge_endpoint.clone(),
-            control_addr,
             "edge-alpha".to_string(),
             Arc::clone(&config),
             Arc::clone(&edge_node),
+            control_target_rx,
             service_change_rx,
             registration_shutdown_rx,
         ));
@@ -335,11 +367,11 @@ impl ControlRegistrationHarness {
 struct EdgeRegistrationHandle {
     _tempdir: tempfile::TempDir,
     node_name: String,
-    control_addr: String,
     config: Arc<RwLock<MeshConfig>>,
     edge_node: Arc<RwLock<EdgeNode>>,
     edge_endpoint: iroh::Endpoint,
     endpoint_id: String,
+    control_target_tx: watch::Sender<Option<String>>,
     service_change_tx: watch::Sender<()>,
     registration_shutdown_tx: broadcast::Sender<()>,
     registration_handle: Option<JoinHandle<()>>,
@@ -360,17 +392,18 @@ impl EdgeRegistrationHandle {
             services,
         )));
         let edge_node = Arc::new(RwLock::new(EdgeNode::with_endpoint(edge_endpoint.clone())));
+        let (control_target_tx, _) = watch::channel(Some(control_addr));
         let (service_change_tx, _) = watch::channel(());
         let (registration_shutdown_tx, _) = broadcast::channel(4);
 
         Ok(Self {
             _tempdir: tempdir,
             node_name: node_name.to_owned(),
-            control_addr,
             config,
             edge_node,
             edge_endpoint,
             endpoint_id,
+            control_target_tx,
             service_change_tx,
             registration_shutdown_tx,
             registration_handle: None,
@@ -383,14 +416,15 @@ impl EdgeRegistrationHandle {
             "edge registration loop should only be started once"
         );
 
+        let control_target_rx = self.control_target_tx.subscribe();
         let service_change_rx = self.service_change_tx.subscribe();
         let registration_shutdown_rx = self.registration_shutdown_tx.subscribe();
         let handle = tokio::spawn(run_registration_loop(
             self.edge_endpoint.clone(),
-            self.control_addr.clone(),
             self.node_name.clone(),
             Arc::clone(&self.config),
             Arc::clone(&self.edge_node),
+            control_target_rx,
             service_change_rx,
             registration_shutdown_rx,
         ));
@@ -736,4 +770,72 @@ async fn test_ipc_expose_returns_assigned_port_after_reregistration() -> Result<
     })
     .await
     .context("IPC expose runtime re-registration integration test timed out")?
+}
+
+#[tokio::test]
+async fn test_edge_registration_reconnects_after_control_addr_change() -> Result<()> {
+    timeout(Duration::from_secs(20), async {
+        let control_a = ControlRegistrationHarness::start().await?;
+        let control_b = ControlRegistrationHarness::start().await?;
+        let tempdir = writable_tempdir("mesh-core-phase6-control-target-");
+        let config_path = tempdir.path().join("config.toml");
+        let initial_config = make_edge_config(
+            control_a.control_addr()?,
+            tempdir.path().join("data"),
+            vec![make_service_entry("echo", "127.0.0.1:18080")],
+        );
+        initial_config.save(&config_path)?;
+
+        let data_dir = initial_config.data_dir.clone();
+        let mut daemon = Daemon::new_without_startup_signal(initial_config, config_path.clone());
+        let daemon_shutdown_tx = daemon.shutdown_tx().clone();
+        let daemon_handle = tokio::spawn(async move { daemon.run().await });
+
+        let test_result: Result<()> = async {
+            let ticket = wait_for_join_ticket(&data_dir).await?;
+            let edge_endpoint_id = ticket.endpoint_id.clone();
+            let control_a_endpoint_id = control_a.control_endpoint.id().to_string();
+            let control_b_endpoint_id = control_b.control_endpoint.id().to_string();
+
+            control_a.allow_edge(&edge_endpoint_id, "edge-alpha").await;
+            control_b.allow_edge(&edge_endpoint_id, "edge-alpha").await;
+
+            control_a.wait_for_control_route("echo", 1).await;
+            wait_for_route_cache_control_identity(&data_dir, &control_a_endpoint_id).await?;
+
+            let mut updated_config = MeshConfig::load(&config_path)?;
+            updated_config.control_addr = Some(control_b.control_addr()?);
+            updated_config.save(&config_path)?;
+
+            control_b.wait_for_control_route("echo", 1).await;
+            wait_for_route_cache_control_identity(&data_dir, &control_b_endpoint_id).await?;
+
+            let control_b_node = control_b.control_node.read().await;
+            assert!(
+                control_b_node
+                    .routes()
+                    .values()
+                    .any(|route| route.service_name == "echo"
+                        && route.endpoint_id == edge_endpoint_id),
+                "replacement control should publish the edge route after reload"
+            );
+            Ok(())
+        }
+        .await;
+
+        let _ = daemon_shutdown_tx.send(());
+        let daemon_result = timeout(Duration::from_secs(10), daemon_handle)
+            .await
+            .context("daemon task did not exit in time")?
+            .context("daemon task panicked")?;
+        let control_a_shutdown = control_a.shutdown().await;
+        let control_b_shutdown = control_b.shutdown().await;
+
+        daemon_result?;
+        control_a_shutdown?;
+        control_b_shutdown?;
+        test_result
+    })
+    .await
+    .context("control target reload integration test timed out")?
 }

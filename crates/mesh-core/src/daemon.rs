@@ -134,6 +134,7 @@ pub struct Daemon {
     config_path: PathBuf,
     shutdown_tx: ShutdownTx,
     startup_ready: Option<StartupReadyWriter>,
+    control_target_tx: Option<watch::Sender<Option<String>>>,
     service_change_tx: Option<watch::Sender<()>>,
 }
 
@@ -150,6 +151,7 @@ impl Daemon {
             config_path,
             shutdown_tx,
             startup_ready: Some(startup_ready),
+            control_target_tx: None,
             service_change_tx: None,
         }
     }
@@ -165,6 +167,7 @@ impl Daemon {
             config_path,
             shutdown_tx,
             startup_ready: None,
+            control_target_tx: None,
             service_change_tx: None,
         }
     }
@@ -254,6 +257,7 @@ impl Daemon {
             registration_handle,
             _config_watcher,
             shared_config,
+            control_target_tx,
             service_change_tx,
             health_state,
             active_connections,
@@ -286,6 +290,7 @@ impl Daemon {
                     None,
                     None,
                     Some(runtime_config),
+                    None,
                     None,
                     Some(HealthServerState::from(Arc::clone(&cn))),
                     None,
@@ -321,9 +326,10 @@ impl Daemon {
                     ConfigWatcher::new(self.config_path.clone(), config_tx.clone())?;
                 info!(path = %self.config_path.display(), "config watcher started");
                 let (svc_tx, svc_rx) = watch::channel(());
-                let reg_handle = if let Some(ref control_addr) = self.config.control_addr {
+                let (control_target_tx, control_target_rx) =
+                    watch::channel(self.config.control_addr.clone());
+                let reg_handle = if self.config.control_addr.is_some() {
                     let endpoint = mesh_node.endpoint().clone();
-                    let control_addr = control_addr.clone();
                     let node_name = self.config.node_name.clone();
                     let config = Arc::clone(&runtime_config);
                     let en = Arc::clone(&en);
@@ -332,12 +338,12 @@ impl Daemon {
                     Some(tokio::spawn(async move {
                         crate::edge_registration::run_registration_loop_with_port_assignment_notifier(
                             endpoint,
-                            control_addr,
                             node_name,
                             config,
                             en,
                             crate::edge_registration::RegistrationLoopChannels {
                                 port_assignment_notifier,
+                                control_target_rx,
                                 service_change_rx: svc_rx,
                                 shutdown: shutdown_rx,
                             },
@@ -366,6 +372,7 @@ impl Daemon {
                     reg_handle,
                     Some(config_watcher),
                     Some(shared_runtime_config),
+                    Some(control_target_tx),
                     Some(svc_tx),
                     Some(health_state),
                     Some(shutdown_active_connections),
@@ -373,6 +380,7 @@ impl Daemon {
                 )
             }
         };
+        self.control_target_tx = control_target_tx;
         self.service_change_tx = service_change_tx;
 
         let health_handle = if let Some(health_bind) = self.config.health_bind.as_deref() {
@@ -648,12 +656,19 @@ impl Daemon {
             let diff = ServiceDiff::between(&self.config.services, &new_config.services);
             diff.log(&self.config_path, new_config.services.len());
             let services_changed = !diff.is_empty();
+            let control_target_changed = self.config.control_addr != new_config.control_addr;
 
             if let Some(shared_config) = shared_config {
                 *shared_config.write().await = new_config.clone();
             }
 
             self.config = new_config;
+
+            if control_target_changed
+                && let Some(control_target_tx) = self.control_target_tx.as_ref()
+            {
+                let _ = control_target_tx.send(self.config.control_addr.clone());
+            }
 
             if services_changed && let Some(service_change_tx) = self.service_change_tx.as_ref() {
                 let _ = service_change_tx.send(());
@@ -1149,18 +1164,19 @@ mod tests {
             let edge_node = Arc::new(tokio::sync::RwLock::new(EdgeNode::with_endpoint(
                 edge_endpoint.clone(),
             )));
+            let (control_target_tx, control_target_rx) = watch::channel(Some(control_addr.clone()));
             let (service_change_tx, service_change_rx) = watch::channel(());
             let port_assignment_notifier = PortAssignmentNotifier::default();
             let (registration_shutdown_tx, registration_shutdown_rx) = broadcast::channel(4);
             let registration_handle = tokio::spawn(
                 crate::edge_registration::run_registration_loop_with_port_assignment_notifier(
                     edge_endpoint.clone(),
-                    control_addr,
                     "edge-alpha".to_string(),
                     Arc::clone(&runtime_config),
                     Arc::clone(&edge_node),
                     crate::edge_registration::RegistrationLoopChannels {
                         port_assignment_notifier: port_assignment_notifier.clone(),
+                        control_target_rx,
                         service_change_rx,
                         shutdown: registration_shutdown_rx,
                     },
@@ -1188,6 +1204,7 @@ mod tests {
                 config_path: config_path.clone(),
                 shutdown_tx: broadcast::channel(1).0,
                 startup_ready: None,
+                control_target_tx: Some(control_target_tx),
                 service_change_tx: Some(service_change_tx),
             };
 

@@ -44,6 +44,7 @@ struct RegistrationIdentity {
 
 pub(crate) struct RegistrationLoopChannels {
     pub(crate) port_assignment_notifier: PortAssignmentNotifier,
+    pub(crate) control_target_rx: watch::Receiver<Option<String>>,
     pub(crate) service_change_rx: watch::Receiver<()>,
     pub(crate) shutdown: broadcast::Receiver<()>,
 }
@@ -453,21 +454,21 @@ async fn handle_control_message(
 
 pub async fn run_registration_loop(
     endpoint: iroh::Endpoint,
-    control_addr: String,
     node_name: String,
     config: Arc<RwLock<MeshConfig>>,
     edge_node: Arc<RwLock<EdgeNode>>,
+    control_target_rx: watch::Receiver<Option<String>>,
     service_change_rx: watch::Receiver<()>,
     shutdown: broadcast::Receiver<()>,
 ) {
     run_registration_loop_with_port_assignment_notifier(
         endpoint,
-        control_addr,
         node_name,
         config,
         edge_node,
         RegistrationLoopChannels {
             port_assignment_notifier: PortAssignmentNotifier::default(),
+            control_target_rx,
             service_change_rx,
             shutdown,
         },
@@ -477,39 +478,59 @@ pub async fn run_registration_loop(
 
 pub(crate) async fn run_registration_loop_with_port_assignment_notifier(
     endpoint: iroh::Endpoint,
-    control_addr: String,
     node_name: String,
     config: Arc<RwLock<MeshConfig>>,
     edge_node: Arc<RwLock<EdgeNode>>,
     mut channels: RegistrationLoopChannels,
 ) {
-    let control_endpoint = match parse_control_endpoint_addr(&control_addr) {
-        Ok(endpoint_addr) => endpoint_addr,
-        Err(error) => {
-            warn!(error = %error, "failed to parse control address for edge registration");
-            return;
-        }
-    };
-    let control_endpoint_id = control_endpoint.id.to_string();
-
-    if let Err(error) =
-        purge_routes_if_control_identity_changed(&edge_node, &config, &control_endpoint_id).await
-    {
-        warn!(
-            error = %error,
-            %control_endpoint_id,
-            "failed to purge stale route cache after control identity change"
-        );
-    }
-
-    let registration = RegistrationIdentity {
-        endpoint_id: endpoint.id().to_string(),
-        control_endpoint_id: control_endpoint_id.clone(),
-        node_name,
-    };
-    let mut watch_open = true;
+    let endpoint_id = endpoint.id().to_string();
+    let mut service_watch_open = true;
+    let mut control_watch_open = true;
 
     loop {
+        let Some(control_addr) = channels.control_target_rx.borrow_and_update().clone() else {
+            warn!("edge registration waiting for control target configuration");
+            disconnect_edge(&edge_node, None).await;
+            if wait_before_retry(&mut channels.shutdown).await {
+                return;
+            }
+            continue;
+        };
+
+        let control_endpoint = match parse_control_endpoint_addr(&control_addr) {
+            Ok(endpoint_addr) => endpoint_addr,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    control_addr = %control_addr,
+                    "failed to parse control address for edge registration"
+                );
+                disconnect_edge(&edge_node, None).await;
+                if wait_before_retry(&mut channels.shutdown).await {
+                    return;
+                }
+                continue;
+            }
+        };
+        let control_endpoint_id = control_endpoint.id.to_string();
+
+        if let Err(error) =
+            purge_routes_if_control_identity_changed(&edge_node, &config, &control_endpoint_id)
+                .await
+        {
+            warn!(
+                error = %error,
+                %control_endpoint_id,
+                "failed to purge stale route cache after control identity change"
+            );
+        }
+
+        let registration = RegistrationIdentity {
+            endpoint_id: endpoint_id.clone(),
+            control_endpoint_id: control_endpoint_id.clone(),
+            node_name: node_name.clone(),
+        };
+
         transition_edge_state(&edge_node, ConnectionState::Connecting).await;
 
         let connection = tokio::select! {
@@ -522,6 +543,16 @@ pub(crate) async fn run_registration_loop_with_port_assignment_notifier(
                         if wait_before_retry(&mut channels.shutdown).await {
                             return;
                         }
+                        continue;
+                    }
+                }
+            }
+            changed = channels.control_target_rx.changed(), if control_watch_open => {
+                match changed {
+                    Ok(()) => continue,
+                    Err(_) => {
+                        warn!("control target watcher closed; disabling runtime control target updates");
+                        control_watch_open = false;
                         continue;
                     }
                 }
@@ -569,6 +600,7 @@ pub(crate) async fn run_registration_loop_with_port_assignment_notifier(
             }
         }
 
+        let mut reconnect_immediately = false;
         loop {
             tokio::select! {
                 incoming = connection.accept_bi() => {
@@ -599,7 +631,19 @@ pub(crate) async fn run_registration_loop_with_port_assignment_notifier(
                         break;
                     }
                 }
-                changed = channels.service_change_rx.changed(), if watch_open => {
+                changed = channels.control_target_rx.changed(), if control_watch_open => {
+                    match changed {
+                        Ok(()) => {
+                            reconnect_immediately = true;
+                            break;
+                        }
+                        Err(_) => {
+                            warn!("control target watcher closed; disabling runtime control target updates");
+                            control_watch_open = false;
+                        }
+                    }
+                }
+                changed = channels.service_change_rx.changed(), if service_watch_open => {
                     match changed {
                         Ok(()) => {
                             match send_register(
@@ -628,7 +672,7 @@ pub(crate) async fn run_registration_loop_with_port_assignment_notifier(
                         }
                         Err(_) => {
                             warn!("service change watcher closed; disabling re-registration triggers");
-                            watch_open = false;
+                            service_watch_open = false;
                         }
                     }
                 }
@@ -640,6 +684,9 @@ pub(crate) async fn run_registration_loop_with_port_assignment_notifier(
         }
 
         disconnect_edge(&edge_node, Some(control_endpoint_id.as_str())).await;
+        if reconnect_immediately {
+            continue;
+        }
         if wait_before_retry(&mut channels.shutdown).await {
             return;
         }
