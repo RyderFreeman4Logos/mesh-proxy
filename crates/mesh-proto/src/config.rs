@@ -22,6 +22,7 @@ pub struct MeshConfig {
     /// For edge nodes: the control node's endpoint address (serialized).
     pub control_addr: Option<String>,
     /// For control nodes: also expose managed routes on localhost.
+    /// Requires daemon restart to take effect.
     #[serde(default)]
     pub enable_local_proxy: bool,
     /// Optional bind address for the local health query HTTP endpoint.

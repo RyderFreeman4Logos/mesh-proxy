@@ -25,6 +25,8 @@ pub enum QuotaError {
     Exceeded { current: usize, limit: u16 },
     #[error("node not found in whitelist: {endpoint_id}")]
     NodeNotFound { endpoint_id: String },
+    #[error("failed to persist quota limit: {0}")]
+    Persistence(#[from] PersistenceError),
 }
 
 /// Error returned when ticket validation fails.
@@ -84,7 +86,13 @@ struct ControlNodeRollbackState {
 struct PersistedWhitelistEntry {
     endpoint_id: String,
     node_name: String,
+    #[serde(default = "default_persisted_quota_limit")]
+    quota_limit: u32,
     accepted_at: u64,
+}
+
+const fn default_persisted_quota_limit() -> u32 {
+    DEFAULT_SERVICE_QUOTA as u32
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -172,12 +180,24 @@ impl ControlNode {
         node.whitelist = persisted_whitelist
             .iter()
             .map(|entry| {
+                let quota_limit = match u16::try_from(entry.quota_limit) {
+                    Ok(limit) => limit,
+                    Err(_) => {
+                        warn!(
+                            endpoint_id = %entry.endpoint_id,
+                            quota_limit = entry.quota_limit,
+                            fallback = DEFAULT_SERVICE_QUOTA as u16,
+                            "persisted quota_limit exceeds supported range, falling back to default"
+                        );
+                        DEFAULT_SERVICE_QUOTA as u16
+                    }
+                };
                 (
                     entry.endpoint_id.clone(),
                     NodeInfo {
                         endpoint_id: entry.endpoint_id.clone(),
                         node_name: entry.node_name.clone(),
-                        quota_limit: DEFAULT_SERVICE_QUOTA as u16,
+                        quota_limit,
                         quota_used: 0,
                         is_online: false,
                         last_heartbeat: None,
@@ -294,6 +314,7 @@ impl ControlNode {
             .map(|node| PersistedWhitelistEntry {
                 endpoint_id: node.endpoint_id.clone(),
                 node_name: node.node_name.clone(),
+                quota_limit: u32::from(node.quota_limit),
                 accepted_at: self
                     .accepted_at
                     .get(&node.endpoint_id)
@@ -504,13 +525,22 @@ impl ControlNode {
 
     /// Updates the configured service quota for a whitelisted node.
     pub fn set_quota_limit(&mut self, endpoint_id: &str, limit: u16) -> Result<(), QuotaError> {
-        let node = self
-            .whitelist
-            .get_mut(endpoint_id)
-            .ok_or_else(|| QuotaError::NodeNotFound {
-                endpoint_id: endpoint_id.to_owned(),
-            })?;
-        node.quota_limit = limit;
+        let rollback = self.rollback_state();
+        {
+            let node =
+                self.whitelist
+                    .get_mut(endpoint_id)
+                    .ok_or_else(|| QuotaError::NodeNotFound {
+                        endpoint_id: endpoint_id.to_owned(),
+                    })?;
+            node.quota_limit = limit;
+        }
+
+        if let Err(error) = self.persist_whitelist() {
+            self.restore_rollback_state(rollback);
+            return Err(QuotaError::Persistence(error));
+        }
+
         Ok(())
     }
 
@@ -1198,7 +1228,8 @@ mod tests {
         let dir = writable_tempdir("control-whitelist-");
         let mut cn = ControlNode::load_from_disk(dir.path());
         let accepted_at = 1_700_000_000;
-        let node = make_node("edge-a", DEFAULT_SERVICE_QUOTA as u16);
+        let quota_limit = 9;
+        let node = make_node("edge-a", quota_limit);
 
         cn.accept_node(node, accepted_at).unwrap();
 
@@ -1211,6 +1242,7 @@ mod tests {
             vec![PersistedWhitelistEntry {
                 endpoint_id: "edge-a".to_owned(),
                 node_name: "node-edge-a".to_owned(),
+                quota_limit: u32::from(quota_limit),
                 accepted_at,
             }]
         );
@@ -1218,6 +1250,31 @@ mod tests {
         let restored = ControlNode::load_from_disk(dir.path());
         assert_eq!(restored.whitelist.len(), 1);
         assert_eq!(restored.whitelist["edge-a"].node_name, "node-edge-a");
+        assert_eq!(restored.whitelist["edge-a"].quota_limit, quota_limit);
+        assert_eq!(restored.accepted_at["edge-a"], accepted_at);
+    }
+
+    #[test]
+    fn test_quota_limit_persistence_roundtrip_after_update() {
+        let dir = writable_tempdir("control-quota-");
+        let mut cn = ControlNode::load_from_disk(dir.path());
+        let accepted_at = 1_700_000_111;
+
+        cn.accept_node(
+            make_node("edge-a", DEFAULT_SERVICE_QUOTA as u16),
+            accepted_at,
+        )
+        .unwrap();
+        cn.set_quota_limit("edge-a", 12).unwrap();
+
+        let stored: Vec<PersistedWhitelistEntry> =
+            crate::persistence::load_state(&dir.path().join("whitelist.json"))
+                .unwrap()
+                .unwrap();
+        assert_eq!(stored[0].quota_limit, 12);
+
+        let restored = ControlNode::load_from_disk(dir.path());
+        assert_eq!(restored.whitelist["edge-a"].quota_limit, 12);
         assert_eq!(restored.accepted_at["edge-a"], accepted_at);
     }
 
