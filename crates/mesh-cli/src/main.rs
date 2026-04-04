@@ -709,7 +709,7 @@ fn render_status_text(info: &mesh_proto::StatusInfo, color_enabled: bool) -> Str
     let _ = writeln!(
         &mut output,
         "Peers: {}  Services: {}  Routes: {}",
-        info.connected_nodes.len(),
+        info.peer_count,
         info.services.len(),
         info.route_table_version
     );
@@ -738,7 +738,7 @@ fn render_status_text(info: &mesh_proto::StatusInfo, color_enabled: bool) -> Str
 fn render_service_line(service: &mesh_proto::ServiceStatus, color_enabled: bool) -> String {
     format!(
         "{} {} ({}) -> {}",
-        format_indicator(service_status_label(&service.status), color_enabled),
+        format_indicator(service_status_label(service.status), color_enabled),
         service.name,
         service.node_name,
         format_service_target(service.assigned_port)
@@ -757,17 +757,15 @@ fn sorted_services(services: &[mesh_proto::ServiceStatus]) -> Vec<&mesh_proto::S
     services
 }
 
-fn service_status_label(status: &str) -> &'static str {
-    if status.eq_ignore_ascii_case("healthy") || status.eq_ignore_ascii_case("online") {
-        "ONLINE"
-    } else if status.eq_ignore_ascii_case("cached") {
-        "CACHED"
-    } else if status.eq_ignore_ascii_case("degraded") {
-        "DEGRADED"
-    } else if status.eq_ignore_ascii_case("unhealthy") || status.eq_ignore_ascii_case("offline") {
-        "OFFLINE"
-    } else {
-        "UNKNOWN"
+fn service_status_label(status: mesh_proto::ServiceDisplayStatus) -> &'static str {
+    match status {
+        mesh_proto::ServiceDisplayStatus::Healthy => "ONLINE",
+        mesh_proto::ServiceDisplayStatus::Degraded => "DEGRADED",
+        mesh_proto::ServiceDisplayStatus::Unhealthy => "OFFLINE",
+        mesh_proto::ServiceDisplayStatus::Unknown => "UNKNOWN",
+        mesh_proto::ServiceDisplayStatus::Ok => "OK",
+        mesh_proto::ServiceDisplayStatus::Unreachable => "UNREACHABLE",
+        mesh_proto::ServiceDisplayStatus::Routed => "ROUTED",
     }
 }
 
@@ -785,9 +783,10 @@ fn format_indicator(label: &str, color_enabled: bool) -> String {
 
     let color_code = match label {
         "ONLINE" => "32",
-        "CACHED" => "36",
+        "OK" => "32",
+        "ROUTED" => "36",
         "DEGRADED" | "UNKNOWN" => "33",
-        "OFFLINE" => "31",
+        "OFFLINE" | "UNREACHABLE" => "31",
         _ => "0",
     };
 
@@ -943,6 +942,7 @@ mod tests {
             endpoint_id: "ep-ctrl".to_string(),
             endpoint_addr: Some(r#"{"node_id":"ep-ctrl"}"#.to_string()),
             online: true,
+            peer_count: 1,
             connected_nodes: vec![mesh_proto::ConnectedNode {
                 name: "edge-1".to_string(),
                 endpoint_id: "ep-edge".to_string(),
@@ -953,13 +953,13 @@ mod tests {
                     name: "api".to_string(),
                     node_name: "node-beta".to_string(),
                     assigned_port: Some(40001),
-                    status: "cached".to_string(),
+                    status: mesh_proto::ServiceDisplayStatus::Routed,
                 },
                 mesh_proto::ServiceStatus {
                     name: "web".to_string(),
                     node_name: "node-alpha".to_string(),
                     assigned_port: Some(40000),
-                    status: "healthy".to_string(),
+                    status: mesh_proto::ServiceDisplayStatus::Ok,
                 },
             ],
             health_bind: Some("127.0.0.1:49000".to_string()),
@@ -971,8 +971,8 @@ mod tests {
         assert!(rendered.contains("[ONLINE] controller (control)"));
         assert!(rendered.contains(r#"Connect Addr: {"node_id":"ep-ctrl"}"#));
         assert!(rendered.contains("Peers: 1  Services: 2  Routes: 3"));
-        assert!(rendered.contains("[ONLINE] web (node-alpha) -> :40000"));
-        assert!(rendered.contains("[CACHED] api (node-beta) -> :40001"));
+        assert!(rendered.contains("[OK] web (node-alpha) -> :40000"));
+        assert!(rendered.contains("[ROUTED] api (node-beta) -> :40001"));
     }
 
     #[test]

@@ -73,6 +73,7 @@ pub struct StatusInfo {
     /// Serialized `EndpointAddr` used to connect back to this node.
     pub endpoint_addr: Option<String>,
     pub online: bool,
+    pub peer_count: usize,
     pub connected_nodes: Vec<ConnectedNode>,
     pub services: Vec<ServiceStatus>,
     /// Bind address for the local health query endpoint, if configured.
@@ -88,12 +89,25 @@ pub struct ConnectedNode {
     pub online: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceDisplayStatus {
+    Healthy,
+    Degraded,
+    Unhealthy,
+    #[default]
+    Unknown,
+    Ok,
+    Unreachable,
+    Routed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceStatus {
     pub name: String,
     pub node_name: String,
     pub assigned_port: Option<u16>,
-    pub status: String,
+    pub status: ServiceDisplayStatus,
 }
 
 #[cfg(test)]

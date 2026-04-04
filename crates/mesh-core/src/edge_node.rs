@@ -697,10 +697,20 @@ pub(crate) async fn run_edge_accept_loop(
                     let node = Arc::clone(&node);
                     let config = Arc::clone(&config);
                     let data_dir = data_dir.clone();
+                    let remote_peer_id = connection.remote_id().to_string();
+                    {
+                        let mut edge = node.write().await;
+                        edge.record_peer_connected(remote_peer_id.clone());
+                    }
                     tokio::spawn(async move {
-                        if let Err(error) =
-                            handle_control_inbound(node, config, connection, &data_dir).await
-                        {
+                        let result =
+                            handle_control_inbound(Arc::clone(&node), config, connection, &data_dir)
+                                .await;
+                        let mut edge = node.write().await;
+                        edge.record_peer_disconnected(&remote_peer_id);
+                        drop(edge);
+
+                        if let Err(error) = result {
                             tracing::warn!(error = %error, "edge control connection handler error");
                         }
                     });
@@ -716,8 +726,20 @@ pub(crate) async fn run_edge_accept_loop(
 
                     let config = Arc::clone(&config);
                     let active_connections = Arc::clone(&active_connections);
+                    let node = Arc::clone(&node);
+                    let remote_peer_id = connection.remote_id().to_string();
+                    {
+                        let mut edge = node.write().await;
+                        edge.record_peer_connected(remote_peer_id.clone());
+                    }
                     tokio::spawn(async move {
-                        if let Err(error) = handle_proxy_inbound(connection, config, active_connections).await {
+                        let result =
+                            handle_proxy_inbound(connection, config, active_connections).await;
+                        let mut edge = node.write().await;
+                        edge.record_peer_disconnected(&remote_peer_id);
+                        drop(edge);
+
+                        if let Err(error) = result {
                             tracing::warn!(error = %error, "edge proxy connection handler error");
                         }
                     });
@@ -863,6 +885,7 @@ pub struct EdgeNode {
     cached_routes: HashMap<u16, RouteEntry>,
     shared_routes: Arc<RwLock<HashMap<u16, RouteEntry>>>,
     route_version: u64,
+    direct_peer_connections: HashMap<String, usize>,
     listener_pool: HashMap<u16, JoinHandle<()>>,
     connection_pool: Arc<ConnectionPool>,
     shutdown_tx: broadcast::Sender<()>,
@@ -895,6 +918,7 @@ impl EdgeNode {
             cached_routes: HashMap::new(),
             shared_routes: Arc::new(RwLock::new(HashMap::new())),
             route_version: 0,
+            direct_peer_connections: HashMap::new(),
             listener_pool: HashMap::new(),
             connection_pool,
             shutdown_tx,
@@ -983,6 +1007,32 @@ impl EdgeNode {
         self.route_version
     }
 
+    /// Record that a non-pooled QUIC connection is active for the given peer.
+    pub fn record_peer_connected(&mut self, endpoint_id: impl Into<String>) {
+        *self
+            .direct_peer_connections
+            .entry(endpoint_id.into())
+            .or_insert(0) += 1;
+    }
+
+    /// Record that a non-pooled QUIC connection has closed for the given peer.
+    pub fn record_peer_disconnected(&mut self, endpoint_id: &str) {
+        let Some(connection_count) = self.direct_peer_connections.get_mut(endpoint_id) else {
+            return;
+        };
+
+        if *connection_count <= 1 {
+            self.direct_peer_connections.remove(endpoint_id);
+        } else {
+            *connection_count -= 1;
+        }
+    }
+
+    /// Return peer ids tracked outside the outbound connection pool.
+    pub fn tracked_peer_ids(&self) -> Vec<String> {
+        self.direct_peer_connections.keys().cloned().collect()
+    }
+
     /// Returns the cached control endpoint identity, if known.
     pub fn control_endpoint_id(&self) -> Option<&str> {
         self.control_endpoint_id.as_deref()
@@ -996,6 +1046,16 @@ impl EdgeNode {
     /// Returns the number of active dynamic listeners currently tracked.
     pub fn listener_count(&self) -> usize {
         self.listener_pool.len()
+    }
+
+    /// Return the local endpoint id used by this edge's outbound pool.
+    pub fn local_endpoint_id(&self) -> String {
+        self.connection_pool.local_endpoint_id()
+    }
+
+    /// Clone the outbound connection pool for read-only status inspection.
+    pub fn connection_pool(&self) -> Arc<ConnectionPool> {
+        Arc::clone(&self.connection_pool)
     }
 
     /// Apply a route table update if the version is newer than the cached one.
@@ -1338,6 +1398,35 @@ mod tests {
 
         edge.record_ping(2000);
         assert_eq!(edge.last_ping_from_control(), Some(2000));
+    }
+
+    #[test]
+    fn test_record_peer_connections_tracks_unique_peer_ids() {
+        let mut edge = EdgeNode::new();
+
+        edge.record_peer_connected("control-1");
+        edge.record_peer_connected("control-1");
+        edge.record_peer_connected("edge-2");
+
+        let mut tracked_peer_ids = edge.tracked_peer_ids();
+        tracked_peer_ids.sort();
+        assert_eq!(
+            tracked_peer_ids,
+            vec!["control-1".to_string(), "edge-2".to_string()]
+        );
+
+        edge.record_peer_disconnected("control-1");
+        let mut tracked_peer_ids = edge.tracked_peer_ids();
+        tracked_peer_ids.sort();
+        assert_eq!(
+            tracked_peer_ids,
+            vec!["control-1".to_string(), "edge-2".to_string()]
+        );
+
+        edge.record_peer_disconnected("control-1");
+        let mut tracked_peer_ids = edge.tracked_peer_ids();
+        tracked_peer_ids.sort();
+        assert_eq!(tracked_peer_ids, vec!["edge-2".to_string()]);
     }
 
     #[test]

@@ -11,7 +11,9 @@ mod validate;
 
 pub use config::{MeshConfig, NodeRole, Protocol, ServiceEntry};
 pub use health::{HealthCheckConfig, HealthCheckMode, HealthState};
-pub use ipc::{ConnectedNode, IpcRequest, IpcResponse, ServiceStatus, StatusInfo};
+pub use ipc::{
+    ConnectedNode, IpcRequest, IpcResponse, ServiceDisplayStatus, ServiceStatus, StatusInfo,
+};
 pub use listener::ListenerState;
 pub use message::{ControlMessage, PortAssignment, RouteEntry, ServiceRegistration};
 pub use proxy::ProxyHandshake;

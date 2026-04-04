@@ -77,8 +77,11 @@ async fn transition_edge_state(edge_node: &Arc<RwLock<EdgeNode>>, next: Connecti
     }
 }
 
-async fn disconnect_edge(edge_node: &Arc<RwLock<EdgeNode>>) {
+async fn disconnect_edge(edge_node: &Arc<RwLock<EdgeNode>>, peer_endpoint_id: Option<&str>) {
     let mut edge = edge_node.write().await;
+    if let Some(peer_endpoint_id) = peer_endpoint_id {
+        edge.record_peer_disconnected(peer_endpoint_id);
+    }
     if let Err(error) = edge.transition_to(ConnectionState::Disconnected) {
         warn!(error = %error, "failed to reset edge registration state");
     }
@@ -475,7 +478,7 @@ pub async fn run_registration_loop(
                     Ok(connection) => connection,
                     Err(error) => {
                         warn!(error = %error, "failed to connect to control node");
-                        disconnect_edge(&edge_node).await;
+                        disconnect_edge(&edge_node, None).await;
                         if wait_before_retry(&mut shutdown).await {
                             return;
                         }
@@ -486,6 +489,10 @@ pub async fn run_registration_loop(
             _ = shutdown.recv() => return,
         };
 
+        {
+            let mut edge = edge_node.write().await;
+            edge.record_peer_connected(control_endpoint_id.clone());
+        }
         transition_edge_state(&edge_node, ConnectionState::Unauthenticated).await;
 
         match send_register(
@@ -507,7 +514,7 @@ pub async fn run_registration_loop(
             }
             Ok(RegistrationResponse::Nack { reason }) => {
                 warn!(reason = %reason, "edge registration rejected by control node");
-                disconnect_edge(&edge_node).await;
+                disconnect_edge(&edge_node, Some(control_endpoint_id.as_str())).await;
                 if wait_before_retry(&mut shutdown).await {
                     return;
                 }
@@ -515,7 +522,7 @@ pub async fn run_registration_loop(
             }
             Err(error) => {
                 warn!(error = %error, "edge registration attempt failed");
-                disconnect_edge(&edge_node).await;
+                disconnect_edge(&edge_node, Some(control_endpoint_id.as_str())).await;
                 if wait_before_retry(&mut shutdown).await {
                     return;
                 }
@@ -587,11 +594,14 @@ pub async fn run_registration_loop(
                         }
                     }
                 }
-                _ = shutdown.recv() => return,
+                _ = shutdown.recv() => {
+                    disconnect_edge(&edge_node, Some(control_endpoint_id.as_str())).await;
+                    return;
+                }
             }
         }
 
-        disconnect_edge(&edge_node).await;
+        disconnect_edge(&edge_node, Some(control_endpoint_id.as_str())).await;
         if wait_before_retry(&mut shutdown).await {
             return;
         }

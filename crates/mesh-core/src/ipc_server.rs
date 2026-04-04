@@ -3,15 +3,17 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use mesh_proto::{
-    ConnectedNode, DEFAULT_SERVICE_QUOTA, IpcRequest, IpcResponse, MeshConfig, NodeInfo, NodeRole,
-    ServiceStatus, StatusInfo,
+    ConnectedNode, DEFAULT_SERVICE_QUOTA, HealthState, IpcRequest, IpcResponse, MeshConfig,
+    NodeInfo, NodeRole, Protocol, RouteEntry, ServiceDisplayStatus, ServiceStatus, StatusInfo,
 };
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::{TcpStream, UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio::task;
+use tokio::time::timeout;
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 use tracing::{info, warn};
 
@@ -21,6 +23,7 @@ use crate::edge_node::EdgeNode;
 use mesh_proto::frame;
 
 const INITIALIZING_ENDPOINT_ID: &str = "(initializing)";
+const STATUS_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Default)]
 struct MeshRuntimeState {
@@ -266,7 +269,7 @@ async fn build_status(state: &SharedState) -> IpcResponse {
     };
 
     let node_state = state.node_state.read().await;
-    let (connected_nodes, services, route_table_version) = match &*node_state {
+    let (peer_count, connected_nodes, services, route_table_version) = match &*node_state {
         NodeState::Control(cn) => {
             let cn = cn.read().await;
             let nodes: Vec<ConnectedNode> = cn
@@ -285,26 +288,46 @@ async fn build_status(state: &SharedState) -> IpcResponse {
                     name: r.service_id.service_name.clone(),
                     node_name: r.node_name.clone(),
                     assigned_port: r.published_port,
-                    status: format!("{:?}", r.health_state),
+                    status: map_health_state(r.health_state),
                 })
                 .collect();
-            (nodes, svcs, cn.route_version())
+            let peer_count = nodes.iter().filter(|node| node.online).count();
+            (peer_count, nodes, svcs, cn.route_version())
         }
         NodeState::Edge(en) => {
-            let en = en.read().await;
-            let svcs: Vec<ServiceStatus> = en
-                .cached_routes()
-                .iter()
-                .map(|(port, entry)| ServiceStatus {
-                    name: entry.service_name.clone(),
-                    node_name: entry.node_name.clone(),
-                    assigned_port: Some(*port),
-                    status: "cached".to_string(),
-                })
-                .collect();
-            (vec![], svcs, en.route_version())
+            let (
+                cached_routes,
+                route_table_version,
+                direct_peer_ids,
+                connection_pool,
+                local_endpoint_id,
+            ) = {
+                let en = en.read().await;
+                (
+                    en.cached_routes().clone(),
+                    en.route_version(),
+                    en.tracked_peer_ids(),
+                    en.connection_pool(),
+                    en.local_endpoint_id(),
+                )
+            };
+            let outbound_peer_ids = connection_pool.active_endpoint_ids().await;
+            let peer_count = direct_peer_ids
+                .into_iter()
+                .chain(outbound_peer_ids.into_iter())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+
+            let mut services = Vec::with_capacity(cached_routes.len());
+            for (port, entry) in cached_routes {
+                services.push(
+                    build_edge_service_status(port, &entry, local_endpoint_id.as_str()).await,
+                );
+            }
+
+            (peer_count, vec![], services, route_table_version)
         }
-        NodeState::Uninit => (vec![], vec![], 0),
+        NodeState::Uninit => (0, vec![], vec![], 0),
     };
 
     IpcResponse::Status(StatusInfo {
@@ -313,11 +336,73 @@ async fn build_status(state: &SharedState) -> IpcResponse {
         endpoint_id,
         endpoint_addr,
         online,
+        peer_count,
         connected_nodes,
         services,
         health_bind: state.config.health_bind.clone(),
         route_table_version,
     })
+}
+
+fn map_health_state(health_state: HealthState) -> ServiceDisplayStatus {
+    match health_state {
+        HealthState::Healthy => ServiceDisplayStatus::Healthy,
+        HealthState::Degraded => ServiceDisplayStatus::Degraded,
+        HealthState::Unhealthy => ServiceDisplayStatus::Unhealthy,
+        HealthState::Unknown => ServiceDisplayStatus::Unknown,
+    }
+}
+
+async fn build_edge_service_status(
+    port: u16,
+    route: &RouteEntry,
+    local_endpoint_id: &str,
+) -> ServiceStatus {
+    let status = if route.endpoint_id == local_endpoint_id {
+        probe_local_service(route).await
+    } else {
+        ServiceDisplayStatus::Routed
+    };
+
+    ServiceStatus {
+        name: route.service_name.clone(),
+        node_name: route.node_name.clone(),
+        assigned_port: Some(port),
+        status,
+    }
+}
+
+async fn probe_local_service(route: &RouteEntry) -> ServiceDisplayStatus {
+    let reachable = match route.protocol {
+        Protocol::Tcp => timeout(
+            STATUS_PROBE_TIMEOUT,
+            TcpStream::connect(route.target_local_addr.as_str()),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok()),
+        Protocol::Unix => probe_local_unix_service(route.target_local_addr.as_str()).await,
+    };
+
+    if reachable {
+        ServiceDisplayStatus::Ok
+    } else {
+        ServiceDisplayStatus::Unreachable
+    }
+}
+
+#[cfg(unix)]
+async fn probe_local_unix_service(target_local_addr: &str) -> bool {
+    timeout(
+        STATUS_PROBE_TIMEOUT,
+        tokio::net::UnixStream::connect(target_local_addr),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok())
+}
+
+#[cfg(not(unix))]
+async fn probe_local_unix_service(_target_local_addr: &str) -> bool {
+    false
 }
 
 async fn handle_quota_show(state: &SharedState) -> IpcResponse {
@@ -794,11 +879,12 @@ fn write_config_document_atomic_blocking(path: &Path, content: &str) -> Result<(
 mod tests {
     use super::*;
     use mesh_proto::{
-        HealthCheckConfig, HealthCheckMode, NodeInfo, NodeRole, Protocol, ServiceEntry,
-        ServiceRegistration,
+        HealthCheckConfig, HealthCheckMode, NodeInfo, NodeRole, Protocol, RouteEntry,
+        ServiceDisplayStatus, ServiceEntry, ServiceRegistration,
     };
     use tempfile::Builder;
     use tokio::sync::{broadcast, mpsc};
+    use tokio::time::timeout;
 
     fn shared_state(role: NodeRole) -> (SharedState, tempfile::TempDir, mpsc::Receiver<()>) {
         let dir = Builder::new()
@@ -839,6 +925,7 @@ mod tests {
         assert_eq!(info.endpoint_id, INITIALIZING_ENDPOINT_ID);
         assert_eq!(info.endpoint_addr, None);
         assert!(!info.online);
+        assert_eq!(info.peer_count, 0);
     }
 
     #[tokio::test]
@@ -864,6 +951,7 @@ mod tests {
             Some(r#"{"node_id":"ep-123"}"#)
         );
         assert!(info.online);
+        assert_eq!(info.peer_count, 0);
     }
 
     #[tokio::test]
@@ -900,8 +988,92 @@ mod tests {
         let IpcResponse::Status(info) = response else {
             panic!("expected status response");
         };
+        assert_eq!(info.peer_count, 1);
         assert_eq!(info.services.len(), 1);
         assert_eq!(info.services[0].node_name, "node-alpha");
+        assert_eq!(info.services[0].status, ServiceDisplayStatus::Unknown);
+    }
+
+    #[tokio::test]
+    async fn test_status_reports_edge_peer_count_and_local_service_health() {
+        let (state, _dir, _reload_rx) = shared_state(NodeRole::Edge);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let accept_task = tokio::spawn(async move {
+            let _ = listener.accept().await.unwrap();
+        });
+
+        let mut edge = EdgeNode::new();
+        let local_endpoint_id = edge.local_endpoint_id();
+        let handle = IpcStatusHandle {
+            runtime: Arc::clone(&state.runtime),
+        };
+        handle.set_mesh_node(local_endpoint_id.clone(), None, true);
+        edge.record_peer_connected("control-1");
+        edge.update_routes(
+            std::iter::once((
+                40000,
+                RouteEntry {
+                    service_name: "web".to_string(),
+                    node_name: "edge-local".to_string(),
+                    endpoint_id: local_endpoint_id,
+                    target_local_addr: local_addr.to_string(),
+                    protocol: Protocol::Tcp,
+                },
+            ))
+            .collect(),
+            1,
+        );
+        *state.node_state.write().await = NodeState::Edge(Arc::new(tokio::sync::RwLock::new(edge)));
+
+        let response = dispatch(&IpcRequest::Status, &state).await;
+
+        let IpcResponse::Status(info) = response else {
+            panic!("expected status response");
+        };
+        assert_eq!(info.peer_count, 1);
+        assert_eq!(info.services.len(), 1);
+        assert_eq!(info.services[0].status, ServiceDisplayStatus::Ok);
+        timeout(Duration::from_secs(1), accept_task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_status_marks_remote_edge_service_as_routed() {
+        let (state, _dir, _reload_rx) = shared_state(NodeRole::Edge);
+        let edge = EdgeNode::new();
+        let local_endpoint_id = edge.local_endpoint_id();
+        let handle = IpcStatusHandle {
+            runtime: Arc::clone(&state.runtime),
+        };
+        handle.set_mesh_node(local_endpoint_id, None, true);
+
+        let mut edge = edge;
+        edge.update_routes(
+            std::iter::once((
+                40001,
+                RouteEntry {
+                    service_name: "api".to_string(),
+                    node_name: "edge-remote".to_string(),
+                    endpoint_id: "edge-remote".to_string(),
+                    target_local_addr: "127.0.0.1:9000".to_string(),
+                    protocol: Protocol::Tcp,
+                },
+            ))
+            .collect(),
+            2,
+        );
+        *state.node_state.write().await = NodeState::Edge(Arc::new(tokio::sync::RwLock::new(edge)));
+
+        let response = dispatch(&IpcRequest::Status, &state).await;
+
+        let IpcResponse::Status(info) = response else {
+            panic!("expected status response");
+        };
+        assert_eq!(info.services.len(), 1);
+        assert_eq!(info.services[0].status, ServiceDisplayStatus::Routed);
     }
 
     #[tokio::test]
