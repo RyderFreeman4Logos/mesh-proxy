@@ -1933,13 +1933,16 @@ name = "mesh-proxy"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bs58",
  "clap",
+ "hostname",
  "iroh",
  "libc",
  "mesh-core",
  "mesh-proto",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml_edit 0.22.27",
  "tracing",

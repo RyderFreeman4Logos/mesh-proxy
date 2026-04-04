@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use mesh_proto::{
-    HealthCheckConfig, HealthCheckMode, IpcRequest, IpcResponse, MeshConfig, NodeRole, Protocol,
-    validate_local_addr, validate_service_name,
+    HealthCheckConfig, HealthCheckMode, InviteToken, IpcRequest, IpcResponse, MeshConfig, NodeRole,
+    Protocol, validate_local_addr, validate_service_name,
 };
 use toml_edit::{DocumentMut, value};
 use tracing_subscriber::EnvFilter;
@@ -92,6 +92,12 @@ enum Command {
         /// Optional friendly name for the edge node.
         #[arg(long)]
         name: Option<String>,
+    },
+
+    /// Join a mesh network using an invite token from the control node.
+    Join {
+        /// The invite token from `mesh-proxy invite`.
+        token: String,
     },
 
     /// Generate an invite token for a new edge node (control node only).
@@ -204,6 +210,7 @@ fn main() -> Result<()> {
     match command {
         Command::Start { role, control_addr } => cmd_start(&config, Some(role), control_addr),
         Command::Restart => cmd_restart(&config),
+        Command::Join { token } => cmd_join(&config, token),
         other => {
             // Non-start commands: create runtime normally.
             tokio::runtime::Builder::new_multi_thread()
@@ -238,7 +245,9 @@ fn main() -> Result<()> {
                         Command::Accept { ticket, name } => cmd_accept(&config, ticket, name).await,
                         Command::Invite { name, ttl } => cmd_invite(&config, name, ttl).await,
                         Command::Quota { command } => cmd_quota(&config, command).await,
-                        Command::Start { .. } | Command::Restart => unreachable!(),
+                        Command::Start { .. } | Command::Restart | Command::Join { .. } => {
+                            unreachable!()
+                        }
                     }
                 })
         }
@@ -367,6 +376,72 @@ fn cmd_restart(config_path: &Path) -> Result<()> {
     }
 
     cmd_start(config_path, None, None)
+}
+
+fn cmd_join(config_path: &Path, token_str: String) -> Result<()> {
+    let token = InviteToken::from_bs58(&token_str)
+        .context("failed to decode invite token (is it copy-pasted correctly?)")?;
+    token.validate().context("invite token validation failed")?;
+
+    let node_name = token.node_name.clone().unwrap_or_else(|| {
+        hostname::get()
+            .map(|h| h.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "unnamed".to_string())
+    });
+
+    // Write config: role=edge, control_addr, node_name
+    let content = if config_path.exists() {
+        std::fs::read_to_string(config_path)
+            .with_context(|| format!("failed to read config at {}", config_path.display()))?
+    } else {
+        // Bootstrap a minimal config so toml_edit has something to work with.
+        String::new()
+    };
+    let mut document = DocumentMut::from_str(&content)
+        .with_context(|| format!("failed to parse config at {}", config_path.display()))?;
+    document["role"] = value("edge");
+    document["control_addr"] = value(&token.control_addr);
+    document["node_name"] = value(&node_name);
+    write_config_document_atomic(config_path, &document)?;
+
+    // Save invite nonce for the daemon's first registration (single-use).
+    let config = MeshConfig::load(config_path)?;
+    let nonce_path = config.data_dir.join("invite_nonce.txt");
+    write_nonce_file(&nonce_path, &token.nonce)?;
+
+    println!("Joining mesh as '{node_name}'...");
+    cmd_start(config_path, Some(Role::Edge), None)?;
+    println!("Use `mesh-proxy status` to verify connection.");
+    Ok(())
+}
+
+/// Write the invite nonce to a file with restricted permissions (0o600).
+fn write_nonce_file(path: &Path, nonce: &[u8; 16]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create data dir {}", parent.display()))?;
+    }
+
+    let encoded = bs58::encode(nonce).into_string();
+
+    let mut open_options = std::fs::OpenOptions::new();
+    open_options.create(true).truncate(true).write(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open_options.mode(0o600);
+    }
+
+    let mut file = open_options
+        .open(path)
+        .with_context(|| format!("failed to create nonce file at {}", path.display()))?;
+    std::io::Write::write_all(&mut file, encoded.as_bytes())
+        .with_context(|| format!("failed to write nonce file at {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to fsync nonce file at {}", path.display()))?;
+
+    Ok(())
 }
 
 fn read_pid_file(pid_path: &Path) -> Result<libc::pid_t> {
@@ -1218,5 +1293,134 @@ mod tests {
             }
             other => panic!("expected Invite, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_cli_join_token_is_positional() {
+        let cli = Cli::try_parse_from(["mesh-proxy", "join", "some-token-string"]).unwrap();
+
+        match cli.command {
+            Command::Join { token } => {
+                assert_eq!(token, "some-token-string");
+            }
+            other => panic!("expected Join, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cli_join_missing_token_fails() {
+        let result = Cli::try_parse_from(["mesh-proxy", "join"]);
+        assert!(result.is_err(), "join without token should fail");
+    }
+
+    #[test]
+    fn test_cmd_join_writes_config_and_nonce() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let dir = tempfile::Builder::new()
+            .prefix("mesh-join-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let config_path = dir.path().join("config.toml");
+        let data_dir = dir.path().join("data");
+
+        // Pre-create a minimal config so MeshConfig::load points data_dir to our temp.
+        let initial_config = format!(
+            "node_name = \"old-name\"\nrole = \"control\"\ndata_dir = \"{}\"\n",
+            data_dir.display()
+        );
+        std::fs::write(&config_path, &initial_config).unwrap();
+
+        let token = InviteToken {
+            control_addr: r#"{"node_id":"ep-ctrl-abc"}"#.to_string(),
+            nonce: [
+                10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160,
+            ],
+            ttl_seconds: 3600,
+            created_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            node_name: Some("invited-edge".to_string()),
+        };
+        let encoded = token.to_bs58().unwrap();
+
+        // Decode + validate + write config + write nonce (skip daemon start).
+        let decoded = InviteToken::from_bs58(&encoded).unwrap();
+        decoded.validate().unwrap();
+
+        let node_name = decoded
+            .node_name
+            .clone()
+            .unwrap_or_else(|| "fallback".to_string());
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let mut document = DocumentMut::from_str(&content).unwrap();
+        document["role"] = value("edge");
+        document["control_addr"] = value(&decoded.control_addr);
+        document["node_name"] = value(&node_name);
+        write_config_document_atomic(&config_path, &document).unwrap();
+
+        let config = MeshConfig::load(&config_path).unwrap();
+        assert_eq!(config.role, NodeRole::Edge);
+        assert_eq!(
+            config.control_addr.as_deref(),
+            Some(r#"{"node_id":"ep-ctrl-abc"}"#)
+        );
+        assert_eq!(config.node_name, "invited-edge");
+
+        let nonce_path = config.data_dir.join("invite_nonce.txt");
+        write_nonce_file(&nonce_path, &decoded.nonce).unwrap();
+        assert!(nonce_path.exists());
+
+        let nonce_content = std::fs::read_to_string(&nonce_path).unwrap();
+        assert!(!nonce_content.is_empty());
+
+        // Verify nonce roundtrips through bs58.
+        let nonce_bytes = bs58::decode(&nonce_content).into_vec().unwrap();
+        assert_eq!(nonce_bytes, decoded.nonce);
+    }
+
+    #[test]
+    fn test_cmd_join_uses_hostname_when_no_node_name() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let token = InviteToken {
+            control_addr: "addr-123".to_string(),
+            nonce: [1; 16],
+            ttl_seconds: 300,
+            created_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            node_name: None,
+        };
+
+        let node_name = token.node_name.clone().unwrap_or_else(|| {
+            hostname::get()
+                .map(|h| h.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "unnamed".to_string())
+        });
+
+        // Should fall back to system hostname, not be empty.
+        assert!(!node_name.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_nonce_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::Builder::new()
+            .prefix("mesh-nonce-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let nonce_path = dir.path().join("invite_nonce.txt");
+        let nonce = [42u8; 16];
+
+        write_nonce_file(&nonce_path, &nonce).unwrap();
+
+        let mode = std::fs::metadata(&nonce_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "nonce file should be owner-only rw");
     }
 }
