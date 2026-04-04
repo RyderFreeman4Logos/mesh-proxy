@@ -23,6 +23,7 @@ libc.workspace = true
 toml_edit.workspace = true
 bs58.workspace = true
 hostname.workspace = true
+dirs-next.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

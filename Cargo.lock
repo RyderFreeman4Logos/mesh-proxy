@@ -1935,6 +1935,7 @@ dependencies = [
  "anyhow",
  "bs58",
  "clap",
+ "dirs-next",
  "hostname",
  "iroh",
  "libc",

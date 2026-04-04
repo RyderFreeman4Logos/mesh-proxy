@@ -116,6 +116,14 @@ enum Command {
         #[command(subcommand)]
         command: QuotaCommand,
     },
+
+    /// Install a system service to start mesh-proxy on boot.
+    InstallService {
+        /// Install as user service instead of system-wide
+        /// (Linux: systemd --user, macOS: ~/Library/LaunchAgents).
+        #[arg(long)]
+        user: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -211,6 +219,7 @@ fn main() -> Result<()> {
         Command::Start { role, control_addr } => cmd_start(&config, Some(role), control_addr),
         Command::Restart => cmd_restart(&config),
         Command::Join { token } => cmd_join(&config, token),
+        Command::InstallService { user } => cmd_install_service(&config, user),
         other => {
             // Non-start commands: create runtime normally.
             tokio::runtime::Builder::new_multi_thread()
@@ -245,7 +254,10 @@ fn main() -> Result<()> {
                         Command::Accept { ticket, name } => cmd_accept(&config, ticket, name).await,
                         Command::Invite { name, ttl } => cmd_invite(&config, name, ttl).await,
                         Command::Quota { command } => cmd_quota(&config, command).await,
-                        Command::Start { .. } | Command::Restart | Command::Join { .. } => {
+                        Command::Start { .. }
+                        | Command::Restart
+                        | Command::Join { .. }
+                        | Command::InstallService { .. } => {
                             unreachable!()
                         }
                     }
@@ -975,6 +987,118 @@ fn render_quota_table(quotas: &[(String, usize, usize)]) -> String {
     output.trim_end().to_string()
 }
 
+/// Generate a systemd unit file for mesh-proxy.
+fn generate_systemd_unit(binary_path: &Path, role: NodeRole, data_dir: &Path) -> String {
+    let role_str = match role {
+        NodeRole::Control => "control",
+        NodeRole::Edge => "edge",
+    };
+    format!(
+        "[Unit]\n\
+         Description=mesh-proxy daemon\n\
+         After=network-online.target\n\
+         Wants=network-online.target\n\
+         \n\
+         [Service]\n\
+         Type=forking\n\
+         ExecStart={binary} start --role {role}\n\
+         ExecStop={binary} stop\n\
+         PIDFile={pid}\n\
+         Restart=on-failure\n\
+         RestartSec=5\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n",
+        binary = binary_path.display(),
+        role = role_str,
+        pid = data_dir.join("daemon.pid").display(),
+    )
+}
+
+/// Generate a launchd plist for mesh-proxy.
+fn generate_launchd_plist(binary_path: &Path, role: NodeRole) -> String {
+    let role_str = match role {
+        NodeRole::Control => "control",
+        NodeRole::Edge => "edge",
+    };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
+         \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\">\n\
+         <dict>\n\
+         \t<key>Label</key>\n\
+         \t<string>com.mesh-proxy.daemon</string>\n\
+         \t<key>ProgramArguments</key>\n\
+         \t<array>\n\
+         \t\t<string>{binary}</string>\n\
+         \t\t<string>start</string>\n\
+         \t\t<string>--role</string>\n\
+         \t\t<string>{role}</string>\n\
+         \t</array>\n\
+         \t<key>RunAtLoad</key>\n\
+         \t<true/>\n\
+         \t<key>KeepAlive</key>\n\
+         \t<true/>\n\
+         \t<key>StandardOutPath</key>\n\
+         \t<string>/tmp/mesh-proxy.log</string>\n\
+         \t<key>StandardErrorPath</key>\n\
+         \t<string>/tmp/mesh-proxy.err</string>\n\
+         </dict>\n\
+         </plist>\n",
+        binary = binary_path.display(),
+        role = role_str,
+    )
+}
+
+fn cmd_install_service(config_path: &Path, user: bool) -> Result<()> {
+    let config = MeshConfig::load(config_path)?;
+    let binary_path =
+        std::env::current_exe().context("failed to determine mesh-proxy binary path")?;
+
+    if cfg!(target_os = "linux") {
+        let content = generate_systemd_unit(&binary_path, config.role, &config.data_dir);
+        let dest = if user {
+            let dir = dirs_next::home_dir()
+                .context("cannot determine home directory")?
+                .join(".config/systemd/user");
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("failed to create {}", dir.display()))?;
+            dir.join("mesh-proxy.service")
+        } else {
+            PathBuf::from("/etc/systemd/system/mesh-proxy.service")
+        };
+
+        std::fs::write(&dest, content)
+            .with_context(|| format!("failed to write {}", dest.display()))?;
+
+        println!("Service installed at {}", dest.display());
+        if user {
+            println!("Enable with:\n  systemctl --user enable --now mesh-proxy");
+        } else {
+            println!("Enable with:\n  sudo systemctl enable --now mesh-proxy");
+        }
+    } else if cfg!(target_os = "macos") {
+        let content = generate_launchd_plist(&binary_path, config.role);
+        let dir = dirs_next::home_dir()
+            .context("cannot determine home directory")?
+            .join("Library/LaunchAgents");
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+        let dest = dir.join("com.mesh-proxy.daemon.plist");
+
+        std::fs::write(&dest, &content)
+            .with_context(|| format!("failed to write {}", dest.display()))?;
+
+        println!("Service installed at {}", dest.display());
+        println!("Load with:\n  launchctl load ~/Library/LaunchAgents/com.mesh-proxy.daemon.plist");
+    } else {
+        anyhow::bail!("install-service is not supported on this platform");
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1422,5 +1546,83 @@ mod tests {
 
         let mode = std::fs::metadata(&nonce_path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "nonce file should be owner-only rw");
+    }
+
+    // ── install-service tests ──
+
+    #[test]
+    fn test_cli_install_service_defaults() {
+        let cli = Cli::try_parse_from(["mesh-proxy", "install-service"]).unwrap();
+        match cli.command {
+            Command::InstallService { user } => {
+                assert!(!user, "default should be system-wide");
+            }
+            other => panic!("expected InstallService, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cli_install_service_user_flag() {
+        let cli = Cli::try_parse_from(["mesh-proxy", "install-service", "--user"]).unwrap();
+        match cli.command {
+            Command::InstallService { user } => {
+                assert!(user);
+            }
+            other => panic!("expected InstallService, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_generate_systemd_unit_control() {
+        let binary = PathBuf::from("/usr/local/bin/mesh-proxy");
+        let data_dir = PathBuf::from("/var/lib/mesh-proxy");
+        let content = generate_systemd_unit(&binary, NodeRole::Control, &data_dir);
+
+        assert!(content.contains("Description=mesh-proxy daemon"));
+        assert!(content.contains("After=network-online.target"));
+        assert!(content.contains("Type=forking"));
+        assert!(content.contains("ExecStart=/usr/local/bin/mesh-proxy start --role control"));
+        assert!(content.contains("ExecStop=/usr/local/bin/mesh-proxy stop"));
+        assert!(content.contains("PIDFile=/var/lib/mesh-proxy/daemon.pid"));
+        assert!(content.contains("Restart=on-failure"));
+        assert!(content.contains("WantedBy=multi-user.target"));
+    }
+
+    #[test]
+    fn test_generate_systemd_unit_edge() {
+        let binary = PathBuf::from("/opt/mesh-proxy");
+        let data_dir = PathBuf::from("/home/user/.local/share/mesh-proxy");
+        let content = generate_systemd_unit(&binary, NodeRole::Edge, &data_dir);
+
+        assert!(content.contains("ExecStart=/opt/mesh-proxy start --role edge"));
+        assert!(content.contains("PIDFile=/home/user/.local/share/mesh-proxy/daemon.pid"));
+    }
+
+    #[test]
+    fn test_generate_launchd_plist_control() {
+        let binary = PathBuf::from("/usr/local/bin/mesh-proxy");
+        let content = generate_launchd_plist(&binary, NodeRole::Control);
+
+        assert!(content.contains("<?xml version=\"1.0\""));
+        assert!(content.contains("<string>com.mesh-proxy.daemon</string>"));
+        assert!(content.contains("<string>/usr/local/bin/mesh-proxy</string>"));
+        assert!(content.contains("<string>start</string>"));
+        assert!(content.contains("<string>--role</string>"));
+        assert!(content.contains("<string>control</string>"));
+        assert!(content.contains("<key>RunAtLoad</key>"));
+        assert!(content.contains("<true/>"));
+        assert!(content.contains("<key>KeepAlive</key>"));
+        assert!(content.contains("<string>/tmp/mesh-proxy.log</string>"));
+        assert!(content.contains("<string>/tmp/mesh-proxy.err</string>"));
+        assert!(content.contains("</plist>"));
+    }
+
+    #[test]
+    fn test_generate_launchd_plist_edge() {
+        let binary = PathBuf::from("/opt/mesh-proxy");
+        let content = generate_launchd_plist(&binary, NodeRole::Edge);
+
+        assert!(content.contains("<string>/opt/mesh-proxy</string>"));
+        assert!(content.contains("<string>edge</string>"));
     }
 }
