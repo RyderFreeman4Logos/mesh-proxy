@@ -1,6 +1,7 @@
 use std::fmt::Write as _;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -9,6 +10,7 @@ use mesh_proto::{
     HealthCheckConfig, HealthCheckMode, IpcRequest, IpcResponse, MeshConfig, NodeRole, Protocol,
     validate_local_addr, validate_service_name,
 };
+use toml_edit::{DocumentMut, value};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -33,6 +35,10 @@ enum Command {
         /// Node role: control or edge.
         #[arg(long)]
         role: Role,
+
+        /// Serialized control node endpoint address written to config before startup.
+        #[arg(long)]
+        control_addr: Option<String>,
     },
 
     /// Restart the daemon using the current config.
@@ -69,6 +75,13 @@ enum Command {
         /// Health check target (overrides addr for probe, e.g. an HTTP URL).
         #[arg(long)]
         health_check_target: Option<String>,
+    },
+
+    /// Remove a previously exposed local service from the mesh config.
+    Unexpose {
+        /// Service name to remove.
+        #[arg(long)]
+        name: String,
     },
 
     /// Accept an edge node's join ticket (control node only).
@@ -178,7 +191,7 @@ fn main() -> Result<()> {
     let Cli { config, command } = Cli::parse();
 
     match command {
-        Command::Start { role } => cmd_start(&config, Some(role)),
+        Command::Start { role, control_addr } => cmd_start(&config, Some(role), control_addr),
         Command::Restart => cmd_restart(&config),
         other => {
             // Non-start commands: create runtime normally.
@@ -210,6 +223,7 @@ fn main() -> Result<()> {
                             )
                             .await
                         }
+                        Command::Unexpose { name } => cmd_unexpose(&config, name).await,
                         Command::Accept { ticket, name } => cmd_accept(&config, ticket, name).await,
                         Command::Quota { command } => cmd_quota(&config, command).await,
                         Command::Start { .. } | Command::Restart => unreachable!(),
@@ -219,8 +233,16 @@ fn main() -> Result<()> {
     }
 }
 
-fn cmd_start(config_path: &Path, role_override: Option<Role>) -> Result<()> {
+fn cmd_start(
+    config_path: &Path,
+    role_override: Option<Role>,
+    control_addr_override: Option<String>,
+) -> Result<()> {
     // All pre-fork work is synchronous (single-threaded).
+    if let Some(control_addr) = control_addr_override.as_deref() {
+        write_control_addr_override(config_path, control_addr)?;
+    }
+
     let mut config = MeshConfig::load(config_path)?;
     if let Some(role) = role_override {
         config.role = role.into();
@@ -250,6 +272,61 @@ fn cmd_start(config_path: &Path, role_override: Option<Role>) -> Result<()> {
         })
 }
 
+fn write_control_addr_override(config_path: &Path, control_addr: &str) -> Result<()> {
+    let control_addr = control_addr.trim();
+    if control_addr.is_empty() {
+        anyhow::bail!("control address must not be empty");
+    }
+
+    MeshConfig::load(config_path)?;
+
+    let content = std::fs::read_to_string(config_path)
+        .with_context(|| format!("failed to read config at {}", config_path.display()))?;
+    let mut document = DocumentMut::from_str(&content)
+        .with_context(|| format!("failed to parse config at {}", config_path.display()))?;
+    document["control_addr"] = value(control_addr);
+
+    write_config_document_atomic(config_path, &document)
+}
+
+fn write_config_document_atomic(path: &Path, document: &DocumentMut) -> Result<()> {
+    let content = document.to_string();
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create config dir {}", parent.display()))?;
+    }
+
+    let tmp_path = path.with_extension("toml.tmp");
+    let mut open_options = std::fs::OpenOptions::new();
+    open_options.create(true).truncate(true).write(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        open_options.mode(0o600);
+    }
+
+    let mut file = open_options
+        .open(&tmp_path)
+        .with_context(|| format!("failed to create temp config at {}", tmp_path.display()))?;
+    std::io::Write::write_all(&mut file, content.as_bytes())
+        .with_context(|| format!("failed to write temp config at {}", tmp_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to fsync temp config at {}", tmp_path.display()))?;
+
+    std::fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "failed to rename {} to {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
+
+    Ok(())
+}
+
 fn cmd_restart(config_path: &Path) -> Result<()> {
     let config = MeshConfig::load(config_path)?;
     let pid_path = config.data_dir.join("daemon.pid");
@@ -277,7 +354,7 @@ fn cmd_restart(config_path: &Path) -> Result<()> {
         }
     }
 
-    cmd_start(config_path, None)
+    cmd_start(config_path, None, None)
 }
 
 fn read_pid_file(pid_path: &Path) -> Result<libc::pid_t> {
@@ -438,8 +515,37 @@ async fn cmd_status(config_path: &Path, output: OutputFormat) -> Result<()> {
         } => {
             println!("Service '{name}' exposed (port: {assigned_port:?})");
         }
+        IpcResponse::ServiceUnexposed { name } => {
+            println!("Service '{name}' unexposed");
+        }
         IpcResponse::ListenerStatus { port, state } => {
             println!("Listener {port}: {state:?}");
+        }
+        other => {
+            anyhow::bail!("unexpected response: {other:?}");
+        }
+    }
+
+    Ok(())
+}
+
+/// Remove a local service from the mesh via IPC.
+async fn cmd_unexpose(config_path: &Path, name: String) -> Result<()> {
+    if let Err(reason) = validate_service_name(&name) {
+        anyhow::bail!("invalid service name '{name}': {reason}");
+    }
+
+    let request = IpcRequest::UnexposeService { name: name.clone() };
+
+    let socket_path = daemon_socket_path(config_path)?;
+    let response = send_ipc_request(&socket_path, &request, "unexpose").await?;
+
+    match response {
+        IpcResponse::ServiceUnexposed { name } => {
+            println!("Service '{name}' unexposed");
+        }
+        IpcResponse::Error { message } => {
+            anyhow::bail!("unexpose failed: {message}");
         }
         other => {
             anyhow::bail!("unexpected response: {other:?}");
@@ -761,7 +867,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(cli.config, PathBuf::from("/tmp/mesh.toml"));
-        assert!(matches!(cli.command, Command::Start { role: Role::Edge }));
+        assert!(matches!(
+            cli.command,
+            Command::Start {
+                role: Role::Edge,
+                control_addr: None
+            }
+        ));
     }
 
     #[test]
@@ -907,6 +1019,27 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_start_accepts_control_addr() {
+        let cli = Cli::try_parse_from([
+            "mesh-proxy",
+            "start",
+            "--role",
+            "edge",
+            "--control-addr",
+            r#"{"node_id":"ep-ctrl"}"#,
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Start { role, control_addr } => {
+                assert!(matches!(role, Role::Edge));
+                assert_eq!(control_addr.as_deref(), Some(r#"{"node_id":"ep-ctrl"}"#));
+            }
+            other => panic!("expected Start, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_cli_expose_with_health_check() {
         let cli = Cli::try_parse_from([
             "mesh-proxy",
@@ -947,6 +1080,24 @@ mod tests {
     fn test_cli_expose_missing_name_fails() {
         let result = Cli::try_parse_from(["mesh-proxy", "expose", "--addr", "127.0.0.1:8080"]);
         assert!(result.is_err(), "expose without --name should fail");
+    }
+
+    #[test]
+    fn test_cli_unexpose_required_args() {
+        let cli = Cli::try_parse_from(["mesh-proxy", "unexpose", "--name", "my-svc"]).unwrap();
+
+        match cli.command {
+            Command::Unexpose { name } => {
+                assert_eq!(name, "my-svc");
+            }
+            other => panic!("expected Unexpose, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cli_unexpose_missing_name_fails() {
+        let result = Cli::try_parse_from(["mesh-proxy", "unexpose"]);
+        assert!(result.is_err(), "unexpose without --name should fail");
     }
 
     #[test]

@@ -246,6 +246,7 @@ async fn dispatch(request: &IpcRequest, state: &SharedState) -> IpcResponse {
             protocol,
             health_check,
         } => handle_expose_service(state, name, local_addr, *protocol, health_check.clone()).await,
+        IpcRequest::UnexposeService { name } => handle_unexpose_service(state, name).await,
         IpcRequest::AcceptNode { ticket, node_name } => {
             handle_accept_node(state, ticket, node_name.as_deref()).await
         }
@@ -503,6 +504,58 @@ async fn handle_expose_service(
     }
 }
 
+async fn handle_unexpose_service(state: &SharedState, name: &str) -> IpcResponse {
+    if state.config.role != NodeRole::Edge {
+        return IpcResponse::Error {
+            message: "unexpose is only available on edge nodes".to_string(),
+        };
+    }
+
+    if let Err(error) = mesh_proto::validate_service_name(name) {
+        return IpcResponse::Error {
+            message: format!("invalid service name: {error}"),
+        };
+    }
+
+    let mut document = match load_config_document(&state.config_path).await {
+        Ok(document) => document,
+        Err(error) => {
+            return IpcResponse::Error {
+                message: format!("failed to update config.toml: {error}"),
+            };
+        }
+    };
+
+    let removed = match remove_service_entry(&mut document, name) {
+        Ok(removed) => removed,
+        Err(error) => {
+            return IpcResponse::Error {
+                message: format!("failed to update config.toml: {error}"),
+            };
+        }
+    };
+
+    if removed {
+        if let Err(error) = write_config_document_atomic(&state.config_path, &document).await {
+            return IpcResponse::Error {
+                message: format!("failed to update config.toml: {error}"),
+            };
+        }
+
+        if let Err(error) = state.reload_tx.send(()).await {
+            return IpcResponse::Error {
+                message: format!(
+                    "service removed from config but failed to trigger reload: {error}"
+                ),
+            };
+        }
+    }
+
+    IpcResponse::ServiceUnexposed {
+        name: name.to_owned(),
+    }
+}
+
 fn validate_expose_service_request(
     name: &str,
     local_addr: &str,
@@ -605,6 +658,43 @@ fn ensure_services_array(document: &mut DocumentMut) -> Result<&mut ArrayOfTable
 
     document["services"]
         .as_array_of_tables_mut()
+        .context("services must be an array of tables")
+}
+
+fn remove_service_entry(document: &mut DocumentMut, name: &str) -> Result<bool> {
+    let should_remove_key = {
+        let Some(services) = get_services_array_mut(document)? else {
+            return Ok(false);
+        };
+        let Some(index) = services
+            .iter()
+            .position(|table| table.get("name").and_then(|item| item.as_str()) == Some(name))
+        else {
+            return Ok(false);
+        };
+
+        services.remove(index);
+        services.is_empty()
+    };
+
+    if should_remove_key {
+        document.as_table_mut().remove("services");
+    }
+
+    Ok(true)
+}
+
+fn get_services_array_mut(document: &mut DocumentMut) -> Result<Option<&mut ArrayOfTables>> {
+    let Some(item) = document.as_table_mut().get_mut("services") else {
+        return Ok(None);
+    };
+
+    if item.is_none() {
+        return Ok(None);
+    }
+
+    item.as_array_of_tables_mut()
+        .map(Some)
         .context("services must be an array of tables")
 }
 
@@ -1009,6 +1099,54 @@ mod tests {
                 protocol: Protocol::Unix,
                 health_check: None,
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unexpose_service_removes_service_from_config_and_triggers_reload() {
+        let (state, _dir, mut reload_rx) = shared_state(NodeRole::Edge);
+        let original = MeshConfig {
+            services: vec![
+                ServiceEntry {
+                    name: "web".to_string(),
+                    local_addr: "127.0.0.1:8080".to_string(),
+                    protocol: Protocol::Tcp,
+                    health_check: None,
+                },
+                ServiceEntry {
+                    name: "ssh".to_string(),
+                    local_addr: "127.0.0.1:22".to_string(),
+                    protocol: Protocol::Tcp,
+                    health_check: None,
+                },
+            ],
+            ..state.config.clone()
+        };
+        original.save(&state.config_path).unwrap();
+
+        let response = dispatch(
+            &IpcRequest::UnexposeService {
+                name: "web".to_string(),
+            },
+            &state,
+        )
+        .await;
+
+        let IpcResponse::ServiceUnexposed { name } = response else {
+            panic!("expected service unexposed response");
+        };
+        assert_eq!(name, "web");
+        assert_eq!(reload_rx.recv().await, Some(()));
+
+        let updated = MeshConfig::load(&state.config_path).unwrap();
+        assert_eq!(
+            updated.services,
+            vec![ServiceEntry {
+                name: "ssh".to_string(),
+                local_addr: "127.0.0.1:22".to_string(),
+                protocol: Protocol::Tcp,
+                health_check: None,
+            }]
         );
     }
 
