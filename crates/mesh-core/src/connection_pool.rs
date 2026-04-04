@@ -31,6 +31,11 @@ impl ConnectionPool {
         }
     }
 
+    /// Return the endpoint id used by this pool for outbound connections.
+    pub fn local_endpoint_id(&self) -> String {
+        self.endpoint.id().to_string()
+    }
+
     /// Get a cached connection or establish a new one on demand.
     pub async fn get_or_connect(&self, endpoint_id_hex: &str) -> Result<Connection> {
         if let Some(connection) = self.cached_connection(endpoint_id_hex).await {

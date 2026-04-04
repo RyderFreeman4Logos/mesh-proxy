@@ -15,7 +15,7 @@ pub mod process;
 pub use config_watcher::ConfigWatcher;
 pub use connection_pool::{ConnectionPool, bridge_bidirectional, bridge_streams};
 pub use control_node::{
-    ControlNode, ControlNodeSnapshot, QuotaError, TicketError, broadcast_routes, run_accept_loop,
+    ControlNode, ControlNodeSnapshot, QuotaError, TicketError, run_accept_loop,
 };
 pub use daemon::{Daemon, ShutdownRx, ShutdownTx};
 #[cfg(unix)]

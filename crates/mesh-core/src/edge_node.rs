@@ -12,6 +12,7 @@ use mesh_proto::{
     ALPN_CONTROL, ALPN_PROXY, ControlMessage, MAX_LISTENERS, MAX_PROXY_CONNECTIONS, MeshConfig,
     PROXY_HANDSHAKE_TIMEOUT_SECS, Protocol, ProxyHandshake, RouteEntry, ServiceEntry,
 };
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::UnixListener;
@@ -73,30 +74,39 @@ pub fn try_reserve_proxy_connection_slot(
 }
 
 /// Resolve the target local service for an inbound proxy handshake.
-pub fn validate_inbound_proxy_handshake(
+fn lookup_local_service(
     config: &MeshConfig,
-    handshake: &ProxyHandshake,
+    service_name: &str,
+    protocol: Protocol,
 ) -> std::result::Result<ServiceEntry, ProxyHandshakeValidationError> {
     let Some(service) = config
         .services
         .iter()
-        .find(|service| service.name == handshake.service_name)
+        .find(|service| service.name == service_name)
         .cloned()
     else {
         return Err(ProxyHandshakeValidationError::UnknownService {
-            service_name: handshake.service_name.clone(),
+            service_name: service_name.to_string(),
         });
     };
 
-    if service.protocol != handshake.protocol {
+    if service.protocol != protocol {
         return Err(ProxyHandshakeValidationError::ProtocolMismatch {
-            service_name: handshake.service_name.clone(),
+            service_name: service_name.to_string(),
             expected: service.protocol,
-            received: handshake.protocol,
+            received: protocol,
         });
     }
 
     Ok(service)
+}
+
+/// Resolve the target local service for an inbound proxy handshake.
+pub fn validate_inbound_proxy_handshake(
+    config: &MeshConfig,
+    handshake: &ProxyHandshake,
+) -> std::result::Result<ServiceEntry, ProxyHandshakeValidationError> {
+    lookup_local_service(config, &handshake.service_name, handshake.protocol)
 }
 
 fn reject_connection(connection: &Connection, reason: &'static [u8]) {
@@ -211,11 +221,102 @@ fn replace_shared_routes(
     }
 }
 
+async fn bridge_local_streams<Incoming, Outgoing>(
+    mut incoming: Incoming,
+    mut outgoing: Outgoing,
+) -> anyhow::Result<()>
+where
+    Incoming: AsyncRead + AsyncWrite + Unpin,
+    Outgoing: AsyncRead + AsyncWrite + Unpin,
+{
+    tokio::io::copy_bidirectional(&mut incoming, &mut outgoing)
+        .await
+        .context("failed to bridge local streams")?;
+    Ok(())
+}
+
+async fn resolve_local_fast_path_service(
+    config: &AsyncRwLock<MeshConfig>,
+    route: &RouteEntry,
+    local_endpoint_id: &str,
+) -> Result<Option<ServiceEntry>> {
+    if route.endpoint_id != local_endpoint_id {
+        return Ok(None);
+    }
+
+    let config = config.read().await;
+    let service = lookup_local_service(&config, &route.service_name, route.protocol)?;
+    Ok(Some(service))
+}
+
+async fn forward_local_service_stream<Incoming>(
+    port: u16,
+    incoming: Incoming,
+    service: &ServiceEntry,
+) -> anyhow::Result<()>
+where
+    Incoming: AsyncRead + AsyncWrite + Unpin,
+{
+    match service.protocol {
+        Protocol::Tcp => {
+            let local_stream = tokio::net::TcpStream::connect(&service.local_addr)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to connect local fast-path TCP service {} at {} for port {port}",
+                        service.name, service.local_addr
+                    )
+                })?;
+            bridge_local_streams(incoming, local_stream)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to bridge local fast-path TCP service {} for port {port}",
+                        service.name
+                    )
+                })?;
+        }
+        Protocol::Unix => {
+            #[cfg(unix)]
+            {
+                let local_stream = tokio::net::UnixStream::connect(&service.local_addr)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to connect local fast-path Unix service {} at {} for port {port}",
+                            service.name, service.local_addr
+                        )
+                    })?;
+                bridge_local_streams(incoming, local_stream)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to bridge local fast-path Unix service {} for port {port}",
+                            service.name
+                        )
+                    })?;
+            }
+
+            #[cfg(not(unix))]
+            {
+                let _ = incoming;
+                return Err(anyhow!(
+                    "unix proxying is not supported on this platform for {}",
+                    service.name
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 async fn forward_tcp_stream(
     port: u16,
     stream: tokio::net::TcpStream,
     pool: Arc<ConnectionPool>,
     routes: Arc<RwLock<HashMap<u16, RouteEntry>>>,
+    config: Arc<AsyncRwLock<MeshConfig>>,
 ) -> anyhow::Result<()> {
     let route = match clone_shared_route(&routes, port) {
         Some(route) => route,
@@ -227,6 +328,27 @@ async fn forward_tcp_stream(
             return Ok(());
         }
     };
+
+    let local_endpoint_id = pool.local_endpoint_id();
+    if let Some(service) =
+        resolve_local_fast_path_service(config.as_ref(), &route, &local_endpoint_id)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to resolve local fast path for service {} on port {port}",
+                    route.service_name
+                )
+            })?
+    {
+        tracing::debug!(
+            port,
+            service_name = %service.name,
+            local_addr = %service.local_addr,
+            "short-circuiting self-route TCP forwarding to local service"
+        );
+        forward_local_service_stream(port, stream, &service).await?;
+        return Ok(());
+    }
 
     let connection = pool
         .get_or_connect(&route.endpoint_id)
@@ -259,6 +381,7 @@ async fn forward_unix_stream(
     stream: tokio::net::UnixStream,
     pool: Arc<ConnectionPool>,
     routes: Arc<RwLock<HashMap<u16, RouteEntry>>>,
+    config: Arc<AsyncRwLock<MeshConfig>>,
 ) -> anyhow::Result<()> {
     let route = match clone_shared_route(&routes, port) {
         Some(route) => route,
@@ -271,6 +394,28 @@ async fn forward_unix_stream(
             return Ok(());
         }
     };
+
+    let local_endpoint_id = pool.local_endpoint_id();
+    if let Some(service) =
+        resolve_local_fast_path_service(config.as_ref(), &route, &local_endpoint_id)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to resolve local fast path for service {} on port {port}",
+                    route.service_name
+                )
+            })?
+    {
+        tracing::debug!(
+            path = %path.display(),
+            port,
+            service_name = %service.name,
+            local_addr = %service.local_addr,
+            "short-circuiting self-route Unix forwarding to local service"
+        );
+        forward_local_service_stream(port, stream, &service).await?;
+        return Ok(());
+    }
 
     let connection = pool
         .get_or_connect(&route.endpoint_id)
@@ -298,6 +443,7 @@ async fn forward_unix_stream(
 
 async fn handle_control_inbound(
     node: Arc<AsyncRwLock<EdgeNode>>,
+    config: Arc<AsyncRwLock<MeshConfig>>,
     connection: Connection,
     data_dir: &Path,
 ) -> Result<()> {
@@ -324,7 +470,9 @@ async fn handle_control_inbound(
         match message {
             ControlMessage::RouteTableUpdate { routes, version } => {
                 let mut edge = node.write().await;
-                let applied = edge.apply_route_update(routes, version).await;
+                let applied = edge
+                    .apply_route_update(routes, version, Arc::clone(&config))
+                    .await;
                 if applied {
                     edge.save_route_cache(data_dir)
                         .await
@@ -545,9 +693,12 @@ pub(crate) async fn run_edge_accept_loop(
 
                 if connection.alpn() == ALPN_CONTROL {
                     let node = Arc::clone(&node);
+                    let config = Arc::clone(&config);
                     let data_dir = data_dir.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = handle_control_inbound(node, connection, &data_dir).await {
+                        if let Err(error) =
+                            handle_control_inbound(node, config, connection, &data_dir).await
+                        {
                             tracing::warn!(error = %error, "edge control connection handler error");
                         }
                     });
@@ -590,6 +741,7 @@ pub async fn spawn_tcp_listener(
     port: u16,
     pool: Arc<ConnectionPool>,
     routes: Arc<RwLock<HashMap<u16, RouteEntry>>>,
+    config: Arc<AsyncRwLock<MeshConfig>>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> std::io::Result<JoinHandle<()>> {
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
@@ -603,8 +755,9 @@ pub async fn spawn_tcp_listener(
                             tracing::info!(port, %peer_addr, "accepted dynamic TCP listener connection");
                             let pool = Arc::clone(&pool);
                             let routes = Arc::clone(&routes);
+                            let config = Arc::clone(&config);
                             tokio::spawn(async move {
-                                if let Err(error) = forward_tcp_stream(port, stream, pool, routes).await {
+                                if let Err(error) = forward_tcp_stream(port, stream, pool, routes, config).await {
                                     tracing::warn!(port, %peer_addr, error = %error, "dynamic TCP listener forwarding failed");
                                 }
                             });
@@ -637,6 +790,7 @@ pub async fn spawn_unix_listener(
     port: u16,
     pool: Arc<ConnectionPool>,
     routes: Arc<RwLock<HashMap<u16, RouteEntry>>>,
+    config: Arc<AsyncRwLock<MeshConfig>>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> std::io::Result<JoinHandle<()>> {
     let path = path.as_ref().to_path_buf();
@@ -659,9 +813,10 @@ pub async fn spawn_unix_listener(
                             tracing::info!(path = %path.display(), "accepted dynamic Unix listener connection");
                             let pool = Arc::clone(&pool);
                             let routes = Arc::clone(&routes);
+                            let config = Arc::clone(&config);
                             let accept_path = path.clone();
                             tokio::spawn(async move {
-                                if let Err(error) = forward_unix_stream(&accept_path, port, stream, pool, routes).await {
+                                if let Err(error) = forward_unix_stream(&accept_path, port, stream, pool, routes, config).await {
                                     tracing::warn!(path = %accept_path.display(), port, error = %error, "dynamic Unix listener forwarding failed");
                                 }
                             });
@@ -821,23 +976,34 @@ impl EdgeNode {
     /// Returns `true` if the update was applied, `false` if stale.
     /// Apply a route update unconditionally, bypassing version check.
     /// Used after fresh registration when the control's route table is authoritative.
-    pub async fn force_route_update(&mut self, routes: HashMap<u16, RouteEntry>, version: u64) {
-        self.apply_route_update_inner(routes, version).await;
+    pub async fn force_route_update(
+        &mut self,
+        routes: HashMap<u16, RouteEntry>,
+        version: u64,
+        config: Arc<AsyncRwLock<MeshConfig>>,
+    ) {
+        self.apply_route_update_inner(routes, version, config).await;
     }
 
     pub async fn apply_route_update(
         &mut self,
         routes: HashMap<u16, RouteEntry>,
         version: u64,
+        config: Arc<AsyncRwLock<MeshConfig>>,
     ) -> bool {
         if version <= self.route_version {
             return false;
         }
-        self.apply_route_update_inner(routes, version).await;
+        self.apply_route_update_inner(routes, version, config).await;
         true
     }
 
-    async fn apply_route_update_inner(&mut self, routes: HashMap<u16, RouteEntry>, version: u64) {
+    async fn apply_route_update_inner(
+        &mut self,
+        routes: HashMap<u16, RouteEntry>,
+        version: u64,
+        config: Arc<AsyncRwLock<MeshConfig>>,
+    ) {
         let (to_spawn, to_remove) = route_diff(&self.cached_routes, &routes);
         replace_shared_routes(&self.shared_routes, &routes);
         self.cached_routes = routes;
@@ -868,6 +1034,7 @@ impl EdgeNode {
                 port,
                 Arc::clone(&self.connection_pool),
                 Arc::clone(&self.shared_routes),
+                Arc::clone(&config),
                 self.shutdown_tx.subscribe(),
             )
             .await
@@ -930,7 +1097,7 @@ mod tests {
     use mesh_proto::{
         MAX_LISTENERS, MAX_PROXY_CONNECTIONS, MeshConfig, Protocol, ProxyHandshake, ServiceEntry,
     };
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
     use tokio::sync::broadcast;
     use tokio::time::{Duration, timeout};
@@ -958,6 +1125,13 @@ mod tests {
 
     fn shared_routes(routes: HashMap<u16, RouteEntry>) -> Arc<RwLock<HashMap<u16, RouteEntry>>> {
         Arc::new(RwLock::new(routes))
+    }
+
+    fn test_config(services: Vec<ServiceEntry>) -> Arc<AsyncRwLock<MeshConfig>> {
+        Arc::new(AsyncRwLock::new(MeshConfig {
+            services,
+            ..MeshConfig::default()
+        }))
     }
 
     async fn proxy_connection_pair()
@@ -1014,6 +1188,27 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(bytes_read, 0);
+    }
+
+    async fn assert_tcp_listener_stopped(port: u16) {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                match std::net::TcpListener::bind(("127.0.0.1", port)) {
+                    Ok(listener) => {
+                        drop(listener);
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => {
+                        panic!("failed to verify TCP listener shutdown on {port}: {error}")
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
     }
 
     async fn shutdown_listeners(edge: &mut EdgeNode) {
@@ -1198,10 +1393,17 @@ mod tests {
         let port = available_tcp_port();
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
         let routes = shared_routes(HashMap::from([(port, test_route("alpha", "endpoint-a"))]));
+        let config = test_config(Vec::new());
 
-        let handle = spawn_tcp_listener(port, fallback_connection_pool(), routes, shutdown_rx)
-            .await
-            .unwrap();
+        let handle = spawn_tcp_listener(
+            port,
+            fallback_connection_pool(),
+            routes,
+            config,
+            shutdown_rx,
+        )
+        .await
+        .unwrap();
 
         assert_tcp_connection_closed(port).await;
 
@@ -1217,12 +1419,14 @@ mod tests {
         let port = available_tcp_port();
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
         let routes = shared_routes(HashMap::from([(port, test_route("alpha", "endpoint-a"))]));
+        let config = test_config(Vec::new());
 
         let handle = spawn_unix_listener(
             &socket_path,
             port,
             fallback_connection_pool(),
             routes,
+            config,
             shutdown_rx,
         )
         .await
@@ -1245,14 +1449,21 @@ mod tests {
     async fn test_apply_route_update_replaces_changed_listener() {
         let port = available_tcp_port();
         let mut edge = EdgeNode::new();
+        let config = test_config(Vec::new());
 
         let initial_routes = HashMap::from([(port, test_route("alpha", "endpoint-a"))]);
-        assert!(edge.apply_route_update(initial_routes, 1).await);
+        assert!(
+            edge.apply_route_update(initial_routes, 1, Arc::clone(&config))
+                .await
+        );
         assert_eq!(edge.listener_pool.len(), 1);
         assert_tcp_connection_closed(port).await;
 
         let updated_routes = HashMap::from([(port, test_route("alpha", "endpoint-b"))]);
-        assert!(edge.apply_route_update(updated_routes, 2).await);
+        assert!(
+            edge.apply_route_update(updated_routes, 2, Arc::clone(&config))
+                .await
+        );
         assert_eq!(edge.listener_pool.len(), 1);
         assert_tcp_connection_closed(port).await;
 
@@ -1260,8 +1471,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_apply_route_update_removes_reassigned_service_listener() {
+        let old_port = available_tcp_port();
+        let new_port = loop {
+            let candidate = available_tcp_port();
+            if candidate != old_port {
+                break candidate;
+            }
+        };
+        let mut edge = EdgeNode::new();
+        let config = test_config(Vec::new());
+
+        let initial_routes = HashMap::from([(old_port, test_route("web", "endpoint-a"))]);
+        assert!(
+            edge.apply_route_update(initial_routes, 1, Arc::clone(&config))
+                .await
+        );
+        assert!(edge.listener_pool.contains_key(&old_port));
+        assert_eq!(edge.listener_pool.len(), 1);
+        assert_tcp_connection_closed(old_port).await;
+
+        let updated_routes = HashMap::from([(new_port, test_route("web", "endpoint-a"))]);
+        assert!(
+            edge.apply_route_update(updated_routes, 2, Arc::clone(&config))
+                .await
+        );
+
+        assert!(!edge.listener_pool.contains_key(&old_port));
+        assert!(edge.listener_pool.contains_key(&new_port));
+        assert_eq!(edge.listener_pool.len(), 1);
+        assert_tcp_listener_stopped(old_port).await;
+        assert_tcp_connection_closed(new_port).await;
+
+        shutdown_listeners(&mut edge).await;
+    }
+
+    #[tokio::test]
     async fn test_apply_route_update_enforces_max_listeners() {
         let mut edge = EdgeNode::new();
+        let config = test_config(Vec::new());
         for port in 0..MAX_LISTENERS {
             edge.listener_pool
                 .insert(port as u16, tokio::spawn(async {}));
@@ -1270,7 +1518,7 @@ mod tests {
         let new_port = available_tcp_port();
         let routes = HashMap::from([(new_port, test_route("overflow", "endpoint-overflow"))]);
 
-        assert!(edge.apply_route_update(routes, 1).await);
+        assert!(edge.apply_route_update(routes, 1, config).await);
         assert_eq!(edge.route_version(), 1);
         assert!(edge.cached_routes().contains_key(&new_port));
         assert_eq!(edge.listener_pool.len(), MAX_LISTENERS);
@@ -1279,6 +1527,99 @@ mod tests {
         for (_, handle) in edge.listener_pool.drain() {
             handle.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn test_local_route_forwarding_short_circuits_self_dial() -> Result<()> {
+        let echo_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .context("failed to bind local echo listener")?;
+        let local_addr = echo_listener
+            .local_addr()
+            .context("failed to read local echo listener address")?;
+        let echo_task = tokio::spawn(async move {
+            let (mut stream, _) = echo_listener.accept().await?;
+            let mut buf = [0_u8; 11];
+            stream.read_exact(&mut buf).await?;
+            stream.write_all(&buf).await?;
+            Result::<()>::Ok(())
+        });
+
+        let address_lookup = MemoryLookup::new();
+        let endpoint = iroh::Endpoint::builder(presets::N0)
+            .address_lookup(address_lookup.clone())
+            .alpns(vec![ALPN_PROXY.to_vec()])
+            .bind()
+            .await
+            .context("failed to bind self-route test endpoint")?;
+        address_lookup.add_endpoint_info(endpoint.addr());
+
+        let self_dial_attempts = Arc::new(AtomicUsize::new(0));
+        let accept_attempts = Arc::clone(&self_dial_attempts);
+        let accept_endpoint = endpoint.clone();
+        let accept_task = tokio::spawn(async move {
+            while let Some(incoming) = accept_endpoint.accept().await {
+                let connecting = incoming
+                    .accept()
+                    .context("failed to accept self-route incoming connection")?;
+                let connection = connecting
+                    .await
+                    .context("failed to complete self-route incoming handshake")?;
+                accept_attempts.fetch_add(1, Ordering::Relaxed);
+                connection.close(0u32.into(), b"unexpected self dial");
+            }
+            Result::<()>::Ok(())
+        });
+
+        let mut edge = EdgeNode::with_endpoint(endpoint.clone());
+        let published_port = loop {
+            let candidate = available_tcp_port();
+            if candidate != local_addr.port() {
+                break candidate;
+            }
+        };
+        let config = test_config(vec![ServiceEntry {
+            name: "self-echo".to_string(),
+            local_addr: local_addr.to_string(),
+            protocol: Protocol::Tcp,
+            health_check: None,
+        }]);
+        let route = RouteEntry {
+            service_name: "self-echo".to_string(),
+            node_name: "edge-a".to_string(),
+            endpoint_id: endpoint.id().to_string(),
+            target_local_addr: "127.0.0.1:1".to_string(),
+            protocol: Protocol::Tcp,
+        };
+        assert!(
+            edge.apply_route_update(HashMap::from([(published_port, route)]), 1, config)
+                .await
+        );
+
+        let round_trip = timeout(Duration::from_secs(5), async {
+            let mut stream = TcpStream::connect(("127.0.0.1", published_port)).await?;
+            stream.write_all(b"hello-mesh!").await?;
+            let mut echoed = [0_u8; 11];
+            stream.read_exact(&mut echoed).await?;
+            Result::<[u8; 11]>::Ok(echoed)
+        })
+        .await
+        .context("timed out waiting for local self-route forwarding")??;
+
+        assert_eq!(&round_trip, b"hello-mesh!");
+        assert_eq!(self_dial_attempts.load(Ordering::Relaxed), 0);
+
+        shutdown_listeners(&mut edge).await;
+        endpoint.close().await;
+        timeout(Duration::from_secs(5), accept_task)
+            .await
+            .context("timed out waiting for self-route accept task")?
+            .context("self-route accept task panicked")??;
+        timeout(Duration::from_secs(5), echo_task)
+            .await
+            .context("timed out waiting for echo task")?
+            .context("echo task panicked")??;
+        Ok(())
     }
 
     #[tokio::test]

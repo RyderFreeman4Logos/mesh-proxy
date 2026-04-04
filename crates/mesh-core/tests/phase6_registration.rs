@@ -224,6 +224,225 @@ impl RegistrationHarness {
     }
 }
 
+struct ControlRegistrationHarness {
+    control_node: Arc<RwLock<ControlNode>>,
+    control_endpoint: iroh::Endpoint,
+    accept_shutdown_tx: broadcast::Sender<()>,
+    accept_handle: JoinHandle<()>,
+}
+
+impl ControlRegistrationHarness {
+    async fn start() -> Result<Self> {
+        let control_endpoint = build_endpoint().await?;
+        let control_node = Arc::new(RwLock::new(ControlNode::new()));
+        let (accept_shutdown_tx, accept_shutdown_rx) = broadcast::channel(4);
+        let accept_handle = tokio::spawn(run_accept_loop(
+            Arc::clone(&control_node),
+            control_endpoint.clone(),
+            accept_shutdown_rx,
+        ));
+
+        Ok(Self {
+            control_node,
+            control_endpoint,
+            accept_shutdown_tx,
+            accept_handle,
+        })
+    }
+
+    fn control_addr(&self) -> Result<String> {
+        serde_json::to_string(&self.control_endpoint.addr())
+            .context("failed to serialize control endpoint address")
+    }
+
+    async fn allow_edge(&self, endpoint_id: &str, node_name: &str) {
+        let mut control = self.control_node.write().await;
+        control.add_node(make_whitelist_node(endpoint_id.to_owned(), node_name));
+    }
+
+    async fn wait_for_control_route(&self, service_name: &str, minimum_version: u64) {
+        loop {
+            let ready = {
+                let control = self.control_node.read().await;
+                control.route_version() >= minimum_version
+                    && control
+                        .routes()
+                        .values()
+                        .any(|route| route.service_name == service_name)
+            };
+
+            if ready {
+                return;
+            }
+
+            sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    async fn shutdown(self) -> Result<()> {
+        let _ = self.accept_shutdown_tx.send(());
+        self.control_endpoint.close().await;
+
+        timeout(Duration::from_secs(2), self.accept_handle)
+            .await
+            .context("accept loop did not exit in time")?
+            .context("accept loop panicked")?;
+
+        Ok(())
+    }
+}
+
+struct EdgeRegistrationHandle {
+    _tempdir: tempfile::TempDir,
+    node_name: String,
+    control_addr: String,
+    config: Arc<RwLock<MeshConfig>>,
+    edge_node: Arc<RwLock<EdgeNode>>,
+    edge_endpoint: iroh::Endpoint,
+    endpoint_id: String,
+    service_change_tx: watch::Sender<()>,
+    registration_shutdown_tx: broadcast::Sender<()>,
+    registration_handle: Option<JoinHandle<()>>,
+}
+
+impl EdgeRegistrationHandle {
+    async fn new(
+        control_addr: String,
+        node_name: &str,
+        services: Vec<ServiceEntry>,
+    ) -> Result<Self> {
+        let edge_endpoint = build_endpoint().await?;
+        let endpoint_id = edge_endpoint.id().to_string();
+        let tempdir = writable_tempdir("mesh-core-phase6-registration-multi-");
+        let config = Arc::new(RwLock::new(make_edge_config(
+            control_addr.clone(),
+            tempdir.path().join("data"),
+            services,
+        )));
+        let edge_node = Arc::new(RwLock::new(EdgeNode::with_endpoint(edge_endpoint.clone())));
+        let (service_change_tx, _) = watch::channel(());
+        let (registration_shutdown_tx, _) = broadcast::channel(4);
+
+        Ok(Self {
+            _tempdir: tempdir,
+            node_name: node_name.to_owned(),
+            control_addr,
+            config,
+            edge_node,
+            edge_endpoint,
+            endpoint_id,
+            service_change_tx,
+            registration_shutdown_tx,
+            registration_handle: None,
+        })
+    }
+
+    fn start(&mut self) {
+        assert!(
+            self.registration_handle.is_none(),
+            "edge registration loop should only be started once"
+        );
+
+        let service_change_rx = self.service_change_tx.subscribe();
+        let registration_shutdown_rx = self.registration_shutdown_tx.subscribe();
+        let handle = tokio::spawn(run_registration_loop(
+            self.edge_endpoint.clone(),
+            self.control_addr.clone(),
+            self.node_name.clone(),
+            Arc::clone(&self.config),
+            Arc::clone(&self.edge_node),
+            service_change_rx,
+            registration_shutdown_rx,
+        ));
+        self.registration_handle = Some(handle);
+    }
+
+    async fn wait_for_registration(&self, control_node: &Arc<RwLock<ControlNode>>) {
+        loop {
+            let registered = {
+                let control = control_node.read().await;
+                let is_online = control
+                    .whitelist()
+                    .get(&self.endpoint_id)
+                    .is_some_and(|node| node.is_online);
+                let has_route = control
+                    .routes()
+                    .values()
+                    .any(|route| route.endpoint_id == self.endpoint_id);
+                is_online && has_route
+            };
+
+            if registered {
+                return;
+            }
+
+            sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    async fn wait_for_edge_routes(&self, expected_count: usize, minimum_version: u64) {
+        loop {
+            let ready = {
+                let edge = self.edge_node.read().await;
+                edge.cached_routes().len() >= expected_count
+                    && edge.route_version() >= minimum_version
+            };
+
+            if ready {
+                return;
+            }
+
+            sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    async fn wait_for_service_route(&self, service_name: &str, minimum_version: u64) {
+        loop {
+            let ready = {
+                let edge = self.edge_node.read().await;
+                edge.route_version() >= minimum_version
+                    && edge
+                        .cached_routes()
+                        .values()
+                        .any(|route| route.service_name == service_name)
+            };
+
+            if ready {
+                return;
+            }
+
+            sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    async fn replace_services_and_reregister(&self, services: Vec<ServiceEntry>) -> Result<()> {
+        {
+            let mut config = self.config.write().await;
+            config.services = services;
+        }
+
+        self.service_change_tx
+            .send(())
+            .map_err(|_| anyhow::anyhow!("failed to trigger service change re-registration"))?;
+
+        Ok(())
+    }
+
+    async fn shutdown(mut self) -> Result<()> {
+        let _ = self.registration_shutdown_tx.send(());
+        self.edge_endpoint.close().await;
+
+        if let Some(handle) = self.registration_handle.take() {
+            timeout(Duration::from_secs(2), handle)
+                .await
+                .context("registration loop did not exit in time")?
+                .context("registration loop panicked")?;
+        }
+
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn test_edge_registration_loop_connects_and_registers() -> Result<()> {
     timeout(TEST_TIMEOUT, async {
@@ -304,4 +523,86 @@ async fn test_edge_registration_receives_existing_routes_without_local_services(
     })
     .await
     .context("edge registration existing-route integration test timed out")?
+}
+
+#[tokio::test]
+async fn test_reregistration_broadcasts_route_updates_to_other_edges() -> Result<()> {
+    timeout(TEST_TIMEOUT, async {
+        let control = ControlRegistrationHarness::start().await?;
+        let control_addr = control.control_addr()?;
+
+        let mut mele = EdgeRegistrationHandle::new(
+            control_addr.clone(),
+            "mele",
+            vec![make_service_entry("mele-api", "127.0.0.1:18080")],
+        )
+        .await?;
+        let mut gb10 = EdgeRegistrationHandle::new(
+            control_addr,
+            "gb10",
+            vec![make_service_entry("gb10-api", "127.0.0.1:28080")],
+        )
+        .await?;
+
+        control.allow_edge(&mele.endpoint_id, "mele").await;
+        control.allow_edge(&gb10.endpoint_id, "gb10").await;
+
+        let test_result: Result<()> = async {
+            mele.start();
+            mele.wait_for_registration(&control.control_node).await;
+            mele.wait_for_edge_routes(1, 1).await;
+
+            gb10.start();
+            gb10.wait_for_registration(&control.control_node).await;
+            gb10.wait_for_edge_routes(2, 2).await;
+
+            let gb10_initial_version = {
+                let edge = gb10.edge_node.read().await;
+                edge.route_version()
+            };
+
+            mele.replace_services_and_reregister(vec![
+                make_service_entry("mele-api", "127.0.0.1:18080"),
+                make_service_entry("mele-admin", "127.0.0.1:18081"),
+            ])
+            .await?;
+
+            control.wait_for_control_route("mele-admin", 3).await;
+            mele.wait_for_service_route("mele-admin", 3).await;
+            timeout(
+                Duration::from_millis(750),
+                gb10.wait_for_service_route("mele-admin", gb10_initial_version + 1),
+            )
+            .await
+            .context(
+                "gb10 should receive the route update before reconnect backoff can hide a missing broadcast",
+            )?;
+
+            let gb10_edge = gb10.edge_node.read().await;
+            assert!(
+                gb10_edge.route_version() > gb10_initial_version,
+                "gb10 should observe a newer route version after mele re-registers"
+            );
+            assert!(
+                gb10_edge.cached_routes().values().any(|route| {
+                    route.endpoint_id == mele.endpoint_id && route.service_name == "mele-admin"
+                }),
+                "gb10 should receive mele's newly registered service"
+            );
+
+            Ok(())
+        }
+        .await;
+
+        let mele_shutdown = mele.shutdown().await;
+        let gb10_shutdown = gb10.shutdown().await;
+        let control_shutdown = control.shutdown().await;
+
+        mele_shutdown?;
+        gb10_shutdown?;
+        control_shutdown?;
+        test_result
+    })
+    .await
+    .context("edge re-registration broadcast integration test timed out")?
 }
