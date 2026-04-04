@@ -21,6 +21,9 @@ pub struct MeshConfig {
     pub role: NodeRole,
     /// For edge nodes: the control node's endpoint address (serialized).
     pub control_addr: Option<String>,
+    /// For control nodes: also expose managed routes on localhost.
+    #[serde(default)]
+    pub enable_local_proxy: bool,
     /// Optional bind address for the local health query HTTP endpoint.
     #[serde(default)]
     pub health_bind: Option<String>,
@@ -69,6 +72,7 @@ impl Default for MeshConfig {
                 .unwrap_or_else(|_| "unnamed".to_string()),
             role: NodeRole::Edge,
             control_addr: None,
+            enable_local_proxy: false,
             health_bind: None,
             services: Vec::new(),
             data_dir: default_data_dir(),
@@ -172,6 +176,7 @@ mod tests {
             node_name: "test-node".to_string(),
             role: NodeRole::Control,
             control_addr: None,
+            enable_local_proxy: true,
             health_bind: None,
             services: vec![ServiceEntry {
                 name: "llama3_api".to_string(),
@@ -210,12 +215,32 @@ mod tests {
     fn test_mesh_config_is_default() {
         let config = MeshConfig::default();
         assert!(config.is_default());
+        assert!(!config.enable_local_proxy);
 
         let modified = MeshConfig {
             role: NodeRole::Control,
             ..Default::default()
         };
         assert!(!modified.is_default());
+    }
+
+    #[test]
+    fn test_config_load_defaults_enable_local_proxy_to_false() {
+        let dir = writable_tempdir();
+        let path = dir.path().join("config.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+node_name = "control"
+role = "control"
+data_dir = "/tmp/mesh-test"
+"#,
+        )
+        .unwrap();
+
+        let loaded = MeshConfig::load(&path).unwrap();
+        assert!(!loaded.enable_local_proxy);
     }
 
     #[test]

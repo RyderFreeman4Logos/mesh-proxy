@@ -71,6 +71,7 @@ fn make_edge_config(
         node_name: "edge-alpha".to_string(),
         role: NodeRole::Edge,
         control_addr: Some(control_addr),
+        enable_local_proxy: false,
         health_bind: None,
         services,
         data_dir,

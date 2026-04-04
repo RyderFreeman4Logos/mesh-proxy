@@ -21,6 +21,10 @@ use crate::health_server::HealthServerState;
 use crate::ipc_server::NodeState;
 use crate::process::StartupReadyWriter;
 
+type SharedRuntimeConfig = Arc<tokio::sync::RwLock<MeshConfig>>;
+type SharedControlNode = Arc<tokio::sync::RwLock<ControlNode>>;
+type SharedLocalProxy = Arc<tokio::sync::Mutex<EdgeNode>>;
+
 /// Shutdown signal type.
 pub type ShutdownTx = broadcast::Sender<()>;
 pub type ShutdownRx = broadcast::Receiver<()>;
@@ -203,8 +207,10 @@ impl Daemon {
             service_change_tx,
             health_state,
             active_connections,
+            control_local_proxy_handle,
         ) = match self.config.role {
             NodeRole::Control => {
+                let runtime_config = Arc::new(tokio::sync::RwLock::new(self.config.clone()));
                 let cn = Arc::new(tokio::sync::RwLock::new(ControlNode::load_from_disk(
                     &self.config.data_dir,
                 )));
@@ -215,16 +221,25 @@ impl Daemon {
                 let shutdown_rx = self.shutdown_rx();
                 let endpoint = mesh_node.endpoint().clone();
                 let cn_clone = Arc::clone(&cn);
+                let control_local_proxy = Self::maybe_spawn_control_local_proxy(
+                    &self.config,
+                    Arc::clone(&cn),
+                    endpoint.clone(),
+                    Arc::clone(&runtime_config),
+                    self.shutdown_rx(),
+                )
+                .await;
                 (
                     Some(tokio::spawn(async move {
                         crate::control_node::run_accept_loop(cn_clone, endpoint, shutdown_rx).await;
                     })),
                     None,
                     None,
-                    None,
+                    Some(runtime_config),
                     None,
                     Some(HealthServerState::from(Arc::clone(&cn))),
                     None,
+                    control_local_proxy.map(|(_, handle)| handle),
                 )
             }
             NodeRole::Edge => {
@@ -300,6 +315,7 @@ impl Daemon {
                     Some(svc_tx),
                     Some(health_state),
                     Some(shutdown_active_connections),
+                    None,
                 )
             }
         };
@@ -370,6 +386,12 @@ impl Daemon {
             warn!(error = %error, "registration loop task join failed");
         }
 
+        if let Some(handle) = control_local_proxy_handle
+            && let Err(error) = handle.await
+        {
+            warn!(error = %error, "control local proxy task join failed");
+        }
+
         if let Some(active_connections) = active_connections.as_deref() {
             Self::wait_for_inflight_proxy_connections(
                 active_connections,
@@ -422,6 +444,84 @@ impl Daemon {
         }
 
         let _ = shutdown_tx.send(());
+    }
+
+    async fn maybe_spawn_control_local_proxy(
+        config: &MeshConfig,
+        control_node: SharedControlNode,
+        endpoint: iroh::Endpoint,
+        runtime_config: SharedRuntimeConfig,
+        shutdown_rx: ShutdownRx,
+    ) -> Option<(SharedLocalProxy, tokio::task::JoinHandle<()>)> {
+        if !config.enable_local_proxy {
+            return None;
+        }
+
+        let route_change_rx = {
+            let control_node = control_node.read().await;
+            control_node.subscribe_route_changes()
+        };
+        let local_proxy = Arc::new(tokio::sync::Mutex::new(EdgeNode::with_endpoint(endpoint)));
+        let task_local_proxy = Arc::clone(&local_proxy);
+        let task_control_node = Arc::clone(&control_node);
+        let task_runtime_config = Arc::clone(&runtime_config);
+        let handle = tokio::spawn(async move {
+            Self::run_control_local_proxy(
+                task_control_node,
+                task_local_proxy,
+                task_runtime_config,
+                route_change_rx,
+                shutdown_rx,
+            )
+            .await;
+        });
+        Some((local_proxy, handle))
+    }
+
+    async fn run_control_local_proxy(
+        control_node: SharedControlNode,
+        local_proxy: SharedLocalProxy,
+        runtime_config: SharedRuntimeConfig,
+        mut route_change_rx: watch::Receiver<u64>,
+        mut shutdown_rx: ShutdownRx,
+    ) {
+        Self::sync_control_local_proxy_routes(&control_node, &local_proxy, &runtime_config).await;
+
+        loop {
+            tokio::select! {
+                change_result = route_change_rx.changed() => {
+                    if change_result.is_err() {
+                        break;
+                    }
+                    Self::sync_control_local_proxy_routes(&control_node, &local_proxy, &runtime_config).await;
+                }
+                recv_result = shutdown_rx.recv() => {
+                    if let Err(error) = recv_result {
+                        tracing::debug!(error = %error, "control local proxy shutdown channel closed");
+                    }
+                    break;
+                }
+            }
+        }
+
+        local_proxy.lock().await.purge_route_cache().await;
+    }
+
+    async fn sync_control_local_proxy_routes(
+        control_node: &SharedControlNode,
+        local_proxy: &SharedLocalProxy,
+        runtime_config: &SharedRuntimeConfig,
+    ) {
+        let (routes, version) = {
+            let control_node = control_node.read().await;
+            (control_node.routes().clone(), control_node.route_version())
+        };
+
+        local_proxy
+            .lock()
+            .await
+            .force_route_update(routes, version, Arc::clone(runtime_config))
+            .await;
     }
 
     async fn wait_for_inflight_proxy_connections(
@@ -629,7 +729,87 @@ fn services_by_name(services: &[ServiceEntry]) -> BTreeMap<String, ServiceEntry>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iroh::endpoint::presets;
+    use mesh_proto::{ALPN_PROXY, DEFAULT_SERVICE_QUOTA, NodeInfo, Protocol, ServiceRegistration};
     use tempfile::Builder;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpStream;
+    use tokio::time::timeout;
+
+    fn make_node(endpoint_id: &str) -> NodeInfo {
+        NodeInfo {
+            endpoint_id: endpoint_id.to_string(),
+            node_name: format!("node-{endpoint_id}"),
+            quota_limit: DEFAULT_SERVICE_QUOTA as u16,
+            quota_used: 0,
+            is_online: false,
+            last_heartbeat: None,
+            addr: None,
+        }
+    }
+
+    fn make_registration(name: &str, local_addr: &str) -> ServiceRegistration {
+        ServiceRegistration {
+            name: name.to_string(),
+            local_addr: local_addr.to_string(),
+            protocol: Protocol::Tcp,
+            health_check: None,
+        }
+    }
+
+    fn available_tcp_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    async fn assert_tcp_listener_accepts_and_closes(port: u16) {
+        let mut stream = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("local proxy listener should accept connections");
+        let mut buf = [0_u8; 1];
+        let bytes_read = timeout(Duration::from_secs(1), stream.read(&mut buf))
+            .await
+            .expect("listener should respond in time")
+            .expect("listener read should succeed");
+        assert_eq!(bytes_read, 0);
+    }
+
+    async fn assert_tcp_listener_stopped(port: u16) {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                match std::net::TcpListener::bind(("127.0.0.1", port)) {
+                    Ok(listener) => {
+                        drop(listener);
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => {
+                        panic!("failed to verify TCP listener shutdown on {port}: {error}")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("listener should stop before timeout");
+    }
+
+    async fn wait_for_listener_count(local_proxy: &SharedLocalProxy, expected: usize) {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if local_proxy.lock().await.listener_count() == expected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("listener count should converge");
+    }
 
     #[tokio::test]
     async fn test_wait_for_inflight_proxy_connections_returns_after_drain() {
@@ -694,5 +874,104 @@ mod tests {
             let mode = fs::metadata(&ticket_path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[tokio::test]
+    async fn test_control_local_proxy_disabled_does_not_spawn_listeners() {
+        let config = MeshConfig {
+            role: NodeRole::Control,
+            enable_local_proxy: false,
+            ..MeshConfig::default()
+        };
+        let runtime_config = Arc::new(tokio::sync::RwLock::new(config.clone()));
+        let control_node = Arc::new(tokio::sync::RwLock::new(ControlNode::new()));
+
+        let endpoint = iroh::Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN_PROXY.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let runtime = Daemon::maybe_spawn_control_local_proxy(
+            &config,
+            Arc::clone(&control_node),
+            endpoint.clone(),
+            runtime_config,
+            shutdown_tx.subscribe(),
+        )
+        .await;
+        assert!(runtime.is_none());
+
+        let probe_port = available_tcp_port();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", probe_port))
+            .expect("listener port should remain free when local proxy is disabled");
+        drop(listener);
+
+        let _ = shutdown_tx.send(());
+        endpoint.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_control_local_proxy_tracks_route_changes() {
+        let config = MeshConfig {
+            role: NodeRole::Control,
+            enable_local_proxy: true,
+            ..MeshConfig::default()
+        };
+        let runtime_config = Arc::new(tokio::sync::RwLock::new(config.clone()));
+        let control_node = Arc::new(tokio::sync::RwLock::new(ControlNode::new()));
+        {
+            let mut control = control_node.write().await;
+            control.accept_node(make_node("edge-a"), 100).unwrap();
+        }
+
+        let endpoint = iroh::Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN_PROXY.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let (local_proxy, handle) = Daemon::maybe_spawn_control_local_proxy(
+            &config,
+            Arc::clone(&control_node),
+            endpoint.clone(),
+            runtime_config,
+            shutdown_tx.subscribe(),
+        )
+        .await
+        .expect("enabled local proxy should spawn a sync task");
+
+        wait_for_listener_count(&local_proxy, 0).await;
+
+        let assigned_port = {
+            let mut control = control_node.write().await;
+            control
+                .register_services(
+                    "edge-a",
+                    "node-edge-a",
+                    &[make_registration("llm-api", "127.0.0.1:3000")],
+                    200,
+                )
+                .unwrap()[0]
+                .assigned_port
+        };
+
+        wait_for_listener_count(&local_proxy, 1).await;
+        assert_tcp_listener_accepts_and_closes(assigned_port).await;
+
+        {
+            let mut control = control_node.write().await;
+            let no_services = Vec::<ServiceRegistration>::new();
+            control
+                .register_services("edge-a", "node-edge-a", &no_services, 300)
+                .unwrap();
+        }
+
+        wait_for_listener_count(&local_proxy, 0).await;
+        assert_tcp_listener_stopped(assigned_port).await;
+
+        let _ = shutdown_tx.send(());
+        handle.await.unwrap();
+        endpoint.close().await;
     }
 }

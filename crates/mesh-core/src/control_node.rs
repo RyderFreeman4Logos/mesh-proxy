@@ -8,7 +8,7 @@ use mesh_proto::{
     ALPN_CONTROL, ControlMessage, DEFAULT_SERVICE_QUOTA, JoinTicket, NodeInfo, PortAssignment,
     RouteEntry, ServiceId, ServiceRecord,
 };
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, watch};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{info, warn};
@@ -60,6 +60,7 @@ pub struct ControlNode {
     services: HashMap<ServiceId, ServiceRecord>,
     routes: HashMap<u16, RouteEntry>,
     route_version: u64,
+    route_change_tx: watch::Sender<u64>,
     accepted_at: HashMap<String, u64>,
     data_dir: Option<PathBuf>,
     /// Maps ticket nonce → expiry epoch for replay prevention with bounded growth.
@@ -144,12 +145,14 @@ impl Default for ControlNode {
 impl ControlNode {
     /// Create a new control node with empty state.
     pub fn new() -> Self {
+        let (route_change_tx, _) = watch::channel(0);
         Self {
             whitelist: HashMap::new(),
             allocator: PortAllocator::new(),
             services: HashMap::new(),
             routes: HashMap::new(),
             route_version: 0,
+            route_change_tx,
             accepted_at: HashMap::new(),
             data_dir: None,
             used_tickets: HashMap::new(),
@@ -192,6 +195,7 @@ impl ControlNode {
         node.route_version = persisted_routes.version;
         node.routes = persisted_routes.routes;
         node.rebuild_runtime_state_from_routes();
+        let _ = node.route_change_tx.send(node.route_version);
         node
     }
 
@@ -226,6 +230,10 @@ impl ControlNode {
         self.route_version = state.route_version;
         self.accepted_at = state.accepted_at;
         self.last_pong = state.last_pong;
+    }
+
+    fn notify_route_change(&self) {
+        let _ = self.route_change_tx.send(self.route_version);
     }
 
     fn whitelist_path(&self) -> Option<PathBuf> {
@@ -415,10 +423,15 @@ impl ControlNode {
             .filter(|(_, entry)| entry.endpoint_id == endpoint_id)
             .map(|(&port, _)| port)
             .collect();
+        let routes_changed = !orphaned_ports.is_empty();
 
         for port in orphaned_ports {
             self.routes.remove(&port);
             self.allocator.release(port);
+        }
+
+        if routes_changed {
+            self.route_version += 1;
         }
 
         if let Err(error) = self.persist_whitelist() {
@@ -434,6 +447,10 @@ impl ControlNode {
                 error = %error,
                 "failed to persist routes after node removal"
             );
+        }
+
+        if routes_changed {
+            self.notify_route_change();
         }
     }
 
@@ -528,6 +545,11 @@ impl ControlNode {
     /// Returns the current route version counter.
     pub fn route_version(&self) -> u64 {
         self.route_version
+    }
+
+    /// Subscribe to route table change notifications.
+    pub fn subscribe_route_changes(&self) -> watch::Receiver<u64> {
+        self.route_change_tx.subscribe()
     }
 
     /// Access the service registry.
@@ -748,6 +770,7 @@ impl ControlNode {
             self.restore_rollback_state(rollback);
             return Err(format!("failed to persist routes: {error}"));
         }
+        self.notify_route_change();
         Ok(assignments)
     }
 
@@ -1224,6 +1247,26 @@ mod tests {
         assert_eq!(restored.route_version(), cn.route_version());
         assert_eq!(restored.services.len(), 2);
         assert_eq!(restored.whitelist["edge-a"].quota_used, 2);
+    }
+
+    #[tokio::test]
+    async fn test_route_change_subscribers_receive_register_service_updates() {
+        let mut cn = ControlNode::new();
+        cn.accept_node(make_node("edge-a", DEFAULT_SERVICE_QUOTA as u16), 100)
+            .unwrap();
+        let mut route_change_rx = cn.subscribe_route_changes();
+
+        assert_eq!(*route_change_rx.borrow_and_update(), 0);
+
+        let registrations = vec![make_registration("llm-api", "127.0.0.1:3000")];
+        cn.register_services("edge-a", "node-edge-a", &registrations, 200)
+            .unwrap();
+
+        route_change_rx
+            .changed()
+            .await
+            .expect("route change watcher should receive updates");
+        assert_eq!(*route_change_rx.borrow_and_update(), 1);
     }
 
     #[test]
