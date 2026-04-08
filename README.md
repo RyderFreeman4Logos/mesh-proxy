@@ -1,6 +1,6 @@
 # mesh-proxy
 
-Decentralized P2P port forwarding and service discovery. Share local services across machines with zero-config NAT traversal.
+A decentralized multi-device service network for local TCP and Unix-socket services. Run one daemon per machine, publish services into the mesh, and reach them from any joined device with zero-config NAT traversal.
 
 ## Why mesh-proxy?
 
@@ -9,6 +9,7 @@ Decentralized P2P port forwarding and service discovery. Share local services ac
 - **Survives control node outage** — Edge nodes cache route tables locally. Existing connections and routes keep working even if the control node goes offline.
 - **Runtime service management** — Add or remove services with `mesh-proxy expose` / `unexpose` without restarting any daemon. Changes propagate to all nodes within seconds.
 - **Two-step onboarding** — Admin generates an invite token on the control node; the edge node joins with a single `mesh-proxy join` command. Auto-accepted, zero manual steps. A manual `accept` flow is also available for finer control.
+- **Built-in health endpoint** — Each node can expose a local HTTP health view on `127.0.0.1:49000`, including daemon health, service status, and node summaries.
 - **Single binary, zero dependencies** — One static binary per platform. TOML config. JSON state files. No database, no container runtime.
 
 ## Install
@@ -19,17 +20,17 @@ Decentralized P2P port forwarding and service discovery. Share local services ac
 mise use -g cargo:https://github.com/RyderFreeman4Logos/mesh-proxy
 ```
 
-### Via cargo-binstall (recommended — downloads prebuilt binary)
+### Via cargo-binstall (recommended — resolves metadata from the GitHub repo and downloads a prebuilt binary when available)
 
 ```bash
 # Install cargo-binstall if you don't have it
 mise use -g cargo-binstall
 
-# Install mesh-proxy (fetches prebuilt from GitHub Releases)
-cargo binstall mesh-proxy
+# Install mesh-proxy using the GitHub repository as the package source
+cargo binstall --git https://github.com/RyderFreeman4Logos/mesh-proxy mesh-proxy
 ```
 
-### From source
+### Via cargo (builds from the GitHub source repository)
 
 ```bash
 cargo install --git https://github.com/RyderFreeman4Logos/mesh-proxy mesh-proxy
@@ -104,6 +105,12 @@ mesh-proxy status
 ```bash
 # From another machine — reaches my-rpi's port 8080 through the mesh
 curl http://127.0.0.1:40000/health
+```
+
+```bash
+# On the same node — inspect daemon and mesh service health
+curl http://127.0.0.1:49000/healthz
+curl http://127.0.0.1:49000/v1/services
 ```
 
 ### Manual Setup (advanced)
@@ -191,9 +198,9 @@ mesh-proxy install-service --user  # user-level (no root needed)
           └───────────┘   (P2P)   └────────────┘
 ```
 
-- **Control plane** (`/mesh/ctrl/1` ALPN): Service registration, port assignment, heartbeats. Star topology — all edges connect to control.
+- **Control plane** (`/mesh/ctrl/1` ALPN): Invite validation, node admission, service registration, route distribution, quota enforcement, and health aggregation. Star topology — all edges connect to control.
 - **Data plane** (`/mesh/proxy/1` ALPN): Actual proxy traffic. Mesh topology — edges connect directly to each other.
-- **Port pool**: Services are assigned ports from 40000–48999. Each edge node can expose up to 5 services by default (configurable via `quota set`).
+- **Port plan**: User services are assigned ports from 40000–48999. Reserved system ports live in 49000–49999, with the local health HTTP endpoint defaulting to `127.0.0.1:49000`.
 
 ## License
 
