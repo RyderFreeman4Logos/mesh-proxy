@@ -24,6 +24,8 @@ toml_edit.workspace = true
 bs58.workspace = true
 hostname.workspace = true
 dirs-next.workspace = true
+i18n-embed = { version = "0.15", features = ["fluent-system", "desktop-requester"] }
+rust-embed = "8.5"
 
 [dev-dependencies]
 tempfile = "3"
