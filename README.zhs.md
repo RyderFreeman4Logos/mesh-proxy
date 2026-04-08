@@ -13,7 +13,7 @@
 
 ## 安装
 
-### 通过 mise（`mise upgrade` 自动更新）
+### 通过 mise（从源码编译，`mise upgrade` 自动更新）
 
 ```bash
 mise use -g cargo:https://github.com/RyderFreeman4Logos/mesh-proxy

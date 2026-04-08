@@ -10,7 +10,7 @@ Decentralized P2P port forwarding and service discovery built on iroh (QUIC). Co
 ## Install
 
 ```bash
-# Preferred — auto-updates on `mise upgrade`
+# Preferred (builds from source) — auto-updates on `mise upgrade`
 mise use -g cargo:https://github.com/RyderFreeman4Logos/mesh-proxy
 
 # Alternative — prebuilt binary
@@ -120,5 +120,5 @@ State files: `~/.local/share/mesh-proxy/` (route cache, PID, daemon socket, invi
 
 - **Edge can't reach control**: check firewall, verify `control_addr` in config matches `mesh-proxy status` on the control node
 - **Invite expired**: tokens default to 5 min TTL; generate a new one with `mesh-proxy invite`
-- **Port conflict**: the pool avoids Linux ephemeral range (32768-60999); if 40000-48999 conflicts with another app, adjust in config
+- **Port conflict**: the pool uses 40000-48999 which overlaps the Linux ephemeral range; if conflicts occur, adjust in config or narrow your system's ephemeral range
 - **Service shows UNKNOWN**: route propagation takes a few seconds; run `mesh-proxy status` again after a moment

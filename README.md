@@ -13,7 +13,7 @@ Decentralized P2P port forwarding and service discovery. Share local services ac
 
 ## Install
 
-### Via mise (auto-updates on `mise upgrade`)
+### Via mise (builds from source, auto-updates on `mise upgrade`)
 
 ```bash
 mise use -g cargo:https://github.com/RyderFreeman4Logos/mesh-proxy
