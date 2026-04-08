@@ -13,6 +13,12 @@
 
 ## 安装
 
+### 通过 mise（从源码编译，`mise upgrade` 自动更新）
+
+```bash
+mise use -g cargo:https://github.com/RyderFreeman4Logos/mesh-proxy
+```
+
 ### 通过 cargo-binstall（推荐 — 直接下载预编译二进制）
 
 ```bash
@@ -21,12 +27,6 @@ mise use -g cargo-binstall
 
 # 安装 mesh-proxy（从 GitHub Releases 下载预编译包）
 cargo binstall mesh-proxy
-```
-
-### 通过 mise（从源码编译，`mise upgrade` 自动更新）
-
-```bash
-mise use -g cargo:mesh-proxy
 ```
 
 ### 从源码构建

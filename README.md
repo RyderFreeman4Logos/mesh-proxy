@@ -13,6 +13,12 @@ Decentralized P2P port forwarding and service discovery. Share local services ac
 
 ## Install
 
+### Via mise (builds from source, auto-updates on `mise upgrade`)
+
+```bash
+mise use -g cargo:https://github.com/RyderFreeman4Logos/mesh-proxy
+```
+
 ### Via cargo-binstall (recommended — downloads prebuilt binary)
 
 ```bash
@@ -21,12 +27,6 @@ mise use -g cargo-binstall
 
 # Install mesh-proxy (fetches prebuilt from GitHub Releases)
 cargo binstall mesh-proxy
-```
-
-### Via mise (builds from source, auto-updates on `mise upgrade`)
-
-```bash
-mise use -g cargo:mesh-proxy
 ```
 
 ### From source
