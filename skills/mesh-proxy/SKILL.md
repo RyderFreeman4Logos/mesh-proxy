@@ -35,7 +35,7 @@ mesh-proxy invite --name <node-name>          # default TTL: 5 min
 mesh-proxy invite --name <node-name> --ttl 3600  # max: 1 hour
 ```
 
-Prints a one-time token (`mesh0-...`). Send it to the edge operator.
+Prints a one-time token (bs58-encoded, ~100 chars). Send it to the edge operator.
 
 ### 3. Edge node joins
 
