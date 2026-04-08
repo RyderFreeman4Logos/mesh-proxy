@@ -1,6 +1,6 @@
 # mesh-proxy
 
-去中心化 P2P 端口转发与服务发现工具。跨机器共享本地服务，自动穿透 NAT。
+一个面向多设备的去中心化服务网络，用来接入本地 TCP 和 Unix Socket 服务。每台机器运行一个 daemon，把服务发布进 mesh 后，任意已加入设备都可以通过自动 NAT 穿透访问它们。
 
 ## 为什么选择 mesh-proxy？
 
@@ -9,6 +9,7 @@
 - **控制节点宕机不影响数据面** — 边缘节点本地缓存路由表。控制节点离线后，已有连接和路由继续工作。
 - **运行时服务管理** — 通过 `mesh-proxy expose` / `unexpose` 动态添加或移除服务，不需要重启守护进程。变更在几秒内传播到所有节点。
 - **两步加入** — 管理员在控制节点生成邀请令牌，边缘节点执行一条 `mesh-proxy join` 命令即可加入，自动注册无需手动操作。也支持手动 `accept` 流程以获得更细粒度的控制。
+- **内建健康查询入口** — 每个节点都可以在 `127.0.0.1:49000` 暴露本地 HTTP 健康视图，查看 daemon、自身服务和全网节点摘要。
 - **单一二进制，零依赖** — 每个平台一个静态二进制文件。TOML 配置。JSON 状态文件。不需要数据库或容器运行时。
 
 ## 安装
@@ -19,17 +20,17 @@
 mise use -g cargo:https://github.com/RyderFreeman4Logos/mesh-proxy
 ```
 
-### 通过 cargo-binstall（推荐 — 直接下载预编译二进制）
+### 通过 cargo-binstall（推荐 — 从 GitHub 仓库解析元数据，并在可用时直接下载预编译二进制）
 
 ```bash
 # 如果没有 cargo-binstall，先安装
 mise use -g cargo-binstall
 
-# 安装 mesh-proxy（从 GitHub Releases 下载预编译包）
-cargo binstall mesh-proxy
+# 使用 GitHub 仓库作为包来源安装 mesh-proxy
+cargo binstall --git https://github.com/RyderFreeman4Logos/mesh-proxy mesh-proxy
 ```
 
-### 从源码构建
+### 通过 cargo 安装（从 GitHub 源码仓库构建）
 
 ```bash
 cargo install --git https://github.com/RyderFreeman4Logos/mesh-proxy mesh-proxy
@@ -104,6 +105,12 @@ mesh-proxy status
 ```bash
 # 从另一台机器 — 通过 mesh 网络访问 my-rpi 的 8080 端口
 curl http://127.0.0.1:40000/health
+```
+
+```bash
+# 在同一节点上 — 查看 daemon 和 mesh 服务健康状态
+curl http://127.0.0.1:49000/healthz
+curl http://127.0.0.1:49000/v1/services
 ```
 
 ### 手动配置（高级）
@@ -210,9 +217,9 @@ mesh-proxy install-service --user  # 用户级（无需 root）
           └───────────┘   (P2P)   └────────────┘
 ```
 
-- **控制面**（`/mesh/ctrl/1` ALPN）：服务注册、端口分配、心跳。星型拓扑 — 所有边缘节点连接到控制节点。
+- **控制面**（`/mesh/ctrl/1` ALPN）：邀请校验、节点准入、服务注册、路由分发、配额控制和健康聚合。星型拓扑 — 所有边缘节点连接到控制节点。
 - **数据面**（`/mesh/proxy/1` ALPN）：实际代理流量。网状拓扑 — 边缘节点之间直连。
-- **端口池**：服务从 40000–48999 分配端口。每个边缘节点默认最多暴露 5 个服务（可通过 `quota set` 调整）。
+- **端口规划**：用户服务从 40000–48999 分配端口。系统保留端口位于 49000–49999，本地健康 HTTP 入口默认是 `127.0.0.1:49000`。
 
 ## 许可证
 
