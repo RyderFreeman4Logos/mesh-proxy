@@ -13,6 +13,8 @@ use mesh_proto::{
 use toml_edit::{DocumentMut, value};
 use tracing_subscriber::EnvFilter;
 
+mod help_i18n;
+
 #[derive(Parser)]
 #[command(
     name = "mesh-proxy",
@@ -213,6 +215,10 @@ impl std::fmt::Display for OutputFormat {
 
 /// Entry point — synchronous so `start` can fork() before any threads exist.
 fn main() -> Result<()> {
+    if help_i18n::print_localized_help_if_requested::<Cli, _>(std::env::args_os())? {
+        return Ok(());
+    }
+
     let Cli { config, command } = Cli::parse();
 
     match command {
