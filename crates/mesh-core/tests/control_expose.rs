@@ -7,14 +7,16 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use iroh::endpoint::presets;
+use iroh::{Endpoint, EndpointAddr};
 use mesh_core::Daemon;
 use mesh_proto::{
-    IpcRequest, IpcResponse, MeshConfig, NodeRole, Protocol, SERVICE_PORT_END, SERVICE_PORT_START,
-    frame,
+    ALPN_PROXY, IpcRequest, IpcResponse, MeshConfig, NodeRole, Protocol, ProxyHandshake,
+    SERVICE_PORT_END, SERVICE_PORT_START, StatusInfo, frame,
 };
 use tempfile::Builder;
-use tokio::io::AsyncReadExt;
-use tokio::net::{TcpStream, UnixStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UnixStream};
 use tokio::time::{sleep, timeout};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -119,9 +121,15 @@ struct ControlDaemonHarness {
 
 impl ControlDaemonHarness {
     async fn start() -> Result<Self> {
+        Self::start_with_config(make_control_config).await
+    }
+
+    async fn start_with_config(
+        configure: impl FnOnce(std::path::PathBuf) -> MeshConfig,
+    ) -> Result<Self> {
         let tempdir = writable_tempdir("mesh-control-expose-");
         let config_path = tempdir.path().join("config.toml");
-        let config = make_control_config(tempdir.path().join("data"));
+        let config = configure(tempdir.path().join("data"));
         config.save(&config_path)?;
 
         let socket_path = config.data_dir.join("daemon.sock");
@@ -148,6 +156,51 @@ impl ControlDaemonHarness {
             Err(_) => Ok(()),
         }
     }
+}
+
+async fn read_status(socket_path: &std::path::Path) -> Result<StatusInfo> {
+    match send_ipc_request(socket_path, &IpcRequest::Status).await? {
+        IpcResponse::Status(status) => Ok(status),
+        other => anyhow::bail!("expected Status response, got {other:?}"),
+    }
+}
+
+async fn read_control_endpoint_addr(socket_path: &std::path::Path) -> Result<EndpointAddr> {
+    let status = read_status(socket_path).await?;
+    let raw = status
+        .endpoint_addr
+        .context("daemon status has no endpoint address yet")?;
+    serde_json::from_str(&raw).context("failed to deserialize control endpoint address")
+}
+
+/// Spawn a stub TCP echo server on an ephemeral port.
+async fn spawn_echo_server() -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("failed to bind echo server")?;
+    let addr = listener.local_addr()?;
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0_u8; 1024];
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if stream.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+    });
+    Ok((addr, handle))
 }
 
 #[tokio::test]
@@ -236,4 +289,116 @@ async fn test_control_node_expose_registers_route() -> Result<()> {
     })
     .await
     .context("test_control_node_expose_registers_route timed out")?
+}
+
+/// End-to-end proxy reachability: an edge-style peer forwards traffic
+/// through the mesh to a service hosted on the control node. Regression
+/// coverage for the HIGH review finding where the control accept loop
+/// rejected ALPN_PROXY, leaving control self-services unreachable from
+/// peers.
+///
+/// The "edge" is modeled as a standalone iroh endpoint dialed with
+/// ALPN_PROXY rather than a full edge daemon. That keeps the test focused
+/// on the bug under repair (control accepting proxy ALPN for its own
+/// services) and avoids cross-test port-allocation races on the
+/// dynamically assigned listener port.
+#[tokio::test]
+async fn test_edge_reaches_control_self_service_via_mesh() -> Result<()> {
+    timeout(Duration::from_secs(30), async {
+        let (echo_addr, echo_handle) = spawn_echo_server().await?;
+
+        // Disable the control's local proxy so the only path to the echo
+        // service runs through the proxy ALPN we are exercising.
+        let control = ControlDaemonHarness::start_with_config(|data_dir| MeshConfig {
+            node_name: "control-expose-test".to_string(),
+            role: NodeRole::Control,
+            enable_local_proxy: Some(false),
+            data_dir,
+            ..MeshConfig::default()
+        })
+        .await?;
+
+        let test_result: Result<()> = async {
+            let expose = IpcRequest::ExposeService {
+                name: "ctrl-echo".to_string(),
+                local_addr: echo_addr.to_string(),
+                protocol: Protocol::Tcp,
+                health_check: None,
+            };
+            let IpcResponse::ServiceExposed {
+                name,
+                assigned_port,
+            } = send_ipc_request(&control.socket_path, &expose).await?
+            else {
+                anyhow::bail!("expected ServiceExposed response");
+            };
+            assert_eq!(name, "ctrl-echo");
+            assert!(
+                (SERVICE_PORT_START..=SERVICE_PORT_END).contains(&assigned_port),
+                "assigned port {assigned_port} should fall inside the mesh service range"
+            );
+
+            let control_endpoint_addr = read_control_endpoint_addr(&control.socket_path).await?;
+
+            // Stand up a peer iroh endpoint and dial the control via the
+            // proxy ALPN exactly as a real edge would.
+            let peer = Endpoint::builder(presets::N0)
+                .alpns(vec![ALPN_PROXY.to_vec()])
+                .bind()
+                .await
+                .context("failed to bind test peer endpoint")?;
+
+            let connection = peer
+                .connect(control_endpoint_addr, ALPN_PROXY)
+                .await
+                .context("peer failed to dial control via ALPN_PROXY")?;
+            let (mut send, mut recv) = connection
+                .open_bi()
+                .await
+                .context("failed to open bi-stream on proxy connection")?;
+
+            let handshake = ProxyHandshake {
+                service_name: "ctrl-echo".to_string(),
+                port: assigned_port,
+                protocol: Protocol::Tcp,
+            };
+            frame::write_json(&mut send, &handshake)
+                .await
+                .context("failed to write proxy handshake")?;
+
+            let payload = b"mesh-proxy-control-roundtrip";
+            send.write_all(payload)
+                .await
+                .context("failed to write payload to proxy stream")?;
+            send.flush()
+                .await
+                .context("failed to flush payload to proxy stream")?;
+
+            let mut buf = vec![0_u8; payload.len()];
+            timeout(Duration::from_secs(5), recv.read_exact(&mut buf))
+                .await
+                .context("timed out waiting for echo response")?
+                .context("failed to read echo response from proxy stream")?;
+            assert_eq!(
+                buf, payload,
+                "control's proxy ALPN should round-trip the payload"
+            );
+
+            // Cleanly tear down the proxy stream before closing the peer.
+            send.finish().ok();
+            drop(connection);
+            peer.close().await;
+            Ok(())
+        }
+        .await;
+
+        let control_shutdown = control.shutdown().await;
+        echo_handle.abort();
+        let _ = echo_handle.await;
+
+        control_shutdown?;
+        test_result
+    })
+    .await
+    .context("test_edge_reaches_control_self_service_via_mesh timed out")?
 }
