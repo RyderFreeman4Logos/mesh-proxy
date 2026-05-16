@@ -18,7 +18,7 @@ use tokio::task;
 use tracing::{error, info, warn};
 
 use crate::ConfigWatcher;
-use crate::control_node::{ActiveControlConnections, ControlNode};
+use crate::control_node::{ActiveControlConnections, ControlNode, ControlProxyAccept};
 use crate::edge_node::EdgeNode;
 use crate::health_server::HealthServerState;
 use crate::ipc_server::NodeState;
@@ -353,11 +353,18 @@ impl Daemon {
                 .await;
                 let control_connections = Arc::new(ActiveControlConnections::default());
                 let accept_active_connections = Arc::clone(&control_connections);
+                let active_proxy_connections = Arc::new(AtomicUsize::new(0));
+                let accept_proxy_connections = Arc::clone(&active_proxy_connections);
+                let accept_runtime_config = Arc::clone(&runtime_config);
                 let accept_handle = tokio::spawn(async move {
                     crate::control_node::run_accept_loop_with_connections(
                         cn_clone,
                         endpoint,
                         accept_active_connections,
+                        Some(ControlProxyAccept {
+                            runtime_config: accept_runtime_config,
+                            active_proxy_connections: accept_proxy_connections,
+                        }),
                         shutdown_rx,
                     )
                     .await;
@@ -396,7 +403,7 @@ impl Daemon {
                     None,
                     None,
                     Some(HealthServerState::from(Arc::clone(&cn))),
-                    None,
+                    Some(active_proxy_connections),
                     control_local_proxy.map(|(_, handle)| handle),
                     Some(broadcaster_handle),
                     None,
