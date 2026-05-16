@@ -75,7 +75,7 @@ fn make_named_edge_config(
         node_name: node_name.to_string(),
         role: NodeRole::Edge,
         control_addr: Some(control_addr),
-        enable_local_proxy: false,
+        enable_local_proxy: None,
         health_bind: None,
         services,
         data_dir,

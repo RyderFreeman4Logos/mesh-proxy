@@ -10,13 +10,15 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use mesh_proto::{JoinTicket, MeshConfig, NodeRole, PortAssignment, ServiceEntry};
+use mesh_proto::{
+    JoinTicket, MeshConfig, NodeRole, PortAssignment, ServiceEntry, ServiceRegistration,
+};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task;
 use tracing::{error, info, warn};
 
 use crate::ConfigWatcher;
-use crate::control_node::ControlNode;
+use crate::control_node::{ActiveControlConnections, ControlNode, ControlProxyAccept};
 use crate::edge_node::EdgeNode;
 use crate::health_server::HealthServerState;
 use crate::ipc_server::NodeState;
@@ -138,6 +140,43 @@ struct EdgeRegistrationRuntime {
     port_assignment_notifier: PortAssignmentNotifier,
 }
 
+/// Runtime context needed to re-register the control node's own services
+/// after a config reload (the control node owns its route table directly,
+/// so self-services bypass the control-plane RPC).
+#[derive(Clone)]
+struct ControlSelfRegistration {
+    control_node: SharedControlNode,
+    self_endpoint_id: String,
+    node_name: String,
+    port_assignment_notifier: PortAssignmentNotifier,
+}
+
+impl ControlSelfRegistration {
+    /// Re-register the supplied service entries with the local control node,
+    /// notifying any IPC expose waiters of their assigned ports.
+    async fn apply(&self, services: &[ServiceEntry]) -> Result<Vec<PortAssignment>, String> {
+        let registrations: Vec<ServiceRegistration> = services
+            .iter()
+            .map(|service| ServiceRegistration {
+                name: service.name.clone(),
+                local_addr: service.local_addr.clone(),
+                protocol: service.protocol,
+                health_check: service.health_check.clone(),
+            })
+            .collect();
+
+        let now = now_epoch();
+        let assignments = {
+            let mut cn = self.control_node.write().await;
+            cn.register_self_services(&self.self_endpoint_id, &self.node_name, &registrations, now)
+        }?;
+
+        self.port_assignment_notifier
+            .notify_assignments(&assignments);
+        Ok(assignments)
+    }
+}
+
 /// The mesh-proxy daemon engine.
 pub struct Daemon {
     config: MeshConfig,
@@ -148,6 +187,7 @@ pub struct Daemon {
     service_change_tx: Option<watch::Sender<()>>,
     edge_registration_runtime: Option<EdgeRegistrationRuntime>,
     registration_handle: Option<tokio::task::JoinHandle<()>>,
+    control_self_registration: Option<ControlSelfRegistration>,
 }
 
 impl Daemon {
@@ -167,6 +207,7 @@ impl Daemon {
             service_change_tx: None,
             edge_registration_runtime: None,
             registration_handle: None,
+            control_self_registration: None,
         }
     }
 
@@ -185,6 +226,7 @@ impl Daemon {
             service_change_tx: None,
             edge_registration_runtime: None,
             registration_handle: None,
+            control_self_registration: None,
         }
     }
 
@@ -284,8 +326,10 @@ impl Daemon {
             health_state,
             active_connections,
             control_local_proxy_handle,
+            control_route_broadcaster_handle,
             edge_registration_runtime,
             registration_handle,
+            control_self_registration,
         ) = match self.config.role {
             NodeRole::Control => {
                 let runtime_config = Arc::clone(&shared_runtime_config);
@@ -307,19 +351,64 @@ impl Daemon {
                     self.shutdown_rx(),
                 )
                 .await;
+                let control_connections = Arc::new(ActiveControlConnections::default());
+                let accept_active_connections = Arc::clone(&control_connections);
+                let active_proxy_connections = Arc::new(AtomicUsize::new(0));
+                let accept_proxy_connections = Arc::clone(&active_proxy_connections);
+                let accept_runtime_config = Arc::clone(&runtime_config);
+                let accept_handle = tokio::spawn(async move {
+                    crate::control_node::run_accept_loop_with_connections(
+                        cn_clone,
+                        endpoint,
+                        accept_active_connections,
+                        Some(ControlProxyAccept {
+                            runtime_config: accept_runtime_config,
+                            active_proxy_connections: accept_proxy_connections,
+                        }),
+                        shutdown_rx,
+                    )
+                    .await;
+                });
+
+                let broadcaster_handle = Self::spawn_control_route_broadcaster(
+                    Arc::clone(&cn),
+                    Arc::clone(&control_connections),
+                    self.shutdown_rx(),
+                )
+                .await;
+
+                let self_registration = ControlSelfRegistration {
+                    control_node: Arc::clone(&cn),
+                    self_endpoint_id: endpoint_id.clone(),
+                    node_name: self.config.node_name.clone(),
+                    port_assignment_notifier: port_assignment_notifier.clone(),
+                };
+                if !self.config.services.is_empty() {
+                    match self_registration.apply(&self.config.services).await {
+                        Ok(assignments) => info!(
+                            count = assignments.len(),
+                            "registered control node self-services from config"
+                        ),
+                        Err(error) => warn!(
+                            error = %error,
+                            "failed to register control node self-services from config"
+                        ),
+                    }
+                }
+
                 (
-                    Some(tokio::spawn(async move {
-                        crate::control_node::run_accept_loop(cn_clone, endpoint, shutdown_rx).await;
-                    })),
+                    Some(accept_handle),
                     None,
                     Some(runtime_config),
                     None,
                     None,
                     Some(HealthServerState::from(Arc::clone(&cn))),
-                    None,
+                    Some(active_proxy_connections),
                     control_local_proxy.map(|(_, handle)| handle),
+                    Some(broadcaster_handle),
                     None,
                     None,
+                    Some(self_registration),
                 )
             }
             NodeRole::Edge => {
@@ -396,8 +485,10 @@ impl Daemon {
                     Some(health_state),
                     Some(shutdown_active_connections),
                     None,
+                    None,
                     Some(edge_registration_runtime),
                     reg_handle,
+                    None,
                 )
             }
         };
@@ -405,6 +496,7 @@ impl Daemon {
         self.service_change_tx = service_change_tx;
         self.edge_registration_runtime = edge_registration_runtime;
         self.registration_handle = registration_handle;
+        self.control_self_registration = control_self_registration;
 
         let health_handle = if let Some(health_bind) = self.config.health_bind.as_deref() {
             let bind_addr: SocketAddr = health_bind
@@ -492,6 +584,12 @@ impl Daemon {
             warn!(error = %error, "control local proxy task join failed");
         }
 
+        if let Some(handle) = control_route_broadcaster_handle
+            && let Err(error) = handle.await
+        {
+            warn!(error = %error, "control route broadcaster task join failed");
+        }
+
         if let Some(active_connections) = active_connections.as_deref() {
             Self::wait_for_inflight_proxy_connections(
                 active_connections,
@@ -546,6 +644,50 @@ impl Daemon {
         let _ = shutdown_tx.send(());
     }
 
+    /// Spawn a task that pushes the latest route table to connected edges
+    /// whenever the control node's route version increments.
+    ///
+    /// The accept loop already broadcasts on edge registration; this listener
+    /// covers other route-table mutations (e.g. control-node self-expose) so
+    /// edges learn about the change without waiting for the next register.
+    async fn spawn_control_route_broadcaster(
+        control_node: SharedControlNode,
+        active_connections: Arc<ActiveControlConnections>,
+        mut shutdown_rx: ShutdownRx,
+    ) -> tokio::task::JoinHandle<()> {
+        let mut route_change_rx = {
+            let cn = control_node.read().await;
+            cn.subscribe_route_changes()
+        };
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    change_result = route_change_rx.changed() => {
+                        if change_result.is_err() {
+                            break;
+                        }
+                        crate::control_node::broadcast_routes(
+                            &control_node,
+                            &active_connections,
+                            None,
+                        )
+                        .await;
+                    }
+                    recv_result = shutdown_rx.recv() => {
+                        if let Err(error) = recv_result {
+                            tracing::debug!(
+                                error = %error,
+                                "control route broadcaster shutdown channel closed"
+                            );
+                        }
+                        break;
+                    }
+                }
+            }
+        })
+    }
+
     async fn maybe_spawn_control_local_proxy(
         config: &MeshConfig,
         control_node: SharedControlNode,
@@ -553,7 +695,7 @@ impl Daemon {
         runtime_config: SharedRuntimeConfig,
         shutdown_rx: ShutdownRx,
     ) -> Option<(SharedLocalProxy, tokio::task::JoinHandle<()>)> {
-        if !config.enable_local_proxy {
+        if config.enable_local_proxy == Some(false) {
             return None;
         }
 
@@ -778,15 +920,31 @@ impl Daemon {
             }
 
             return Ok(());
-        } else {
-            info!(path = %self.config_path.display(), "config reloaded from disk");
         }
+
+        let diff = ServiceDiff::between(&self.config.services, &new_config.services);
+        diff.log(&self.config_path, new_config.services.len());
+        let services_changed = !diff.is_empty();
 
         if let Some(shared_config) = shared_config {
             *shared_config.write().await = new_config.clone();
         }
 
         self.config = new_config;
+
+        if services_changed && let Some(registration) = self.control_self_registration.clone() {
+            match registration.apply(&self.config.services).await {
+                Ok(assignments) => info!(
+                    count = assignments.len(),
+                    "re-registered control node self-services after config reload"
+                ),
+                Err(error) => warn!(
+                    error = %error,
+                    "failed to re-register control node self-services after config reload"
+                ),
+            }
+        }
+
         Ok(())
     }
 }
@@ -965,7 +1123,7 @@ mod tests {
             node_name: "edge-alpha".to_string(),
             role: NodeRole::Edge,
             control_addr: Some(control_addr),
-            enable_local_proxy: false,
+            enable_local_proxy: None,
             health_bind: None,
             services,
             data_dir,
@@ -1134,7 +1292,7 @@ mod tests {
     async fn test_control_local_proxy_disabled_does_not_spawn_listeners() {
         let config = MeshConfig {
             role: NodeRole::Control,
-            enable_local_proxy: false,
+            enable_local_proxy: Some(false),
             ..MeshConfig::default()
         };
         let runtime_config = Arc::new(tokio::sync::RwLock::new(config.clone()));
@@ -1169,7 +1327,7 @@ mod tests {
     async fn test_control_local_proxy_tracks_route_changes() {
         let config = MeshConfig {
             role: NodeRole::Control,
-            enable_local_proxy: true,
+            enable_local_proxy: Some(true),
             ..MeshConfig::default()
         };
         let runtime_config = Arc::new(tokio::sync::RwLock::new(config.clone()));
@@ -1258,7 +1416,7 @@ mod tests {
                 node_name: "edge-alpha".to_string(),
                 role: NodeRole::Edge,
                 control_addr: None,
-                enable_local_proxy: false,
+                enable_local_proxy: None,
                 health_bind: None,
                 services: vec![make_service_entry("echo", "127.0.0.1:18080")],
                 data_dir,
@@ -1286,6 +1444,7 @@ mod tests {
                     port_assignment_notifier: PortAssignmentNotifier::default(),
                 }),
                 registration_handle: None,
+                control_self_registration: None,
             };
 
             let control_addr = serde_json::to_string(&control_endpoint.addr())
@@ -1428,6 +1587,7 @@ mod tests {
                 service_change_tx: Some(service_change_tx),
                 edge_registration_runtime: None,
                 registration_handle: None,
+                control_self_registration: None,
             };
 
             let test_result: Result<()> = async {

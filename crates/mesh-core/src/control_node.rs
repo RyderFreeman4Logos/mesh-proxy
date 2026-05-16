@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use mesh_proto::{
-    ALPN_CONTROL, ControlMessage, DEFAULT_SERVICE_QUOTA, InviteToken, JoinTicket, NodeInfo,
-    PortAssignment, RouteEntry, ServiceId, ServiceRecord,
+    ALPN_CONTROL, ALPN_PROXY, ControlMessage, DEFAULT_SERVICE_QUOTA, InviteToken, JoinTicket,
+    MeshConfig, NodeInfo, PortAssignment, RouteEntry, ServiceId, ServiceRecord,
 };
 use tokio::sync::{RwLock, watch};
 use tokio::task::JoinSet;
@@ -127,7 +128,7 @@ struct PersistedPendingInvites {
 }
 
 #[derive(Debug, Default)]
-struct ActiveControlConnections {
+pub(crate) struct ActiveControlConnections {
     by_endpoint_id: RwLock<HashMap<String, iroh::endpoint::Connection>>,
 }
 
@@ -838,7 +839,7 @@ impl ControlNode {
 
     // -- Service registration (2C-02) --
 
-    /// Register services for a node, allocating ports atomically.
+    /// Register services for a whitelisted node, allocating ports atomically.
     ///
     /// On success, returns port assignments and updates the whitelist, service
     /// registry, and route table. On failure (quota exceeded, pool exhausted),
@@ -855,6 +856,40 @@ impl ControlNode {
             .get(endpoint_id)
             .ok_or_else(|| format!("node not found in whitelist: {endpoint_id}"))?
             .quota_limit;
+        self.apply_service_registrations(
+            endpoint_id,
+            node_name,
+            registrations,
+            now_epoch,
+            Some(quota_limit),
+        )
+    }
+
+    /// Register services for the control node itself (no whitelist lookup).
+    ///
+    /// The control node owns the route table directly, so its own services do
+    /// not flow through the registration RPC. This method writes the services,
+    /// allocates ports, updates the route table, and triggers a route change
+    /// notification — the same effects as `register_services`, minus the
+    /// whitelist quota check (the port pool is the natural ceiling).
+    pub fn register_self_services(
+        &mut self,
+        endpoint_id: &str,
+        node_name: &str,
+        registrations: &[mesh_proto::ServiceRegistration],
+        now_epoch: u64,
+    ) -> Result<Vec<PortAssignment>, String> {
+        self.apply_service_registrations(endpoint_id, node_name, registrations, now_epoch, None)
+    }
+
+    fn apply_service_registrations(
+        &mut self,
+        endpoint_id: &str,
+        node_name: &str,
+        registrations: &[mesh_proto::ServiceRegistration],
+        now_epoch: u64,
+        quota_limit: Option<u16>,
+    ) -> Result<Vec<PortAssignment>, String> {
         let current_count = self
             .services
             .keys()
@@ -875,10 +910,11 @@ impl ControlNode {
         }
 
         let final_count = requested_order.len();
-        if final_count > quota_limit as usize {
+        if let Some(limit) = quota_limit
+            && final_count > limit as usize
+        {
             return Err(format!(
-                "quota exceeded: have {current_count}, want final {final_count}, limit {}",
-                quota_limit
+                "quota exceeded: have {current_count}, want final {final_count}, limit {limit}",
             ));
         }
 
@@ -1055,16 +1091,45 @@ fn now_epoch() -> u64 {
         .as_secs()
 }
 
+/// Per-endpoint configuration that lets the control accept loop also serve
+/// proxy-plane connections for the control node's own self-hosted services.
+///
+/// The control endpoint binds both `ALPN_CONTROL` and `ALPN_PROXY` (see
+/// [`crate::MeshNode`]), but historically the accept loop only dispatched
+/// control traffic. When the control node registers services in its own
+/// route table, edge peers learn the routes and dial it via `ALPN_PROXY`;
+/// without this hook those connections would be rejected.
+pub(crate) struct ControlProxyAccept {
+    pub runtime_config: Arc<RwLock<MeshConfig>>,
+    pub active_proxy_connections: Arc<AtomicUsize>,
+}
+
 /// Accept incoming control-plane connections, verify ALPN, and dispatch messages.
 ///
 /// Runs until a shutdown signal is received or the endpoint is closed.
 pub async fn run_accept_loop(
     node: Arc<RwLock<ControlNode>>,
     endpoint: iroh::Endpoint,
-    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    shutdown: tokio::sync::broadcast::Receiver<()>,
 ) {
     let active_connections = Arc::new(ActiveControlConnections::default());
+    run_accept_loop_with_connections(node, endpoint, active_connections, None, shutdown).await;
+}
 
+/// Accept loop variant that shares an externally-owned connection registry.
+///
+/// Used by the daemon so that the route broadcaster can push updates to the
+/// same set of connected edges that the accept loop tracks. When
+/// `proxy_accept` is `Some`, the loop also accepts proxy-plane connections
+/// destined for the control node's self-hosted services.
+pub(crate) async fn run_accept_loop_with_connections(
+    node: Arc<RwLock<ControlNode>>,
+    endpoint: iroh::Endpoint,
+    active_connections: Arc<ActiveControlConnections>,
+    proxy_accept: Option<ControlProxyAccept>,
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+) {
+    let self_endpoint_id = endpoint.id();
     loop {
         tokio::select! {
             incoming = endpoint.accept() => {
@@ -1088,23 +1153,50 @@ pub async fn run_accept_loop(
                     }
                 };
 
-                // Check ALPN after handshake.
-                if connection.alpn() != ALPN_CONTROL {
-                    warn!(
-                        alpn = ?String::from_utf8_lossy(connection.alpn()),
-                        "rejecting connection with unexpected ALPN"
-                    );
-                    connection.close(0u32.into(), b"wrong ALPN");
+                let alpn = connection.alpn();
+                if alpn == ALPN_CONTROL {
+                    let node = Arc::clone(&node);
+                    let active_connections = Arc::clone(&active_connections);
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_connection(node, active_connections, connection).await {
+                            warn!(error = %e, "control connection handler error");
+                        }
+                    });
                     continue;
                 }
 
-                let node = Arc::clone(&node);
-                let active_connections = Arc::clone(&active_connections);
-                tokio::spawn(async move {
-                    if let Err(e) = handle_connection(node, active_connections, connection).await {
-                        warn!(error = %e, "control connection handler error");
+                if alpn == ALPN_PROXY {
+                    let Some(proxy_accept) = proxy_accept.as_ref() else {
+                        warn!("rejecting proxy connection on control endpoint without self-service support");
+                        connection.close(0u32.into(), b"proxy ALPN disabled");
+                        continue;
+                    };
+                    if connection.remote_id() == self_endpoint_id {
+                        warn!("rejecting self-referential proxy connection on control endpoint");
+                        connection.close(0u32.into(), b"self proxy loop");
+                        continue;
                     }
-                });
+                    let runtime_config = Arc::clone(&proxy_accept.runtime_config);
+                    let active_proxy_connections = Arc::clone(&proxy_accept.active_proxy_connections);
+                    tokio::spawn(async move {
+                        if let Err(error) = crate::edge_node::handle_proxy_inbound(
+                            connection,
+                            runtime_config,
+                            active_proxy_connections,
+                        )
+                        .await
+                        {
+                            warn!(error = %error, "control proxy connection handler error");
+                        }
+                    });
+                    continue;
+                }
+
+                warn!(
+                    alpn = ?String::from_utf8_lossy(alpn),
+                    "rejecting connection with unexpected ALPN"
+                );
+                connection.close(0u32.into(), b"wrong ALPN");
             }
             _ = shutdown.recv() => {
                 info!("accept loop received shutdown signal");
@@ -1364,7 +1456,7 @@ async fn finish_register(
 }
 
 /// Broadcast the current route table to every connected edge except the sender.
-async fn broadcast_routes(
+pub(crate) async fn broadcast_routes(
     node: &Arc<RwLock<ControlNode>>,
     active_connections: &Arc<ActiveControlConnections>,
     exclude_endpoint_id: Option<&str>,
