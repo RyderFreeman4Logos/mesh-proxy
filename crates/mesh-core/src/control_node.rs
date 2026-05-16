@@ -127,7 +127,7 @@ struct PersistedPendingInvites {
 }
 
 #[derive(Debug, Default)]
-struct ActiveControlConnections {
+pub(crate) struct ActiveControlConnections {
     by_endpoint_id: RwLock<HashMap<String, iroh::endpoint::Connection>>,
 }
 
@@ -838,7 +838,7 @@ impl ControlNode {
 
     // -- Service registration (2C-02) --
 
-    /// Register services for a node, allocating ports atomically.
+    /// Register services for a whitelisted node, allocating ports atomically.
     ///
     /// On success, returns port assignments and updates the whitelist, service
     /// registry, and route table. On failure (quota exceeded, pool exhausted),
@@ -855,6 +855,40 @@ impl ControlNode {
             .get(endpoint_id)
             .ok_or_else(|| format!("node not found in whitelist: {endpoint_id}"))?
             .quota_limit;
+        self.apply_service_registrations(
+            endpoint_id,
+            node_name,
+            registrations,
+            now_epoch,
+            Some(quota_limit),
+        )
+    }
+
+    /// Register services for the control node itself (no whitelist lookup).
+    ///
+    /// The control node owns the route table directly, so its own services do
+    /// not flow through the registration RPC. This method writes the services,
+    /// allocates ports, updates the route table, and triggers a route change
+    /// notification — the same effects as `register_services`, minus the
+    /// whitelist quota check (the port pool is the natural ceiling).
+    pub fn register_self_services(
+        &mut self,
+        endpoint_id: &str,
+        node_name: &str,
+        registrations: &[mesh_proto::ServiceRegistration],
+        now_epoch: u64,
+    ) -> Result<Vec<PortAssignment>, String> {
+        self.apply_service_registrations(endpoint_id, node_name, registrations, now_epoch, None)
+    }
+
+    fn apply_service_registrations(
+        &mut self,
+        endpoint_id: &str,
+        node_name: &str,
+        registrations: &[mesh_proto::ServiceRegistration],
+        now_epoch: u64,
+        quota_limit: Option<u16>,
+    ) -> Result<Vec<PortAssignment>, String> {
         let current_count = self
             .services
             .keys()
@@ -875,10 +909,11 @@ impl ControlNode {
         }
 
         let final_count = requested_order.len();
-        if final_count > quota_limit as usize {
+        if let Some(limit) = quota_limit
+            && final_count > limit as usize
+        {
             return Err(format!(
-                "quota exceeded: have {current_count}, want final {final_count}, limit {}",
-                quota_limit
+                "quota exceeded: have {current_count}, want final {final_count}, limit {limit}",
             ));
         }
 
@@ -1061,10 +1096,22 @@ fn now_epoch() -> u64 {
 pub async fn run_accept_loop(
     node: Arc<RwLock<ControlNode>>,
     endpoint: iroh::Endpoint,
-    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    shutdown: tokio::sync::broadcast::Receiver<()>,
 ) {
     let active_connections = Arc::new(ActiveControlConnections::default());
+    run_accept_loop_with_connections(node, endpoint, active_connections, shutdown).await;
+}
 
+/// Accept loop variant that shares an externally-owned connection registry.
+///
+/// Used by the daemon so that the route broadcaster can push updates to the
+/// same set of connected edges that the accept loop tracks.
+pub(crate) async fn run_accept_loop_with_connections(
+    node: Arc<RwLock<ControlNode>>,
+    endpoint: iroh::Endpoint,
+    active_connections: Arc<ActiveControlConnections>,
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+) {
     loop {
         tokio::select! {
             incoming = endpoint.accept() => {
@@ -1364,7 +1411,7 @@ async fn finish_register(
 }
 
 /// Broadcast the current route table to every connected edge except the sender.
-async fn broadcast_routes(
+pub(crate) async fn broadcast_routes(
     node: &Arc<RwLock<ControlNode>>,
     active_connections: &Arc<ActiveControlConnections>,
     exclude_endpoint_id: Option<&str>,

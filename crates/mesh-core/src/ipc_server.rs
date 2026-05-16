@@ -625,7 +625,14 @@ async fn handle_reload(state: &SharedState) -> IpcResponse {
     }
 }
 
-/// Handle ExposeService: add service entry to config (edge only).
+/// Handle ExposeService: add service entry to config and wait for the daemon
+/// to assign a route table port.
+///
+/// Both edge and control nodes share this flow: the service is written into
+/// `config.toml`, a reload is triggered, and the daemon publishes the assigned
+/// port via the port-assignment notifier. Edges register through the
+/// control-plane RPC, while control nodes register against their own route
+/// table directly inside `Daemon::reload_config`.
 async fn handle_expose_service(
     state: &SharedState,
     name: &str,
@@ -633,12 +640,6 @@ async fn handle_expose_service(
     protocol: mesh_proto::Protocol,
     health_check: Option<mesh_proto::HealthCheckConfig>,
 ) -> IpcResponse {
-    if state.config.role != NodeRole::Edge {
-        return IpcResponse::Error {
-            message: "expose is only available on edge nodes".to_string(),
-        };
-    }
-
     if let Err(error) = validate_expose_service_request(name, local_addr, health_check.as_ref()) {
         return IpcResponse::Error {
             message: error.to_string(),
@@ -681,7 +682,7 @@ async fn handle_expose_service(
                 name: name.to_owned(),
                 assigned_port,
             },
-            None if runtime_config_matches => {
+            None if runtime_config_matches && state.service_refresh_tx.is_some() => {
                 trigger_service_refresh_and_wait_for_port_assignment(state, name).await
             }
             None => trigger_reload_and_wait_for_port_assignment(state, name).await,
@@ -721,12 +722,6 @@ async fn handle_expose_service(
 }
 
 async fn handle_unexpose_service(state: &SharedState, name: &str) -> IpcResponse {
-    if state.config.role != NodeRole::Edge {
-        return IpcResponse::Error {
-            message: "unexpose is only available on edge nodes".to_string(),
-        };
-    }
-
     if let Err(error) = mesh_proto::validate_service_name(name) {
         return IpcResponse::Error {
             message: format!("invalid service name: {error}"),
@@ -982,20 +977,35 @@ async fn current_assigned_port(
     requested_service: &ServiceEntry,
 ) -> Option<u16> {
     let node_state = state.node_state.read().await;
-    let NodeState::Edge(edge_node) = &*node_state else {
-        return None;
-    };
-    let edge_node = Arc::clone(edge_node);
-    drop(node_state);
+    match &*node_state {
+        NodeState::Edge(edge_node) => {
+            let edge_node = Arc::clone(edge_node);
+            drop(node_state);
 
-    let edge = edge_node.read().await;
-    edge.cached_routes().iter().find_map(|(port, route)| {
-        (route.service_name == requested_service.name
-            && route.node_name == state.config.node_name
-            && route.target_local_addr == requested_service.local_addr
-            && route.protocol == requested_service.protocol)
-            .then_some(*port)
-    })
+            let edge = edge_node.read().await;
+            edge.cached_routes().iter().find_map(|(port, route)| {
+                (route.service_name == requested_service.name
+                    && route.node_name == state.config.node_name
+                    && route.target_local_addr == requested_service.local_addr
+                    && route.protocol == requested_service.protocol)
+                    .then_some(*port)
+            })
+        }
+        NodeState::Control(control_node) => {
+            let control_node = Arc::clone(control_node);
+            drop(node_state);
+
+            let control = control_node.read().await;
+            control.routes().iter().find_map(|(port, route)| {
+                (route.service_name == requested_service.name
+                    && route.node_name == state.config.node_name
+                    && route.target_local_addr == requested_service.local_addr
+                    && route.protocol == requested_service.protocol)
+                    .then_some(*port)
+            })
+        }
+        NodeState::Uninit => None,
+    }
 }
 
 async fn trigger_reload_and_wait_for_port_assignment(
@@ -1374,24 +1384,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_expose_service_requires_edge_role() {
-        let (state, _dir, _reload_rx) = shared_state(NodeRole::Control);
+    async fn test_expose_service_on_control_writes_config_and_signals_reload() {
+        let (state, _dir, mut reload_rx) = shared_state(NodeRole::Control);
 
-        let response = dispatch(
-            &IpcRequest::ExposeService {
-                name: "web".to_string(),
-                local_addr: "127.0.0.1:8080".to_string(),
-                protocol: mesh_proto::Protocol::Tcp,
-                health_check: None,
-            },
-            &state,
-        )
-        .await;
-
-        let IpcResponse::Error { message } = response else {
-            panic!("expected error response");
+        let notifier = state.port_assignment_notifier.clone();
+        let request = IpcRequest::ExposeService {
+            name: "admin".to_string(),
+            local_addr: "127.0.0.1:9000".to_string(),
+            protocol: Protocol::Tcp,
+            health_check: None,
         };
-        assert!(message.contains("edge nodes"));
+        let notify_assignment = async {
+            assert_eq!(reload_rx.recv().await, Some(()));
+            notifier.notify_assignments(&[mesh_proto::PortAssignment {
+                service_name: "admin".to_string(),
+                assigned_port: 40123,
+            }]);
+        };
+        let (response, ()) = tokio::join!(dispatch(&request, &state), notify_assignment);
+
+        let IpcResponse::ServiceExposed {
+            name,
+            assigned_port,
+        } = response
+        else {
+            panic!("expected service exposed response, got {response:?}");
+        };
+        assert_eq!(name, "admin");
+        assert_eq!(assigned_port, 40123);
+
+        let updated = MeshConfig::load(&state.config_path).unwrap();
+        assert_eq!(updated.services.len(), 1);
+        assert_eq!(updated.services[0].name, "admin");
+        assert_eq!(updated.services[0].local_addr, "127.0.0.1:9000");
     }
 
     #[tokio::test]
