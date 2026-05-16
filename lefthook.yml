@@ -8,3 +8,8 @@ pre-commit:
   commands:
     quality-gates:
       run: just pre-commit
+
+pre-push:
+  commands:
+    review-check:
+      run: scripts/hooks/review-check.sh
