@@ -22,9 +22,9 @@ pub struct MeshConfig {
     /// For edge nodes: the control node's endpoint address (serialized).
     pub control_addr: Option<String>,
     /// For control nodes: also expose managed routes on localhost.
-    /// Requires daemon restart to take effect.
-    #[serde(default)]
-    pub enable_local_proxy: bool,
+    /// Defaults to enabled for control nodes. Set `false` to disable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_local_proxy: Option<bool>,
     /// Optional bind address for the local health query HTTP endpoint.
     #[serde(default)]
     pub health_bind: Option<String>,
@@ -73,7 +73,7 @@ impl Default for MeshConfig {
                 .unwrap_or_else(|_| "unnamed".to_string()),
             role: NodeRole::Edge,
             control_addr: None,
-            enable_local_proxy: false,
+            enable_local_proxy: None,
             health_bind: None,
             services: Vec::new(),
             data_dir: default_data_dir(),
@@ -177,7 +177,7 @@ mod tests {
             node_name: "test-node".to_string(),
             role: NodeRole::Control,
             control_addr: None,
-            enable_local_proxy: true,
+            enable_local_proxy: Some(true),
             health_bind: None,
             services: vec![ServiceEntry {
                 name: "llama3_api".to_string(),
@@ -216,7 +216,7 @@ mod tests {
     fn test_mesh_config_is_default() {
         let config = MeshConfig::default();
         assert!(config.is_default());
-        assert!(!config.enable_local_proxy);
+        assert!(config.enable_local_proxy.is_none());
 
         let modified = MeshConfig {
             role: NodeRole::Control,
@@ -226,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn test_config_load_defaults_enable_local_proxy_to_false() {
+    fn test_config_load_defaults_enable_local_proxy_to_none() {
         let dir = writable_tempdir();
         let path = dir.path().join("config.toml");
 
@@ -241,7 +241,7 @@ data_dir = "/tmp/mesh-test"
         .unwrap();
 
         let loaded = MeshConfig::load(&path).unwrap();
-        assert!(!loaded.enable_local_proxy);
+        assert!(loaded.enable_local_proxy.is_none());
     }
 
     #[test]

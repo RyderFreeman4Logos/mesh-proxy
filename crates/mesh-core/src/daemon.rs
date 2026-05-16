@@ -553,7 +553,7 @@ impl Daemon {
         runtime_config: SharedRuntimeConfig,
         shutdown_rx: ShutdownRx,
     ) -> Option<(SharedLocalProxy, tokio::task::JoinHandle<()>)> {
-        if !config.enable_local_proxy {
+        if config.enable_local_proxy == Some(false) {
             return None;
         }
 
@@ -965,7 +965,7 @@ mod tests {
             node_name: "edge-alpha".to_string(),
             role: NodeRole::Edge,
             control_addr: Some(control_addr),
-            enable_local_proxy: false,
+            enable_local_proxy: None,
             health_bind: None,
             services,
             data_dir,
@@ -1134,7 +1134,7 @@ mod tests {
     async fn test_control_local_proxy_disabled_does_not_spawn_listeners() {
         let config = MeshConfig {
             role: NodeRole::Control,
-            enable_local_proxy: false,
+            enable_local_proxy: Some(false),
             ..MeshConfig::default()
         };
         let runtime_config = Arc::new(tokio::sync::RwLock::new(config.clone()));
@@ -1169,7 +1169,7 @@ mod tests {
     async fn test_control_local_proxy_tracks_route_changes() {
         let config = MeshConfig {
             role: NodeRole::Control,
-            enable_local_proxy: true,
+            enable_local_proxy: Some(true),
             ..MeshConfig::default()
         };
         let runtime_config = Arc::new(tokio::sync::RwLock::new(config.clone()));
@@ -1258,7 +1258,7 @@ mod tests {
                 node_name: "edge-alpha".to_string(),
                 role: NodeRole::Edge,
                 control_addr: None,
-                enable_local_proxy: false,
+                enable_local_proxy: None,
                 health_bind: None,
                 services: vec![make_service_entry("echo", "127.0.0.1:18080")],
                 data_dir,
