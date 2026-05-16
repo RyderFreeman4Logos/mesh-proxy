@@ -358,7 +358,7 @@ async fn build_status(state: &SharedState) -> IpcResponse {
             let outbound_peer_ids = connection_pool.active_endpoint_ids().await;
             let peer_count = direct_peer_ids
                 .into_iter()
-                .chain(outbound_peer_ids.into_iter())
+                .chain(outbound_peer_ids)
                 .collect::<std::collections::BTreeSet<_>>()
                 .len();
 
